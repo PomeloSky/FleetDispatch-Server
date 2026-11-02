@@ -1,0 +1,62 @@
+# FleetDispatch Server
+
+可以自行架設的 FleetDispatch 主機。FleetDispatch App（8.1 起）除了在同一個區域網路內以 iPad 或 Mac 當主機，也可以改連你自己架設的主機：
+不在同一個 Wi-Fi 也能同步，資料保存在你掌控的地方。
+
+- 三種部署方式，功能完全相同，選一種即可：
+
+| 部署方式 | 適合 | 費用 | 難度 | 架設說明 |
+| --- | --- | --- | --- | --- |
+| **Cloudflare Workers＋D1** | 不想管伺服器、車隊規模中小 | 免費方案通常就夠用 | ★☆☆ | [docs/setup-cloudflare.md](docs/setup-cloudflare.md) |
+| **PHP＋MySQL** | 已經有虛擬主機（cPanel、DirectAdmin、Plesk）或 LAMP 主機 | 現有主機即可 | ★★☆ | [docs/setup-php-mysql.md](docs/setup-php-mysql.md) |
+| **Docker** | NAS（Synology、QNAP）、VPS、公司內部伺服器、Raspberry Pi | 自有設備 | ★★☆ | [docs/setup-docker.md](docs/setup-docker.md) |
+
+- App 端的操作：**設定 › 使用模式 › 連線到自訂主機** → 輸入主機網址 → 驗證 → 第一次輸入部署時設定的**設定碼**（這台裝置成為管理員）。
+  其他裝置由管理員在 App 的「管理主機」建立**配對碼**後連線；角色（管理員、駕駛、檢視者）與綁定的駕駛人由配對碼決定。
+- 改用自訂主機後，可以在 App 的「雲端備份與同步」關閉 iCloud 同步與雲端自動備份，並刪除已經備份到雲端的檔案。
+
+## 功能
+
+- 與 App 的區網主機相同的同步規則：最後寫入者勝、主機校正用戶端偏快的時間、刪除車輛時一併刪除它的車趟與保養紀錄。
+- 角色與資料範圍：管理員可讀寫全部；駕駛只收到自己的車趟、巡檢與用車申請，其他駕駛人的個資被遮蔽；檢視者唯讀、個資被遮蔽。
+  駕駛不能核准自己的申請、不能修改或改派別人的車趟。
+- 用車申請與核准、巡檢、工單、零件、保養等 10 種資料；即時位置（出車中的車輛位置）；稽核紀錄（誰在什麼時候改了什麼）。
+- 裝置管理：配對碼（單次有效、可設定期限）、改角色、綁定駕駛人、解除配對。
+- 安全：只在 HTTPS 上使用；權杖與配對碼只存雜湊；配對失敗太多次會暫時鎖定；所有 SQL 參數化。
+
+## 架構
+
+```
+core/          TypeScript 核心（Cloudflare 與 Docker 共用；只用 Web 標準 API，沒有框架相依）
+cloudflare/    Cloudflare Workers＋D1 的進入點與 wrangler 設定
+docker/        Node 24（內建 node:sqlite）的進入點與維護工具
+php/           PHP 8.1＋MySQL（或 SQLite）實作
+conformance/   相容性測試：對任何一台主機執行，三種實作都必須通過
+docs/          協定規格與各部署方式的架設說明
+```
+
+- 協定規格：[docs/protocol.md](docs/protocol.md)（HTTP JSON API v1）。
+- 相容性測試（對一台全新、空的主機執行）：
+
+  ```sh
+  FD_BASE=https://你的主機網址 FD_SETUP_TOKEN=你的設定碼 node --test conformance/api.test.mjs
+  ```
+
+  測試會建立管理員與測試資料，並讓執行的 IP 在 15 分鐘內無法配對；**不要對正式使用中的主機執行**。
+
+## 開發
+
+需要 Node 24 以上。
+
+```sh
+npm install
+npm run typecheck            # TypeScript 型別檢查
+npm run docker:dev           # 本機以 Node 執行（資料在 ./data）
+npm run cf:dev               # 本機以 wrangler 執行 Worker（本機 D1）
+php -S 127.0.0.1:8080 php/public/index.php   # PHP 版（見 docs/setup-php-mysql.md）
+```
+
+## 更新
+
+- 三種實作的資料表會在啟動或第一次請求時自動建立；之後的版本若需要調整資料表，會在更新說明中寫明步驟。
+- 更新前請先備份（各部署方式的說明都有備份方法）。

@@ -1,0 +1,172 @@
+# 架設 FleetDispatch Server：Docker
+
+適合 NAS（Synology、QNAP）、VPS、公司內部伺服器或 Raspberry Pi（arm64）。主機是一個 Node 24 容器，資料存在容器的資料卷中的 SQLite 檔；
+執行時不需要安裝任何套件，也不需要另外的資料庫。
+
+## 1. 需要的東西
+
+- 已安裝 Docker 與 Docker Compose 的主機（Synology 的「Container Manager」、QNAP 的「Container Station」也可以）。
+- 對外使用時：一個網域，以及 HTTPS（第 5 節）。App 只接受 HTTPS；只有區域網路內的位址（例如 `http://192.168.1.20:8080`）在使用者確認後可以用 http 測試。
+
+## 2. 下載程式
+
+```sh
+git clone https://github.com/PomeloSky/FleetDispatch-Server.git
+cd FleetDispatch-Server
+```
+
+沒有 Git 時，可以在 GitHub 頁面以 Code › Download ZIP 下載後解壓縮。
+
+## 3. 設定
+
+打開 `compose.yaml`：
+
+| 環境變數 | 說明 |
+| --- | --- |
+| `FD_SETUP_TOKEN` | **設定碼**：第一次連線用，輸入它的裝置成為管理員。至少 16 個字元的隨機字串（產生方式見下方）。留空時主機會自動產生一組，存在資料卷的 `setup-token.txt` |
+| `FD_SERVER_NAME` | 主機第一次啟動時的名稱（之後可以在 App 修改） |
+| `FD_TRUST_PROXY` | 前面有幾層反向代理：直接對外時保持 `0`；放在一層反向代理（Caddy、nginx、Synology 反向代理、Cloudflare Tunnel）後面時設為 `1`。主機只採用信任的代理在 `X-Forwarded-For` 右邊附加的 IP（最左邊的值可以被偽造），配對嘗試次數限制才會用到真實 IP |
+| `FD_PORT` | 容器內的連接埠，預設 8080 |
+
+產生設定碼：
+
+```sh
+openssl rand -base64 24
+```
+
+請另外妥善保存設定碼（例如密碼管理器）；管理員裝置遺失時要用它恢復（第 8 節）。
+
+## 4. 啟動
+
+```sh
+docker compose up -d --build
+docker compose logs -f fleetdispatch
+```
+
+看到 `FleetDispatch Server 1.0.0（Docker）在 http://0.0.0.0:8080` 就表示啟動成功。確認：
+
+```sh
+curl http://localhost:8080/api/v1/info
+```
+
+應看到 `"product":"FleetDispatch Server"`、`"setupRequired":true`。
+
+沒有設定 `FD_SETUP_TOKEN` 時，查看自動產生的設定碼：
+
+```sh
+docker compose exec fleetdispatch node docker/src/admin-tools.ts setup-token
+```
+
+## 5. HTTPS
+
+App 要求 HTTPS（區域網路內的測試除外）。任選一種：
+
+### A. Caddy（自動申請 Let's Encrypt 憑證）
+
+1. 網域（例如 `fleet.example.com`）的 DNS 指向這台主機，防火牆與路由器開放 80、443 連接埠。
+2. 修改 `docker/examples/Caddyfile` 的網域，以及 `docker/examples/compose.caddy.yaml` 的 `FD_SETUP_TOKEN`。
+3. 改用這個 compose 檔啟動（先停止第 4 節啟動的容器）：
+
+   ```sh
+   docker compose down
+   docker compose -f docker/examples/compose.caddy.yaml up -d --build
+   ```
+
+4. App 使用 `https://fleet.example.com`。
+
+### B. 已經有的反向代理
+
+把 `https://你的網域` 轉送到 `http://<這台主機>:8080`，並把 `FD_TRUST_PROXY` 設為 `1`。例如 nginx：
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name fleet.example.com;
+    ssl_certificate     /etc/letsencrypt/live/fleet.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/fleet.example.com/privkey.pem;
+    client_max_body_size 6m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}
+```
+
+這時建議把 `compose.yaml` 的 `ports` 改成 `"127.0.0.1:8080:8080"`，主機只接受本機的反向代理連線。
+
+- **Synology**：控制台 › 登入入口 › 進階 › 反向代理伺服器，來源 `HTTPS` ＋你的網域、目的地 `HTTP localhost:8080`；憑證在 控制台 › 安全性 › 憑證 申請 Let's Encrypt。
+- **Cloudflare Tunnel**：不需要開放連接埠；在 Cloudflare Zero Trust 建立 Tunnel，Public Hostname 指向 `http://localhost:8080`。
+
+### C. 只在區域網路內使用
+
+直接使用 `http://<這台主機的區域網路 IP>:8080`。App 會提醒連線未加密，確認後可以使用；資料與權杖不加密，只建議用在測試或可信任的內部網路。
+
+## 6. 在 App 連線
+
+1. 管理員的裝置：FleetDispatch › 設定 › 使用模式 › **連線到自訂主機**。
+2. 輸入主機網址 → **驗證主機** → 輸入設定碼 → **連線**。這台裝置成為管理員，開始同步。
+3. 原本在這台裝置上的資料：配對主機頁 › **上傳本機資料到主機**。
+4. 其他裝置：管理員在 **管理主機 › 建立配對碼**，選擇角色（駕駛可以綁定駕駛人）與期限；把主機網址與配對碼交給對方，對方以同樣步驟輸入配對碼。
+5. 改用自訂主機後，可以在 **雲端備份與同步** 關閉 iCloud 同步與雲端自動備份，並刪除已經備份的檔案。
+
+## 7. 備份與還原
+
+資料都在資料卷中的 `fleetdispatch.sqlite`。
+
+- 備份（主機執行中也可以）：
+
+  ```sh
+  docker compose exec fleetdispatch node docker/src/admin-tools.ts backup
+  ```
+
+  會在資料卷的 `backups/` 產生 `fleetdispatch-<日期時間>.sqlite`。複製到別處保存：
+
+  ```sh
+  docker compose cp fleetdispatch:/data/backups ./fleetdispatch-backups
+  ```
+
+  可以用排程（cron、Synology 的「任務排程表」）每天執行。
+
+- 還原（主機必須先停止；原本的資料庫會另存為 `fleetdispatch.before-restore-*.sqlite`）：
+
+  ```sh
+  docker compose stop fleetdispatch
+  docker compose run --rm fleetdispatch node docker/src/admin-tools.ts restore backups/fleetdispatch-<日期時間>.sqlite
+  docker compose start fleetdispatch
+  ```
+
+  備份檔在別處時，先以 `docker compose cp <檔案> fleetdispatch:/data/backups/` 放回資料卷。
+  還原後，各裝置會在下一次同步時以主機的資料為準。
+
+## 8. 管理員裝置遺失：恢復第一次設定
+
+撤銷所有管理員裝置後，設定碼會重新生效（資料不受影響）：
+
+```sh
+docker compose exec fleetdispatch node docker/src/admin-tools.ts reset-admins
+```
+
+再用新的裝置以設定碼連線即可。忘記設定碼時，修改 `compose.yaml` 的 `FD_SETUP_TOKEN` 後執行 `docker compose up -d`。
+
+## 9. 更新主機程式
+
+```sh
+docker compose exec fleetdispatch node docker/src/admin-tools.ts backup
+git pull
+docker compose up -d --build
+```
+
+## 10. 疑難排解
+
+| 現象 | 原因與處理 |
+| --- | --- |
+| App 顯示「請使用 HTTPS」 | 對外網址必須是 HTTPS（第 5 節）；只有區域網路位址可以用 http |
+| App 顯示「主機的 HTTPS 憑證無效」 | 憑證過期、網域不符或使用自簽憑證；請使用 Let's Encrypt 等公開憑證 |
+| App 顯示「無法連線到主機」 | 防火牆或路由器沒有開放連接埠、反向代理設定錯誤；先在主機上 `curl http://localhost:8080/api/v1/info` 確認容器正常 |
+| 輸入設定碼後顯示錯誤 | 設定碼打錯；或主機已經有管理員（設定碼只在沒有管理員時有效，其他裝置請用配對碼） |
+| 「嘗試太多次，請稍後再試」 | 同一個 IP 在 15 分鐘內配對失敗 10 次，等 15 分鐘。放在反向代理後面卻沒有設 `FD_TRUST_PROXY=1` 時，所有裝置會被當成同一個 IP |
+| 「此裝置已被解除配對」 | 管理員解除了這台裝置，或權杖 90 天未使用而過期；請管理員建立新的配對碼重新連線 |
+| 容器一直重啟 | `docker compose logs fleetdispatch` 查看；`FD_SETUP_TOKEN` 少於 16 個字元時主機不會啟動 |

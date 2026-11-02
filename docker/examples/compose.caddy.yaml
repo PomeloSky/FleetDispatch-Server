@@ -1,0 +1,36 @@
+# FleetDispatch Server＋Caddy（自動申請 Let's Encrypt 憑證的 HTTPS）。
+# 1. 網域（例如 fleet.example.com）的 DNS A／AAAA 記錄指向這台主機，防火牆開放 80 與 443。
+# 2. 修改下方的 FD_SETUP_TOKEN 與 docker/examples/Caddyfile 的網域。
+# 3. 在 repo 根目錄執行：docker compose -f docker/examples/compose.caddy.yaml up -d --build
+services:
+  fleetdispatch:
+    build: ../..
+    container_name: fleetdispatch-server
+    restart: unless-stopped
+    environment:
+      FD_SETUP_TOKEN: "請換成至少 16 個字元的隨機字串"
+      FD_SERVER_NAME: "FleetDispatch Server"
+      FD_TRUST_PROXY: "1"
+    volumes:
+      - fleetdispatch-data:/data
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2
+    container_name: fleetdispatch-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - fleetdispatch
+
+volumes:
+  fleetdispatch-data:
+  caddy-data:
+  caddy-config:

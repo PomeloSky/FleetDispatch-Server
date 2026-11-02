@@ -1,0 +1,20 @@
+# FleetDispatch Server（Docker）。步驟見 docs/setup-docker.md。
+# 對外提供服務時請放在 HTTPS 反向代理後面（範例：docker/examples/compose.caddy.yaml）。
+services:
+  fleetdispatch:
+    build: .
+    container_name: fleetdispatch-server
+    restart: unless-stopped
+    environment:
+      # 第一次設定用的設定碼（至少 16 個字元）。留空時主機會自動產生一組，存在 /data/setup-token.txt。
+      FD_SETUP_TOKEN: ""
+      FD_SERVER_NAME: "FleetDispatch Server"
+      # 前面有幾層反向代理（0＝直接對外；放在一層反向代理後面時設為 1），配對嘗試次數限制才會用到真實 IP。
+      FD_TRUST_PROXY: "0"
+    volumes:
+      - fleetdispatch-data:/data
+    ports:
+      - "8080:8080"
+
+volumes:
+  fleetdispatch-data:

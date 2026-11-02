@@ -1,0 +1,17 @@
+# FleetDispatch Server — Cloudflare Workers＋D1。步驟見 docs/setup-cloudflare.md。
+name = "fleetdispatch-server"
+main = "src/index.ts"
+compatibility_date = "2026-10-01"
+
+# 第一次設定用的設定碼放在機密設定：npx wrangler secret put FD_SETUP_TOKEN --config cloudflare/wrangler.toml
+[vars]
+FD_SERVER_NAME = "FleetDispatch Server"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "fleetdispatch"
+# 換成 `npx wrangler d1 create fleetdispatch` 輸出的 database_id。
+database_id = "00000000-0000-0000-0000-000000000000"
+
+[observability]
+enabled = true

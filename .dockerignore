@@ -1,0 +1,10 @@
+node_modules
+data
+.wrangler
+cloudflare
+php
+conformance
+docs
+.git
+*.sqlite
+*.sqlite-*

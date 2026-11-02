@@ -1,0 +1,5 @@
+# 換成你的網域。Caddy 會自動申請並更新 HTTPS 憑證。
+fleet.example.com {
+	encode gzip
+	reverse_proxy fleetdispatch:8080
+}

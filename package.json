@@ -1,0 +1,23 @@
+{
+  "name": "fleetdispatch-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "可自行架設的 FleetDispatch 主機（Cloudflare Workers＋D1、Docker／Node、PHP＋MySQL）",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "docker:dev": "FD_DATA_DIR=./data FD_HOST=127.0.0.1 node docker/src/server.ts",
+    "cf:dev": "wrangler dev --config cloudflare/wrangler.toml --local",
+    "cf:deploy": "wrangler deploy --config cloudflare/wrangler.toml",
+    "test:conformance": "node --test conformance/api.test.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261018.1",
+    "@types/node": "24.19.2",
+    "typescript": "6.0.3",
+    "wrangler": "4.151.1"
+  }
+}
