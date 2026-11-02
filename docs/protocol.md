@@ -1,6 +1,6 @@
 # FleetDispatch Server API v1
 
-FleetDispatch App（8.1 起）可以改連使用者自行架設的主機。這份文件是三種主機實作（Cloudflare Worker＋D1、PHP＋MySQL、Docker）與 App 之間的共同規格；實作之間的行為必須一致，`conformance/` 的測試會逐項檢查。
+FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這份文件是三種主機實作（Cloudflare Worker＋D1、PHP＋MySQL、Docker）與 App 之間的共同規格；實作之間的行為必須一致，`conformance/` 的測試會逐項檢查。
 
 - 傳輸：HTTPS，JSON（UTF-8）。所有端點在 `<基底網址>/api/v1/` 之下；基底網址可以含路徑（例如 `https://example.com/fleet`）。
   PHP 主機無法設定網址改寫時，也接受 `<基底網址>/index.php/api/v1/…`。

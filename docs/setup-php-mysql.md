@@ -245,7 +245,7 @@ curl https://fleet.example.com/api/v1/session -H "Authorization: Bearer xxxxxxxx
 
 ## 9. 在 App 連線
 
-1. 在管理員的裝置上，FleetDispatch App（8.1 以上）改連**自訂主機**，輸入基底網址
+1. 在管理員的裝置上，FleetDispatch App（8.0 以上）改連**自訂主機**，輸入基底網址
    （例如 `https://fleet.example.com`、`https://example.com/fleet`；沒有網址改寫時是 `https://example.com/fleet/index.php`）並驗證主機。
 2. 輸入**設定碼**當作第一個配對碼 → 這台裝置成為管理員，開始同步。之後設定碼就不再有效。
 3. 其他裝置：管理員在 App 中**建立配對碼**，選擇角色（管理員、駕駛〔可以綁定駕駛人〕、檢視者）與有效期限，

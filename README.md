@@ -1,6 +1,6 @@
 # FleetDispatch Server
 
-可以自行架設的 FleetDispatch 主機。FleetDispatch App（8.1 起）除了在同一個區域網路內以 iPad 或 Mac 當主機，也可以改連你自己架設的主機：
+可以自行架設的 FleetDispatch 主機。FleetDispatch App（8.0 起）除了在同一個區域網路內以 iPad 或 Mac 當主機，也可以改連你自己架設的主機：
 不在同一個 Wi-Fi 也能同步，資料保存在你掌控的地方。
 
 - 三種部署方式，功能完全相同，選一種即可：
