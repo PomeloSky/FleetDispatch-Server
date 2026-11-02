@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="fd-page" content="home">
+<meta name="description" content="FleetDispatch：給小型車隊、公司車與多車輛車主的派車與保養管理 App。出車登記、保養提醒、工單與巡檢、數據報表，支援 iPhone、iPad、Mac 與 Android。">
+<meta name="color-scheme" content="light dark">
+<title>FleetDispatch｜車隊派車與保養管理 App</title>
+<style>
+  /* 版面：單欄的產品介紹（標題與下載按鈕 → 功能 → 這台主機的說明 → English），寬螢幕時功能排成三欄。 */
+  :root {
+    --bg: #F2F5F8; --surface: #FFFFFF; --ink: #0C1626; --muted: #566579; --line: #D3DCE5;
+    --accent: #0B6F91; --accent-ink: #FFFFFF; --accent-soft: #E1F0F6; --hero: #071426; --hero-ink: #E8F1F8; --hero-muted: #9FB4C8; --cyan: #3DD0EE;
+    --font: "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", "Hiragino Sans", system-ui, sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #070C17; --surface: #0D1729; --ink: #E3ECF4; --muted: #8FA2B7; --line: #1F2D44;
+      --accent: #3DD0EE; --accent-ink: #03131B; --accent-soft: #0E2B3A; --hero: #040A15;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--font); font-size: 16px; line-height: 1.65; }
+  p, h1, h2, h3, ul, ol { margin: 0; }
+  .nobr { white-space: nowrap; }
+  a { color: var(--accent); }
+  a:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; border-radius: 6px; }
+  .wrap { max-width: 1040px; margin: 0 auto; padding-inline: 20px; }
+
+  header.hero { background: var(--hero); color: var(--hero-ink); padding-block: 28px 56px; }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; letter-spacing: 0.01em; }
+  .hero-body { display: grid; gap: 18px; margin-top: 44px; max-width: 720px; }
+  .eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--cyan); }
+  h1 { font-size: clamp(30px, 5.4vw, 48px); line-height: 1.18; letter-spacing: 0.01em; text-wrap: balance; }
+  .hero p.lede { color: var(--hero-muted); font-size: 17px; max-width: 62ch; }
+  .stores { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 6px; }
+  .store { display: inline-flex; flex-direction: column; justify-content: center; min-width: 210px; padding: 10px 18px; border-radius: 12px;
+           background: var(--hero-ink); color: var(--hero); text-decoration: none; line-height: 1.3; }
+  .store small { font-size: 12px; opacity: 0.75; }
+  .store strong { font-size: 18px; }
+  .store.alt { background: transparent; color: var(--hero-ink); border: 1px solid rgba(232, 241, 248, 0.35); }
+  .more { color: var(--cyan); }
+
+  main { display: grid; gap: 48px; padding-block: 48px 64px; }
+  h2 { font-size: 24px; line-height: 1.3; text-wrap: balance; }
+  .section { display: grid; gap: 18px; }
+  .section > p { color: var(--muted); max-width: 70ch; }
+  .features { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; list-style: none; padding: 0; }
+  .features li { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; display: grid; gap: 6px; align-content: start; }
+  .features h3 { font-size: 16px; }
+  .features p { color: var(--muted); font-size: 15px; }
+  .server { background: var(--accent-soft); border-radius: 14px; padding: 22px; display: grid; gap: 10px; }
+  .server p { max-width: 72ch; }
+  .steps { padding-left: 1.3em; display: grid; gap: 4px; }
+  .en { border-top: 1px solid var(--line); padding-top: 28px; display: grid; gap: 10px; }
+  .en p { color: var(--muted); max-width: 72ch; }
+  footer { border-top: 1px solid var(--line); padding-block: 22px 36px; color: var(--muted); font-size: 14px; }
+  footer .wrap { display: flex; flex-wrap: wrap; gap: 8px 18px; justify-content: space-between; }
+  @media (max-width: 760px) {
+    .features { grid-template-columns: minmax(0, 1fr); }
+    .store { min-width: 0; flex: 1 1 200px; }
+    header.hero { padding-block: 22px 40px; }
+    .hero-body { margin-top: 30px; }
+  }
+</style>
+</head>
+<body>
+<header class="hero">
+  <div class="wrap">
+    <div class="brand">
+      <svg width="34" height="34" viewBox="0 0 32 32" aria-hidden="true"><rect x="1" y="1" width="30" height="30" rx="8" fill="#3DD0EE"/><path d="M8 22c3-8 7-2 10-8s5-4 6-6" fill="none" stroke="#071426" stroke-width="2.6" stroke-linecap="round"/><circle cx="8" cy="22" r="2.6" fill="#071426"/></svg>
+      FleetDispatch
+    </div>
+    <div class="hero-body">
+      <div class="eyebrow">Fleet dispatch & maintenance</div>
+      <h1><span class="nobr">派車、保養與車隊數據，</span><span class="nobr">一個 App 管好</span></h1>
+      <p class="lede">FleetDispatch 是給小型車隊、公司車與多車輛車主的維運工具：出車登記、保養與到期提醒、工單與巡檢、用車申請與簽核、數據報表，在 iPhone、iPad、Mac 與 Android 上使用，離線也能記錄。</p>
+      <div class="stores">
+        <a class="store" href="https://apps.apple.com/app/id6764582426" rel="noopener"><small>iPhone・iPad・Mac</small><strong>在 App Store 下載</strong></a>
+        <a class="store" href="https://play.google.com/store/apps/details?id=com.yucts.fleetdispatch" rel="noopener"><small>Android 手機與平板</small><strong>在 Google Play 下載</strong></a>
+        <a class="store alt" href="https://instw.org/fleetdispatch" rel="noopener"><small>功能介紹與使用說明</small><strong>了解更多</strong></a>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="section" aria-labelledby="h-features">
+    <h2 id="h-features">車隊每天要做的事，都在同一個地方</h2>
+    <ul class="features">
+      <li><h3>出車與回車</h3><p>里程自動帶入上一趟，出車前檢查同一台車的時段衝突；車趟有路線地圖與回放。</p></li>
+      <li><h3>保養與到期提醒</h3><p>依里程或月數提醒保養；驗車、保險與駕照到期集中列出，不會漏掉。</p></li>
+      <li><h3>工單、巡檢與零件</h3><p>巡檢發現的缺失轉成工單，完工自動扣除零件庫存並產生保養紀錄。</p></li>
+      <li><h3>用車申請與簽核</h3><p>駕駛送出用車申請，管理者核准後直接建立車趟，也可以退回。</p></li>
+      <li><h3>數據與報表</h3><p>里程、油耗、成本與每公里成本的趨勢與排行，可以匯出 PDF 與 CSV。</p></li>
+      <li><h3>多人即時同步</h3><p>辦公室的平板或電腦當主機透過區網同步，也可以連線自行架設的主機，資料留在自己手上。</p></li>
+    </ul>
+  </section>
+
+  <section class="server" aria-labelledby="h-server">
+    <h2 id="h-server">這是一台 FleetDispatch 主機</h2>
+    <p>你打開的網址是車隊自行架設的 FleetDispatch Server，用來讓同一個車隊的 App 同步資料。車隊成員可以這樣加入：</p>
+    <ol class="steps">
+      <li>安裝 FleetDispatch App。</li>
+      <li>在 App 的「設定 › 使用模式 › 連線到自訂主機」輸入這個網址。</li>
+      <li>輸入管理員提供的配對碼。</li>
+    </ol>
+    <p>想為自己的車隊架設一台？主機程式開放原始碼，可以架在 Cloudflare、PHP＋MySQL 虛擬主機或 Docker：<a href="https://github.com/PomeloSky/FleetDispatch-Server" rel="noopener">github.com/PomeloSky/FleetDispatch-Server</a></p>
+  </section>
+
+  <section class="en" lang="en" aria-labelledby="h-en">
+    <h2 id="h-en">FleetDispatch in English</h2>
+    <p>FleetDispatch is a dispatch and maintenance app for small fleets and company cars: trip logging, maintenance and renewal reminders, work orders and inspections, trip requests with approvals, and reports. It runs on iPhone, iPad, Mac, and Android, and works offline.</p>
+    <p>This address is a self-hosted FleetDispatch Server. To join this fleet, install the app, open Settings › Usage Mode › Connect to Custom Host, enter this address, and use the pairing code from your administrator.</p>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>FleetDispatch Server {{VERSION}}・開放原始碼（AGPL-3.0）</span>
+    <span><a href="https://instw.org/fleetdispatch/privacy" rel="noopener">隱私權政策</a>・<a href="https://instw.org/fleetdispatch" rel="noopener">instw.org/fleetdispatch</a></span>
+  </div>
+</footer>
+</body>
+</html>

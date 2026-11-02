@@ -6,6 +6,9 @@ compatibility_date = "2026-10-01"
 # 第一次設定用的設定碼放在機密設定：npx wrangler secret put FD_SETUP_TOKEN --config cloudflare/wrangler.toml
 [vars]
 FD_SERVER_NAME = "FleetDispatch Server"
+# 網頁管理的網址（https://<主機>/admin）。對外服務時建議改成不容易猜到的路徑，例如 "/manage-7k2q9"；
+# 設為 "off" 關閉網頁管理。首頁顯示 FleetDispatch App 的介紹與下載連結。
+FD_ADMIN_PATH = "/admin"
 
 [[d1_databases]]
 binding = "DB"

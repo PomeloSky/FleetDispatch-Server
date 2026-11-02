@@ -108,7 +108,8 @@ chmod 600 config.php
 | `setup_token` | **設定碼**：App 第一次連線時輸入，那台裝置成為管理員。至少 16 個字元的隨機字串，產生方式見下方 |
 | `db.dsn` | 資料庫位置，例如 `mysql:host=localhost;dbname=帳號_fleet;charset=utf8mb4`。資料庫在其他主機或連接埠時寫 `host=127.0.0.1;port=3306` |
 | `db.user`、`db.password` | 第 4 節建立的使用者與密碼 |
-| `server_name` | 第一次初始化時的主機名稱（之後管理員可以在 App 修改） |
+| `server_name` | 第一次初始化時的主機名稱（之後管理員可以在 App 或網頁管理修改） |
+| `admin_path` | 網頁管理的網址（第 14 節），預設 `/admin`；建議改成不容易猜到的路徑，例如 `'/manage-7k2q9'`；設為 `'off'` 關閉 |
 | `trust_proxy` | 前面有幾層**你自己控制的**反向代理：PHP 直接面對網際網路時（一般虛擬主機、Apache 或 nginx 直接執行 PHP）保持 `0`；前面剛好有一層反向代理（例如開啟代理的 Cloudflare、另一台 nginx）時設為 `1`。設為 N 時，主機取 `X-Forwarded-For` 從右邊數來第 N 個位址作為來源 IP（最左邊的值可以被用戶端偽造，不會採用）；配對嘗試次數限制會用到真實的 IP。不確定時保持 `0` |
 
 產生設定碼（有 SSH 時）：
@@ -228,7 +229,7 @@ curl https://fleet.example.com/api/v1/info
 （沒有 curl 時，用瀏覽器打開這個網址也可以。）應看到類似：
 
 ```json
-{"product":"FleetDispatch Server","apiVersion":1,"serverVersion":"1.0.0","variant":"php", … ,"setupRequired":true,"setupConfigured":true, … }
+{"product":"FleetDispatch Server","apiVersion":1,"serverVersion":"1.1.0","variant":"php", … ,"setupRequired":true,"setupConfigured":true, … }
 ```
 
 - `setupConfigured` 是 `false`：`config.php` 沒有設定 `setup_token`，或少於 16 個字元。
@@ -252,6 +253,7 @@ curl https://fleet.example.com/api/v1/session -H "Authorization: Bearer xxxxxxxx
    把基底網址與配對碼（`XXXX-XXXX`，只能用一次，預設 24 小時內有效）交給對方，對方以同樣的步驟輸入配對碼。
 
 App 的操作畫面與其他主機相同，詳細步驟也可以參考 [setup-docker.md](setup-docker.md) 第 6 節。
+也可以先用瀏覽器打開網頁管理（第 14 節），以設定碼建立第一位管理員，再在網頁建立配對碼給每一台 App。
 
 ## 10. 管理員裝置遺失：恢復第一次設定
 
@@ -339,3 +341,23 @@ sqlite3 /home/帳號/fleetdispatch/data/fleetdispatch.sqlite \
 | `413`（或 nginx 的 413 錯誤頁） | 一次送出的資料超過 5 MB；nginx 請設定 `client_max_body_size 6m;`，PHP 的 `post_max_size` 至少 6 MB |
 | 管理功能（改角色、解除配對、刪除配對碼）回主機商的 403 錯誤頁 | 主機的 ModSecurity／防火牆擋住了 `PATCH`、`DELETE` 方法；在 cPanel 的 **ModSecurity** 對這個網域停用，或請主機商放行 |
 | App 顯示「請使用 HTTPS」或憑證錯誤 | 對外網址必須是 HTTPS，且憑證有效、網域相符（第 6 節） |
+| 打開網頁管理的網址卻看到 App 介紹（首頁） | 網址與 `admin_path` 不同（大小寫也要相同），或設成了 `'off'`；沒有網址改寫時網址是 `…/index.php/admin` |
+| 網頁管理顯示「找不到網頁管理的檔案」 | 上傳時漏了 `web/` 資料夾；請上傳完整的 `php` 資料夾 |
+
+## 14. 網頁管理（瀏覽器）
+
+這台主機也可以用瀏覽器管理：打開 `<主機網址><管理網址>`（預設 `/admin`）。**首頁顯示 FleetDispatch App 的介紹與下載連結**（任何人都看得到），管理頁只在管理網址出現，只有知道管理網址的人看得到登入頁；
+登入仍然需要設定碼或管理員的配對碼，管理網址本身不是密碼。
+
+- **登入**：主機還沒有管理員時，輸入設定碼，這個瀏覽器就成為第一位管理員（之後再建立配對碼給 App）；
+  已經有管理員時，請管理員在 App 的「管理主機」或網頁的「配對碼」建立**角色為管理員**的配對碼，用它登入。
+  瀏覽器會像 App 一樣出現在裝置清單（平台是「網頁」）；登出會解除這個瀏覽器的配對。
+- **功能**：概況、裝置（改角色、綁定駕駛人、解除配對）、配對碼（建立與撤銷）、即時位置、稽核紀錄、資料（車趟、車輛、駕駛人、用車申請，唯讀）、主機名稱。
+- **安全**：建議把管理網址改成不容易猜到的路徑（只能用英數字與 `. _ ~ -`，不能以 `/api` 開頭），不要公開分享；
+  勾選「記住這個瀏覽器」只用在自己的電腦。只有一個管理員時，網頁會提醒你再建立一位管理員，避免瀏覽器資料被清除後失去管理權限。
+
+- **管理網址**：`config.php` 的 `admin_path`。網址是基底網址加上管理網址，例如 `https://fleet.example.com/admin`、`https://example.com/fleet/admin`；
+  沒有網址改寫時是 `https://example.com/fleet/index.php/admin`。
+- 還沒有建立 `config.php`、或設定檔有錯誤時，網頁管理仍會在預設的 `/admin` 顯示主機回報的設定錯誤，方便確認哪裡要修正；設定完成後才會改用 `admin_path`。
+- 網頁管理的檔案在 `web/`（和 `src/` 一樣不能從網站直接存取）。
+

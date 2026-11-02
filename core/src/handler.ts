@@ -9,6 +9,7 @@ import type { DriverBinding, Entity, EventResult, Role, ServerConfig, Session, S
 import { ApiError, ENTITIES, ROLES, SNAPSHOT_KEYS, VEHICLE_CHILDREN } from './types.ts';
 import { badRequest, cleanName, intParam, isObject, msToApple, normalizeUuid, nowMs, num, str } from './util.ts';
 import { SERVER_VERSION } from './version.ts';
+import { acceptsHtml, adminResponse, homeResponse, isHome, matchAdmin } from './web.ts';
 
 export const LIMITS = { maxEventsPerRequest: 500, maxBodyBytes: 5 * 1024 * 1024, maxPayloadBytes: 1024 * 1024 };
 const TOKEN_TTL_MS = 90 * 24 * 3600 * 1000;
@@ -140,7 +141,17 @@ export class Api {
   async handle(request: Request): Promise<Response> {
     try {
       const url = new URL(request.url);
+      // 網頁（不需要資料庫）：管理頁只在設定的管理網址出現；首頁是 App 介紹，瀏覽器開啟找不到的網址也顯示首頁（404）。
+      const method = request.method.toUpperCase();
       const path = apiPath(url.pathname);
+      if (method === 'GET' || method === 'HEAD') {
+        if (this.config.adminPath !== null) {
+          const hit = matchAdmin(url.pathname, this.config.adminPath);
+          if (hit) return adminResponse(hit.kind, hit.base, this.config.adminPath, method);
+        }
+        if (path === null && isHome(url.pathname)) return homeResponse(200, method);
+        if (path === null && acceptsHtml(request.headers.get('Accept'))) return homeResponse(404, method);
+      }
       if (path === null) throw new ApiError(404, 'not_found', '找不到這個端點');
       await ensureInit(this.repo, this.config);
       return await this.route(request, url, path);

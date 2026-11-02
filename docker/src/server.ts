@@ -11,6 +11,7 @@ import type { SqlDb, SqlStatement } from '../../core/src/db.ts';
 import { handleRequest, LIMITS } from '../../core/src/handler.ts';
 import type { ServerConfig } from '../../core/src/types.ts';
 import { SERVER_VERSION } from '../../core/src/version.ts';
+import { parseAdminPath } from '../../core/src/web.ts';
 
 class NodeSqliteDb implements SqlDb {
   db: DatabaseSync;
@@ -86,10 +87,14 @@ function setupToken(): string {
   return token;
 }
 
+const admin = parseAdminPath(process.env.FD_ADMIN_PATH);
+if (admin.error) console.error(admin.error);
+
 const config: ServerConfig = {
   variant: 'docker',
   setupToken: setupToken(),
   defaultName: process.env.FD_SERVER_NAME?.trim() || 'FleetDispatch Server',
+  adminPath: admin.path,
 };
 const db = new NodeSqliteDb(join(dataDir, 'fleetdispatch.sqlite'));
 
@@ -158,6 +163,7 @@ const server = createServer((req, res) => {
 server.requestTimeout = 60_000;
 server.listen(port, host, () => {
   console.log(`FleetDispatch Server ${SERVER_VERSION}（Docker）在 http://${host}:${port}，資料：${dataDir}`);
+  console.log(config.adminPath ? `網頁管理：<主機網址>${config.adminPath}（首頁是 App 介紹）` : '網頁管理已關閉（FD_ADMIN_PATH）。');
   if (!process.env.FD_SETUP_TOKEN) {
     console.log(`沒有設定 FD_SETUP_TOKEN：第一次設定用的設定碼已存在 ${join(dataDir, 'setup-token.txt')}（docker compose exec 後以 cat 查看）。`);
   }

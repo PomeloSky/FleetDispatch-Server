@@ -75,6 +75,20 @@ final class Request
     }
 
     /** Authorization 標頭（Apache 的 CGI／FastCGI 模式由 .htaccess 轉成 HTTP_AUTHORIZATION 環境變數）。 */
+    /** 進入點（index.php）所在的網址路徑，例如 /fleet；在網站根目錄時是空字串。首頁判斷用。 */
+    public function scriptDir(): string
+    {
+        $script = self::serverString($this->server, 'SCRIPT_NAME') ?? '';
+        $dir = rtrim(str_replace('\\', '/', dirname($script)), '/');
+        return $dir === '.' ? '' : $dir;
+    }
+
+    /** 瀏覽器開啟的請求（Accept 有 text/html）。 */
+    public function acceptsHtml(): bool
+    {
+        return str_contains(strtolower(self::serverString($this->server, 'HTTP_ACCEPT') ?? ''), 'text/html');
+    }
+
     public function authorization(): string
     {
         foreach (['HTTP_AUTHORIZATION', 'REDIRECT_HTTP_AUTHORIZATION'] as $key) {

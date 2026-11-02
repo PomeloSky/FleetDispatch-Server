@@ -77,6 +77,7 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 
 部署時必須設定**設定碼**（setup token，至少 16 個字元；各實作的設定方式見部署文件）。主機上沒有任何有效的管理員裝置時，
 `POST /pair` 接受設定碼，配對的裝置成為管理員。之後設定碼不再有效；要恢復（例如管理員裝置遺失），由主機管理者依部署文件撤銷所有管理員後，設定碼重新生效。
+第一位管理員也可以是網頁管理的瀏覽器（§13）。
 
 ### 3.2 配對碼
 
@@ -328,6 +329,7 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 - 不回傳 `Access-Control-Allow-Origin`（App 是原生程式，不需要跨來源存取；避免網頁冒用）。
 - 回應加上 `Cache-Control: no-store`、`X-Content-Type-Options: nosniff`。
 - 主機錯誤不得洩漏內部細節（堆疊、SQL、檔案路徑）。
+- 網頁（§13）：管理頁只在設定的管理網址回應，首頁與管理頁都不把請求內容（基底路徑除外）填進頁面，並加上 §13 的安全標頭；`GET /info` 與首頁都不透露管理網址。
 
 ## 12. 用戶端行為（App）
 
@@ -336,3 +338,33 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
   每 6 小時或角色改變時重做全量同步。
 - 時鐘：以 `server.time` 換算偏移（超過 ±1 天不採用），用於事件時間。
 - `401 unauthorized`：停止同步、提示重新配對；`429`：依 `Retry-After` 延後。
+
+## 13. 網頁（1.1.0 起）：首頁與網頁管理
+
+主機的網址也提供兩種網頁：**首頁**是 FleetDispatch App 的介紹與下載連結（任何人都看得到）；**網頁管理**只在一個設定的網址出現，
+讓管理員用瀏覽器管理。網頁管理只使用本文件的 API，不需要額外的端點。
+
+- **首頁**（只有 `GET`、`HEAD`）：基底路徑本身（`/`；PHP 是 `index.php` 所在的資料夾），以及 `…/index.php`、`…/index.html` 回 `200` 的 HTML。
+  其他找不到的非 API 網址：`Accept` 有 `text/html`（瀏覽器）時回 `404` 狀態與同樣的首頁內容，否則照 API 的規則回 `404 not_found`（JSON）。
+  首頁沒有程式、不含任何由請求產生的內容，也不透露管理網址；標頭：`Content-Type: text/html; charset=utf-8`、`Cache-Control: no-cache`、
+  `X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`、`X-Frame-Options: DENY`、
+  `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`。
+- **管理網址**：Cloudflare Workers 與 Docker 用環境變數 `FD_ADMIN_PATH`，PHP 用 `config.php` 的 `admin_path`；沒有設定時是 `/admin`，
+  空字串或 `off` 關閉。格式：一或多段，每段只能有 `A–Z a–z 0–9 . _ ~ -`，不能是 `.`、`..`，第一段不能是 `api` 或 `index.php`，全長 100 字元以內；
+  格式不正確時關閉網頁管理並寫入日誌（API 照常運作）。
+- **路由**（只有 `GET`、`HEAD`）：
+  - `<基底路徑><管理網址>`（可以有結尾的 `/`）：管理頁（HTML）。
+  - `<基底路徑><管理網址>/app.js`：管理頁的程式。
+  - 基底路徑是管理網址前面的部分（部署在子資料夾，或 PHP 沒有網址改寫時的 `/index.php`），只能由上面的路徑段組成，且不能含 `/api/v1`；
+    不符合時視同其他路徑。
+  - 管理網址的其他方法：照 API 的規則回 `404 not_found`（JSON）。
+- **頁面內容**：HTML 的 `data-base`、`data-admin` 填入基底路徑與管理網址（HTML 跳脫），`<script src>` 指向 `<基底路徑><管理網址>/app.js`；
+  沒有其他由請求產生的內容。首頁、管理頁與程式的原始檔在 `web/`，`scripts/build-web.mjs` 產生 `core/src/web-assets.ts`（TypeScript 實作）與 `php/web/`（PHP 實作）。
+- **標頭**：管理頁 `Content-Type: text/html; charset=utf-8`，程式 `text/javascript; charset=utf-8`；兩者都有 `Cache-Control: no-store`、
+  `X-Content-Type-Options: nosniff`、`X-Robots-Tag: noindex, nofollow`、`Referrer-Policy: no-referrer`。管理頁另外有
+  `X-Frame-Options: DENY` 與 `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`。
+- **登入**：瀏覽器以 `POST /pair` 配對（`platform: "web"`，每次登入產生新的 `deviceId`）：沒有管理員時用設定碼成為管理員，否則用管理員建立的配對碼；
+  角色不是管理員時只能登出。權杖存在瀏覽器（勾選「記住這個瀏覽器」時是 localStorage，否則是 sessionStorage）；登出是 `POST /unpair`；
+  `401` 時清除權杖並回到登入頁。最後一位管理員不能登出（`409 last_admin`），頁面會提示先建立另一位管理員。
+- **相容性測試**：`conformance/web.test.mjs`（`FD_ADMIN_PATH` 與主機的設定相同）。
+

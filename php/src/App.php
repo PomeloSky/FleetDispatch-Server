@@ -26,11 +26,37 @@ final class App
     private static function handle(Request $request, string $appDir): Response
     {
         try {
+            $config = null;
+            $setupError = null;
+            try {
+                $config = Config::load(self::configPath($appDir));
+            } catch (SetupError $e) {
+                $setupError = $e;
+            }
+            // 網頁（不需要資料庫）：管理頁只在設定的管理網址出現（設定檔有問題時仍以預設網址提供，頁面會顯示 /info 回報的設定錯誤）；
+            // 首頁是 App 介紹，瀏覽器開啟找不到的網址也顯示首頁（404）。
+            $adminPath = $config !== null ? $config->adminPath : Web::DEFAULT_ADMIN_PATH;
             $path = Api::apiPath($request->path);
+            if ($request->method === 'GET' || $request->method === 'HEAD') {
+                if ($adminPath !== null) {
+                    $hit = Web::match($request->path, $adminPath);
+                    if ($hit !== null) {
+                        return Web::response($hit[0], $hit[1], $adminPath, $appDir);
+                    }
+                }
+                if ($path === null && Web::isHome($request->path, $request->scriptDir())) {
+                    return Web::home(200, $appDir);
+                }
+                if ($path === null && $request->acceptsHtml()) {
+                    return Web::home(404, $appDir);
+                }
+            }
             if ($path === null) {
                 throw new ApiError(404, 'not_found', '找不到這個端點');
             }
-            $config = Config::load(self::configPath($appDir));
+            if ($setupError !== null || $config === null) {
+                throw $setupError ?? new SetupError('找不到設定檔');
+            }
             $db = Db::connect($config);
             $db->ensureSchema($appDir . '/schema', $config->serverName);
             return (new Api($request, $config, $db))->route($path);

@@ -57,6 +57,9 @@ npx wrangler secret put FD_SETUP_TOKEN --config cloudflare/wrangler.toml
 
 ## 5. 部署
 
+部署前可以先在 `cloudflare/wrangler.toml` 的 `[vars]` 把網頁管理的網址 `FD_ADMIN_PATH` 改成不容易猜到的路徑（例如 `"/manage-7k2q9"`；
+預設 `/admin`，設為 `"off"` 關閉；見第 13 節）。
+
 ```sh
 npm run cf:deploy
 ```
@@ -84,6 +87,8 @@ Cloudflare 會自動設定 DNS 與 HTTPS 憑證。之後 App 使用 `https://fle
 3. 原本在這台裝置上的資料：配對主機頁 › **上傳本機資料到主機**（以修改時間較新的為準）。
 4. 其他裝置：管理員在 **管理主機 › 建立配對碼**，選擇角色（駕駛可以綁定駕駛人）與期限；把主機網址與配對碼交給對方，對方在自己的 App 以同樣步驟輸入配對碼。
 5. 改用自訂主機後，可以在 **雲端備份與同步** 關閉 iCloud 同步與雲端自動備份，並刪除已經備份的檔案。
+
+也可以先用瀏覽器打開網頁管理（第 13 節），以設定碼建立第一位管理員，再在網頁建立配對碼給每一台 App。
 
 ## 9. 管理員裝置遺失：恢復第一次設定
 
@@ -133,3 +138,20 @@ npm run cf:deploy
 | 「此裝置已被解除配對」 | 管理員解除了這台裝置，或權杖 90 天未使用而過期；請管理員建立新的配對碼重新連線 |
 | 部署時出現 `database_id` 相關錯誤 | `cloudflare/wrangler.toml` 的 `database_id` 還是範例值 |
 | 想看主機的錯誤紀錄 | Cloudflare 儀表板 › Workers & Pages › `fleetdispatch-server` › Logs，或執行 `npx wrangler tail --config cloudflare/wrangler.toml` |
+| 打開網頁管理的網址卻看到 App 介紹（首頁） | 網址與 `FD_ADMIN_PATH` 不同（大小寫也要相同），或設成了 `off`；改了 `wrangler.toml` 之後要重新部署 |
+
+## 13. 網頁管理（瀏覽器）
+
+這台主機也可以用瀏覽器管理：打開 `<主機網址><管理網址>`（預設 `/admin`）。**首頁顯示 FleetDispatch App 的介紹與下載連結**（任何人都看得到），管理頁只在管理網址出現，只有知道管理網址的人看得到登入頁；
+登入仍然需要設定碼或管理員的配對碼，管理網址本身不是密碼。
+
+- **登入**：主機還沒有管理員時，輸入設定碼，這個瀏覽器就成為第一位管理員（之後再建立配對碼給 App）；
+  已經有管理員時，請管理員在 App 的「管理主機」或網頁的「配對碼」建立**角色為管理員**的配對碼，用它登入。
+  瀏覽器會像 App 一樣出現在裝置清單（平台是「網頁」）；登出會解除這個瀏覽器的配對。
+- **功能**：概況、裝置（改角色、綁定駕駛人、解除配對）、配對碼（建立與撤銷）、即時位置、稽核紀錄、資料（車趟、車輛、駕駛人、用車申請，唯讀）、主機名稱。
+- **安全**：建議把管理網址改成不容易猜到的路徑（只能用英數字與 `. _ ~ -`，不能以 `/api` 開頭），不要公開分享；
+  勾選「記住這個瀏覽器」只用在自己的電腦。只有一個管理員時，網頁會提醒你再建立一位管理員，避免瀏覽器資料被清除後失去管理權限。
+
+- **管理網址**：`cloudflare/wrangler.toml` 的 `[vars]` › `FD_ADMIN_PATH`，改完重新部署（`npm run cf:deploy`）。也可以在 Cloudflare 儀表板 ›
+  Workers & Pages › `fleetdispatch-server` › Settings › Variables and Secrets 修改（下次以 wrangler 部署時會被 `wrangler.toml` 的值覆蓋）。
+

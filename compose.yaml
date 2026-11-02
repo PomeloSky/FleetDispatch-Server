@@ -9,6 +9,8 @@ services:
       # 第一次設定用的設定碼（至少 16 個字元）。留空時主機會自動產生一組，存在 /data/setup-token.txt。
       FD_SETUP_TOKEN: ""
       FD_SERVER_NAME: "FleetDispatch Server"
+      # 網頁管理的網址（http(s)://<主機>/admin）。對外服務時建議改成不容易猜到的路徑；設為 "off" 關閉。首頁是 App 介紹。
+      FD_ADMIN_PATH: "/admin"
       # 前面有幾層反向代理（0＝直接對外；放在一層反向代理後面時設為 1），配對嘗試次數限制才會用到真實 IP。
       FD_TRUST_PROXY: "0"
     volumes:

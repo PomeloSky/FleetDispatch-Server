@@ -13,6 +13,9 @@
 
 - App 端的操作：**設定 › 使用模式 › 連線到自訂主機** → 輸入主機網址 → 驗證 → 第一次輸入部署時設定的**設定碼**（這台裝置成為管理員）。
   其他裝置由管理員在 App 的「管理主機」建立**配對碼**後連線；角色（管理員、駕駛、檢視者）與綁定的駕駛人由配對碼決定。
+- 也可以用瀏覽器管理：打開**網頁管理**的網址（預設 `<主機網址>/admin`，可以改成不容易猜到的路徑）。
+  主機網址的首頁顯示 FleetDispatch App 的介紹與下載連結，讓看到網址的人也能認識這個 App；管理頁不會出現在首頁。
+  第一位管理員也可以直接在網頁用設定碼建立。
 - 改用自訂主機後，可以在 App 的「雲端備份與同步」關閉 iCloud 同步與雲端自動備份，並刪除已經備份到雲端的檔案。
 
 ## 功能
@@ -22,6 +25,7 @@
   駕駛不能核准自己的申請、不能修改或改派別人的車趟。
 - 用車申請與核准、巡檢、工單、零件、保養等 10 種資料；即時位置（出車中的車輛位置）；稽核紀錄（誰在什麼時候改了什麼）。
 - 裝置管理：配對碼（單次有效、可設定期限）、改角色、綁定駕駛人、解除配對。
+- 網頁（1.1.0 起）：首頁是 App 的介紹與 App Store、Google Play 下載連結；網頁管理在設定的管理網址，用瀏覽器做上面的管理工作，並查看即時位置、稽核紀錄與資料（唯讀）。登入方式與 App 相同（設定碼或配對碼）。
 - 安全：只在 HTTPS 上使用；權杖與配對碼只存雜湊；配對失敗太多次會暫時鎖定；所有 SQL 參數化。
 
 ## 架構
@@ -31,6 +35,8 @@ core/          TypeScript 核心（Cloudflare 與 Docker 共用；只用 Web 標
 cloudflare/    Cloudflare Workers＋D1 的進入點與 wrangler 設定
 docker/        Node 24（內建 node:sqlite）的進入點與維護工具
 php/           PHP 8.1 以上＋MySQL 8.0／MariaDB 10.6 以上（或 SQLite）實作
+web/           網頁：首頁 home.html、網頁管理 admin.html／admin.js（npm run build:web 產生 core/src/web-assets.ts 與 php/web/）
+scripts/       開發工具（build-web.mjs）
 conformance/   相容性測試：對任何一台主機執行，三種實作都必須通過
 docs/          協定規格與各部署方式的架設說明
 ```
@@ -39,7 +45,7 @@ docs/          協定規格與各部署方式的架設說明
 - 相容性測試（對一台全新、空的主機執行）：
 
   ```sh
-  FD_BASE=https://你的主機網址 FD_SETUP_TOKEN=你的設定碼 node --test conformance/api.test.mjs
+  FD_BASE=https://你的主機網址 FD_SETUP_TOKEN=你的設定碼 FD_ADMIN_PATH=/admin node --test conformance/api.test.mjs conformance/web.test.mjs
   ```
 
   測試會建立管理員與測試資料，並讓執行的 IP 在 15 分鐘內無法配對；**不要對正式使用中的主機執行**。
@@ -51,6 +57,8 @@ docs/          協定規格與各部署方式的架設說明
 ```sh
 npm install
 npm run typecheck            # TypeScript 型別檢查
+npm run build:web            # 修改 web/ 之後：產生 core/src/web-assets.ts 與 php/web/（要一起提交）
+npm run check:web            # 檢查產生的檔案與 web/ 一致（CI 也會檢查）
 npm run docker:dev           # 本機以 Node 執行（資料在 ./data）
 npm run cf:dev               # 本機以 wrangler 執行 Worker（本機 D1）
 FD_PHP_CONFIG=/path/to/config.php php -S 127.0.0.1:8080 php/public/index.php   # PHP 版（見 docs/setup-php-mysql.md）
@@ -60,6 +68,7 @@ FD_PHP_CONFIG=/path/to/config.php php -S 127.0.0.1:8080 php/public/index.php   #
 
 - 三種實作的資料表會在啟動或第一次請求時自動建立；之後的版本若需要調整資料表，會在更新說明中寫明步驟。
 - 更新前請先備份（各部署方式的說明都有備份方法）。
+- 1.1.0 起提供網頁管理，預設網址是 `/admin`；不需要時設為 `off` 關閉（Cloudflare 與 Docker 的 `FD_ADMIN_PATH`、PHP 的 `admin_path`）。
 
 ## 授權
 

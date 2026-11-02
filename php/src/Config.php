@@ -19,6 +19,8 @@ final class Config
         public readonly string $serverName,
         /** 信任的反向代理層數：0 = 不採信 X-Forwarded-For；N ≥ 1 = 取 X-Forwarded-For 從右邊數來第 N 個值。 */
         public readonly int $trustedProxies,
+        /** 網頁管理的網址路徑（例如 /admin）；null 表示關閉。 */
+        public readonly ?string $adminPath = Web::DEFAULT_ADMIN_PATH,
     ) {
     }
 
@@ -66,6 +68,11 @@ final class Config
 
         $name = is_string($data['server_name'] ?? null) ? Util::jsTrim($data['server_name']) : '';
 
+        [$adminPath, $adminError] = Web::parseAdminPath(array_key_exists('admin_path', $data) ? $data['admin_path'] : null);
+        if ($adminError !== null) {
+            error_log('[fleetdispatch-server] ' . $adminError);
+        }
+
         return new self(
             $setupToken,
             $dsn,
@@ -73,6 +80,7 @@ final class Config
             $password,
             $name !== '' ? $name : self::DEFAULT_SERVER_NAME,
             self::proxyHops($data['trust_proxy'] ?? 0),
+            $adminPath,
         );
     }
 

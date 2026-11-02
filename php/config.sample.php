@@ -25,8 +25,12 @@ return [
     //     'dsn' => 'sqlite:' . __DIR__ . '/data/fleetdispatch.sqlite',
     // ],
 
-    // 第一次初始化時的主機名稱（之後由管理員在 App 修改）。
+    // 第一次初始化時的主機名稱（之後由管理員在 App 或網頁管理修改）。
     'server_name' => 'FleetDispatch Server',
+
+    // 網頁管理的網址（https://<主機>/admin）。對外服務時建議改成不容易猜到的路徑，例如 '/manage-7k2q9'；
+    // 設為 'off' 關閉網頁管理。首頁顯示 FleetDispatch App 的介紹與下載連結。
+    'admin_path' => '/admin',
 
     // 前面有幾層「你自己控制的」反向代理（用來取得真實的來源 IP，配對嘗試次數限制會用到）：
     //   0 = PHP 直接面對網際網路（一般虛擬主機、Apache／nginx 直接跑 PHP）：不採信 X-Forwarded-For。

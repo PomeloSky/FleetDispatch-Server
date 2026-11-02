@@ -1,4 +1,4 @@
-# 每次推送與 PR：型別檢查，並對每一種主機實作執行相容性測試（conformance/api.test.mjs）。
+# 每次推送與 PR：型別檢查、網頁產生檔案的一致性，並對每一種主機實作執行相容性測試（conformance/）。
 name: conformance
 
 on:
@@ -19,12 +19,14 @@ jobs:
           node-version: 24
       - run: npm ci
       - run: npm run typecheck
+      - name: 網頁的產生檔案與原始檔一致
+        run: npm run check:web
       - name: 啟動主機
         run: |
-          FD_DATA_DIR="$RUNNER_TEMP/data" FD_SETUP_TOKEN=ci-setup-token-0123456789 FD_PORT=8080 FD_HOST=127.0.0.1 node docker/src/server.ts > "$RUNNER_TEMP/server.log" 2>&1 &
+          FD_DATA_DIR="$RUNNER_TEMP/data" FD_SETUP_TOKEN=ci-setup-token-0123456789 FD_ADMIN_PATH=/console-ci FD_PORT=8080 FD_HOST=127.0.0.1 node docker/src/server.ts > "$RUNNER_TEMP/server.log" 2>&1 &
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:8080/api/v1/info > /dev/null && break; sleep 1; done
       - name: 相容性測試
-        run: FD_BASE=http://127.0.0.1:8080 FD_SETUP_TOKEN=ci-setup-token-0123456789 node --test conformance/api.test.mjs
+        run: FD_BASE=http://127.0.0.1:8080 FD_SETUP_TOKEN=ci-setup-token-0123456789 FD_ADMIN_PATH=/console-ci node --test conformance/api.test.mjs conformance/web.test.mjs
       - if: failure()
         run: cat "$RUNNER_TEMP/server.log"
 
@@ -39,11 +41,11 @@ jobs:
       - run: npm ci
       - name: 啟動主機
         run: |
-          printf 'FD_SETUP_TOKEN=ci-setup-token-0123456789\n' > cloudflare/.dev.vars
+          printf 'FD_SETUP_TOKEN=ci-setup-token-0123456789\nFD_ADMIN_PATH=/console-ci\n' > cloudflare/.dev.vars
           npx wrangler dev --config cloudflare/wrangler.toml --local --port 8787 --ip 127.0.0.1 > "$RUNNER_TEMP/wrangler.log" 2>&1 &
           for i in $(seq 1 90); do curl -sf http://127.0.0.1:8787/api/v1/info > /dev/null && break; sleep 1; done
       - name: 相容性測試
-        run: FD_BASE=http://127.0.0.1:8787 FD_SETUP_TOKEN=ci-setup-token-0123456789 node --test conformance/api.test.mjs
+        run: FD_BASE=http://127.0.0.1:8787 FD_SETUP_TOKEN=ci-setup-token-0123456789 FD_ADMIN_PATH=/console-ci node --test conformance/api.test.mjs conformance/web.test.mjs
       - if: failure()
         run: cat "$RUNNER_TEMP/wrangler.log"
 
@@ -65,11 +67,11 @@ jobs:
       - name: 啟動主機
         run: |
           mkdir -p "$RUNNER_TEMP/php"
-          printf "<?php\nreturn ['setup_token' => 'ci-setup-token-0123456789', 'db' => ['dsn' => 'sqlite:%s/php/fd.sqlite']];\n" "$RUNNER_TEMP" > "$RUNNER_TEMP/php/config.php"
+          printf "<?php\nreturn ['setup_token' => 'ci-setup-token-0123456789', 'db' => ['dsn' => 'sqlite:%s/php/fd.sqlite'], 'admin_path' => '/console-ci'];\n" "$RUNNER_TEMP" > "$RUNNER_TEMP/php/config.php"
           FD_PHP_CONFIG="$RUNNER_TEMP/php/config.php" php -S 127.0.0.1:8080 php/public/index.php > "$RUNNER_TEMP/php.log" 2>&1 &
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:8080/api/v1/info > /dev/null && break; sleep 1; done
       - name: 相容性測試
-        run: FD_BASE=http://127.0.0.1:8080 FD_SETUP_TOKEN=ci-setup-token-0123456789 node --test conformance/api.test.mjs
+        run: FD_BASE=http://127.0.0.1:8080 FD_SETUP_TOKEN=ci-setup-token-0123456789 FD_ADMIN_PATH=/console-ci node --test conformance/api.test.mjs conformance/web.test.mjs
       - if: failure()
         run: cat "$RUNNER_TEMP/php.log"
 
@@ -110,11 +112,11 @@ jobs:
       - name: 啟動主機
         run: |
           mkdir -p "$RUNNER_TEMP/php"
-          printf "<?php\nreturn ['setup_token' => 'ci-setup-token-0123456789', 'db' => ['dsn' => 'mysql:host=127.0.0.1;port=3306;dbname=fleetdispatch;charset=utf8mb4', 'user' => 'fleetdispatch', 'password' => 'fd-ci-password']];\n" > "$RUNNER_TEMP/php/config.php"
+          printf "<?php\nreturn ['setup_token' => 'ci-setup-token-0123456789', 'db' => ['dsn' => 'mysql:host=127.0.0.1;port=3306;dbname=fleetdispatch;charset=utf8mb4', 'user' => 'fleetdispatch', 'password' => 'fd-ci-password'], 'admin_path' => '/console-ci'];\n" > "$RUNNER_TEMP/php/config.php"
           FD_PHP_CONFIG="$RUNNER_TEMP/php/config.php" php -S 127.0.0.1:8080 php/public/index.php > "$RUNNER_TEMP/php.log" 2>&1 &
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:8080/api/v1/info > /dev/null && break; sleep 1; done
           curl -s http://127.0.0.1:8080/api/v1/info
       - name: 相容性測試
-        run: FD_BASE=http://127.0.0.1:8080 FD_SETUP_TOKEN=ci-setup-token-0123456789 node --test conformance/api.test.mjs
+        run: FD_BASE=http://127.0.0.1:8080 FD_SETUP_TOKEN=ci-setup-token-0123456789 FD_ADMIN_PATH=/console-ci node --test conformance/api.test.mjs conformance/web.test.mjs
       - if: failure()
         run: cat "$RUNNER_TEMP/php.log"

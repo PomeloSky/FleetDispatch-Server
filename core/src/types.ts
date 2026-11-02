@@ -106,6 +106,8 @@ export interface ServerConfig {
   setupToken: string | null;
   /** 第一次初始化時使用的伺服器名稱。 */
   defaultName: string;
+  /** 網頁管理的網址路徑（例如 `/admin`）；`null` 表示關閉。 */
+  adminPath: string | null;
 }
 
 export class ApiError extends Error {
