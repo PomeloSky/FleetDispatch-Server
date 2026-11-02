@@ -1,0 +1,21 @@
+# FleetDispatch Server（PHP 版）— Apache／LiteSpeed 設定。
+# 所有請求都交給 index.php（API 在 <基底網址>/api/v1/）；這個資料夾裡的其他檔案不能直接存取。
+# 需要 mod_rewrite。主機沒有 mod_rewrite 時，App 的基底網址改用 https://<主機>/<路徑>/index.php
+# （API 就是 …/index.php/api/v1/…）。
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # 把 Authorization 標頭（權杖）交給 PHP：PHP 以 CGI／FastCGI 執行時，Apache 預設不會傳這個標頭。
+    RewriteCond %{HTTP:Authorization} .
+    RewriteRule ^ - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+
+    # index.php 本身不再改寫；其他所有路徑都交給 index.php（原始路徑仍在 REQUEST_URI 中）。
+    # 網站用 Alias 對應到這個資料夾時，請在下面加上 RewriteBase /<對應的網址路徑>/
+    RewriteRule ^index\.php$ - [L]
+    RewriteRule ^ index.php [L]
+</IfModule>
+
+# 仍然收不到權杖（一直回 401）時，可以改用下面這一行（Apache 2.4.13 以上，
+# 且主機允許 .htaccess 使用 AuthConfig；不允許時整個網站會回 500，請再改回註解）：
+# CGIPassAuth On

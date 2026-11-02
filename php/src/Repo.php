@@ -1,0 +1,416 @@
+<?php
+
+declare(strict_types=1);
+
+namespace FleetDispatch;
+
+/**
+ * 儲存層（對應 core/src/db.ts 的 Repo）。資料表與欄位和 TypeScript 版相同；SQL 只用 MySQL 與 SQLite 都支援的語法，
+ * 「沒有就新增、有就更新」在寫入交易中先讀再寫（不依賴 UPSERT 語法，舊版 SQLite 也能用）。
+ */
+final class Repo
+{
+    private const RECORD_COLUMNS = 'entity, id, seq, modified_at, deleted, payload, driver_uuid, driver_name, requester_device, vehicle_plate, created_by';
+    private const DEVICE_COLUMNS = 'device_id, name, platform, role, driver_uuid, driver_name, token_hash, token_expires_at, paired_at, last_seen_at, revoked_at, identity';
+    private const CODE_COLUMNS = 'id, code_hash, role, driver_uuid, driver_name, label, created_by, created_at, expires_at, used_at';
+
+    public function __construct(private readonly Db $db)
+    {
+    }
+
+    private static function nstr(mixed $v): ?string
+    {
+        return $v === null ? null : (string) $v;
+    }
+
+    private static function nint(mixed $v): ?int
+    {
+        return $v === null ? null : (int) $v;
+    }
+
+    // ───────── 伺服器資訊 ─────────
+
+    /** @return array{serverId: string, name: string} */
+    public function meta(): array
+    {
+        $out = ['serverId' => '', 'name' => ''];
+        foreach ($this->db->all("SELECT k, v FROM fd_meta WHERE k IN ('serverId', 'name')") as $r) {
+            $out[(string) $r['k']] = (string) $r['v'];
+        }
+        return $out;
+    }
+
+    public function setName(string $name): void
+    {
+        $this->db->run("UPDATE fd_meta SET v = ? WHERE k = 'name'", [$name]);
+    }
+
+    public function currentSeq(): int
+    {
+        return (int) ($this->db->value("SELECT v FROM fd_meta WHERE k = 'seq'") ?? 0);
+    }
+
+    // ───────── 裝置 ─────────
+
+    /**
+     * @param array<string, mixed> $r
+     * @return array<string, mixed>
+     */
+    private static function device(array $r): array
+    {
+        return [
+            'device_id' => (string) $r['device_id'],
+            'name' => (string) $r['name'],
+            'platform' => (string) $r['platform'],
+            'role' => (string) $r['role'],
+            'driver_uuid' => self::nstr($r['driver_uuid']),
+            'driver_name' => self::nstr($r['driver_name']),
+            'token_hash' => self::nstr($r['token_hash']),
+            'token_expires_at' => self::nint($r['token_expires_at']),
+            'paired_at' => (int) $r['paired_at'],
+            'last_seen_at' => self::nint($r['last_seen_at']),
+            'revoked_at' => self::nint($r['revoked_at']),
+            'identity' => self::nstr($r['identity']),
+        ];
+    }
+
+    public function countActiveAdmins(): int
+    {
+        return (int) $this->db->value("SELECT COUNT(*) AS n FROM fd_devices WHERE role = 'admin' AND revoked_at IS NULL");
+    }
+
+    /** @return array<string, mixed>|null */
+    public function deviceByTokenHash(string $hash): ?array
+    {
+        $r = $this->db->first('SELECT ' . self::DEVICE_COLUMNS . ' FROM fd_devices WHERE token_hash = ? AND revoked_at IS NULL', [$hash]);
+        return $r === null ? null : self::device($r);
+    }
+
+    /** @return array<string, mixed>|null */
+    public function deviceById(string $id): ?array
+    {
+        $r = $this->db->first('SELECT ' . self::DEVICE_COLUMNS . ' FROM fd_devices WHERE device_id = ?', [$id]);
+        return $r === null ? null : self::device($r);
+    }
+
+    /** @return list<array<string, mixed>> */
+    public function listDevices(): array
+    {
+        return array_map(static fn (array $r): array => self::device($r), $this->db->all('SELECT ' . self::DEVICE_COLUMNS . ' FROM fd_devices ORDER BY paired_at'));
+    }
+
+    public function touchDevice(string $id, int $now, int $expiresAt): void
+    {
+        $this->db->run('UPDATE fd_devices SET last_seen_at = ?, token_expires_at = ? WHERE device_id = ?', [$now, $expiresAt, $id]);
+    }
+
+    /**
+     * 配對成功：建立裝置，或覆寫同一個 ID 的舊裝置（解除配對或權杖過期的）。在寫入交易中呼叫。
+     * 每次配對都產生新的主機端身分（identity）：以同一個 deviceId 重新配對不會繼承之前建立的資料的擁有權。
+     *
+     * @param array{id: string, name: string, platform: string, role: string, binding: array{driverUuid: string, driverName: string}|null, tokenHash: string, expiresAt: int} $d
+     */
+    public function saveDevice(bool $exists, array $d, int $now): void
+    {
+        $uuid = $d['binding']['driverUuid'] ?? null;
+        $name = $d['binding']['driverName'] ?? null;
+        $identity = Crypto::uuid4();
+        if ($exists) {
+            $this->db->run(
+                'UPDATE fd_devices SET name = ?, platform = ?, role = ?, driver_uuid = ?, driver_name = ?, token_hash = ?, token_expires_at = ?,
+                   paired_at = ?, last_seen_at = ?, revoked_at = NULL, identity = ? WHERE device_id = ?',
+                [$d['name'], $d['platform'], $d['role'], $uuid, $name, $d['tokenHash'], $d['expiresAt'], $now, $now, $identity, $d['id']],
+            );
+            return;
+        }
+        $this->db->run(
+            'INSERT INTO fd_devices (device_id, name, platform, role, driver_uuid, driver_name, token_hash, token_expires_at, paired_at, last_seen_at, revoked_at, identity)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)',
+            [$d['id'], $d['name'], $d['platform'], $d['role'], $uuid, $name, $d['tokenHash'], $d['expiresAt'], $now, $now, $identity],
+        );
+    }
+
+    public function revokeDevice(string $id, int $now): void
+    {
+        $this->db->run('UPDATE fd_devices SET revoked_at = ?, token_hash = NULL WHERE device_id = ? AND revoked_at IS NULL', [$now, $id]);
+    }
+
+    /** @param array{driverUuid: string, driverName: string}|null $binding */
+    public function updateDevice(string $id, string $role, ?array $binding): void
+    {
+        $this->db->run(
+            'UPDATE fd_devices SET role = ?, driver_uuid = ?, driver_name = ? WHERE device_id = ?',
+            [$role, $binding['driverUuid'] ?? null, $binding['driverName'] ?? null, $id],
+        );
+    }
+
+    // ───────── 配對嘗試次數 ─────────
+
+    public function recordFailure(string $ip, int $now): void
+    {
+        $this->db->run('DELETE FROM fd_attempts WHERE at < ?', [$now - 24 * 3600 * 1000]);
+        $this->db->run('INSERT INTO fd_attempts (ip, at) VALUES (?, ?)', [$ip, $now]);
+    }
+
+    /** @return array{count: int, oldest: int|null} */
+    public function failures(string $ip, int $since): array
+    {
+        $r = $this->db->first('SELECT COUNT(*) AS n, MIN(at) AS oldest FROM fd_attempts WHERE ip = ? AND at > ?', [$ip, $since]);
+        return ['count' => (int) ($r['n'] ?? 0), 'oldest' => self::nint($r['oldest'] ?? null)];
+    }
+
+    // ───────── 配對碼 ─────────
+
+    /**
+     * @param array<string, mixed> $r
+     * @return array<string, mixed>
+     */
+    private static function code(array $r): array
+    {
+        return [
+            'id' => (string) $r['id'],
+            'code_hash' => (string) $r['code_hash'],
+            'role' => (string) $r['role'],
+            'driver_uuid' => self::nstr($r['driver_uuid']),
+            'driver_name' => self::nstr($r['driver_name']),
+            'label' => (string) $r['label'],
+            'created_by' => (string) $r['created_by'],
+            'created_at' => (int) $r['created_at'],
+            'expires_at' => (int) $r['expires_at'],
+            'used_at' => self::nint($r['used_at']),
+        ];
+    }
+
+    /** @param array{id: string, code_hash: string, role: string, driver_uuid: ?string, driver_name: ?string, label: string, created_by: string, created_at: int, expires_at: int} $row */
+    public function createCode(array $row): void
+    {
+        $this->db->run(
+            'INSERT INTO fd_pairing_codes (id, code_hash, role, driver_uuid, driver_name, label, created_by, created_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [$row['id'], $row['code_hash'], $row['role'], $row['driver_uuid'], $row['driver_name'], $row['label'], $row['created_by'], $row['created_at'], $row['expires_at']],
+        );
+    }
+
+    /** @return array<string, mixed>|null */
+    public function findUsableCode(string $hash, int $now): ?array
+    {
+        $r = $this->db->first('SELECT ' . self::CODE_COLUMNS . ' FROM fd_pairing_codes WHERE code_hash = ? AND used_at IS NULL AND expires_at > ?', [$hash, $now]);
+        return $r === null ? null : self::code($r);
+    }
+
+    /** 用掉配對碼（單次有效：只有還沒用過、沒過期的才會被更新）。回傳是否成功。 */
+    public function consumeCode(string $hash, string $deviceId, int $now): bool
+    {
+        return $this->db->run(
+            'UPDATE fd_pairing_codes SET used_at = ?, used_by = ? WHERE code_hash = ? AND used_at IS NULL AND expires_at > ?',
+            [$now, $deviceId, $hash, $now],
+        ) > 0;
+    }
+
+    /** @return list<array<string, mixed>> */
+    public function listCodes(int $now): array
+    {
+        return array_map(
+            static fn (array $r): array => self::code($r),
+            $this->db->all('SELECT ' . self::CODE_COLUMNS . ' FROM fd_pairing_codes WHERE used_at IS NULL AND expires_at > ? ORDER BY created_at', [$now]),
+        );
+    }
+
+    public function deleteCode(string $id): int
+    {
+        return $this->db->run('DELETE FROM fd_pairing_codes WHERE id = ?', [$id]);
+    }
+
+    // ───────── 資料 ─────────
+
+    /**
+     * @param array<string, mixed> $r
+     * @return array<string, mixed>
+     */
+    private static function record(array $r, bool $decode): array
+    {
+        $deleted = (int) $r['deleted'] === 1;
+        $text = !$deleted && $r['payload'] !== null ? (string) $r['payload'] : null;
+        return [
+            'entity' => (string) $r['entity'],
+            'id' => (string) $r['id'],
+            'seq' => (int) $r['seq'],
+            'modifiedAt' => (float) $r['modified_at'],
+            'deleted' => $deleted,
+            'payload' => $decode && $text !== null ? Json::decodeObject($text) : null,
+            'payloadText' => $text,
+            'driverUuid' => self::nstr($r['driver_uuid']),
+            'driverName' => self::nstr($r['driver_name']),
+            'requesterDevice' => self::nstr($r['requester_device']),
+            'vehiclePlate' => self::nstr($r['vehicle_plate']),
+            'createdBy' => self::nstr($r['created_by']),
+        ];
+    }
+
+    /** @return array<string, mixed>|null 含墓碑；payload 已解碼 */
+    public function getRecord(string $entity, string $id): ?array
+    {
+        $r = $this->db->first('SELECT ' . self::RECORD_COLUMNS . ' FROM fd_records WHERE entity = ? AND id = ?', [$entity, $id]);
+        return $r === null ? null : self::record($r, true);
+    }
+
+    /** @return array<string, mixed>|null 只有查詢範圍用的欄位（不解碼 payload） */
+    public function getRecordScope(string $entity, string $id): ?array
+    {
+        $r = $this->db->first('SELECT entity, id, driver_uuid, driver_name, requester_device, created_by FROM fd_records WHERE entity = ? AND id = ?', [$entity, $id]);
+        if ($r === null) {
+            return null;
+        }
+        return [
+            'entity' => (string) $r['entity'],
+            'id' => (string) $r['id'],
+            'driverUuid' => self::nstr($r['driver_uuid']),
+            'driverName' => self::nstr($r['driver_name']),
+            'requesterDevice' => self::nstr($r['requester_device']),
+            'createdBy' => self::nstr($r['created_by']),
+        ];
+    }
+
+    /**
+     * 建立或修改（在寫入交易中呼叫；授權與最後寫入者勝已經判斷過）。墓碑會被復原成一般資料。
+     * created_by：新建立或復活墓碑時是寫入者的配對身分；修改現存的資料時保留原本的建立者。updated_by 是用戶端的裝置 ID。
+     *
+     * @param array<string, mixed>|null $existing 主機上現存的版本（含墓碑），在同一個交易中讀取
+     * @param array{driverUuid: ?string, driverName: ?string, requesterDevice: ?string, vehiclePlate: ?string} $f
+     */
+    public function writeRecord(?array $existing, string $entity, string $id, int $seq, int|float $modifiedAt, string $payloadText, array $f, string $identity, string $deviceId, int $now): void
+    {
+        if ($existing === null) {
+            $this->db->run(
+                'INSERT INTO fd_records (entity, id, seq, modified_at, deleted, payload, driver_uuid, driver_name, requester_device, vehicle_plate,
+                   created_by, updated_by, updated_at)
+                 VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [$entity, $id, $seq, $modifiedAt, $payloadText, $f['driverUuid'], $f['driverName'], $f['requesterDevice'], $f['vehiclePlate'], $identity, $deviceId, $now],
+            );
+            return;
+        }
+        // 在 PHP 決定建立者（不寫成 SQL 的 CASE：MySQL 的 UPDATE 會由左到右套用新值，容易讀到已改過的 deleted）。
+        $createdBy = $existing['deleted'] ? $identity : $existing['createdBy'];
+        $this->db->run(
+            'UPDATE fd_records SET seq = ?, modified_at = ?, deleted = 0, payload = ?, driver_uuid = ?, driver_name = ?, requester_device = ?,
+               vehicle_plate = ?, created_by = ?, updated_by = ?, updated_at = ? WHERE entity = ? AND id = ?',
+            [$seq, $modifiedAt, $payloadText, $f['driverUuid'], $f['driverName'], $f['requesterDevice'], $f['vehiclePlate'], $createdBy, $deviceId, $now, $entity, $id],
+        );
+    }
+
+    /** 改為墓碑（保留查詢欄位；在寫入交易中呼叫）。回傳是否改到。 */
+    public function tombstone(string $entity, string $id, int $seq, int|float $at, string $deviceId, int $now): bool
+    {
+        return $this->db->run(
+            'UPDATE fd_records SET deleted = 1, payload = NULL, seq = ?, modified_at = ?, updated_by = ?, updated_at = ?
+             WHERE entity = ? AND id = ? AND deleted = 0',
+            [$seq, $at, $deviceId, $now, $entity, $id],
+        ) > 0;
+    }
+
+    /**
+     * 車牌相同、還沒刪除的子資料（刪除車輛時連鎖刪除）。與 TypeScript 版相同的查詢（不指定順序，由資料庫依索引決定）。
+     *
+     * @param list<string> $entities
+     * @return list<array{entity: string, id: string}>
+     */
+    public function liveChildrenOfPlate(string $plate, array $entities): array
+    {
+        $marks = implode(', ', array_fill(0, count($entities), '?'));
+        $rows = $this->db->all(
+            "SELECT entity, id, vehicle_plate FROM fd_records WHERE vehicle_plate = ? AND deleted = 0 AND entity IN ({$marks})",
+            array_merge([$plate], $entities),
+        );
+        $out = [];
+        foreach ($rows as $r) {
+            // MySQL 的字串比較會忽略結尾空白；這裡再逐位元組比對一次，結果與 SQLite（TypeScript 版）一致。
+            if ((string) $r['vehicle_plate'] === $plate) {
+                $out[] = ['entity' => (string) $r['entity'], 'id' => (string) $r['id']];
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * 所有未刪除的資料（快照用），依種類、UUID 排序；payload 不解碼（payloadText 是原始 JSON）。
+     *
+     * @return \Generator<int, array<string, mixed>>
+     */
+    public function liveRecords(): \Generator
+    {
+        foreach ($this->db->iterate('SELECT ' . self::RECORD_COLUMNS . ' FROM fd_records WHERE deleted = 0 ORDER BY entity, id') as $r) {
+            yield self::record($r, false);
+        }
+    }
+
+    /** @return list<array<string, mixed>> 序號大於 $seq 的資料（含墓碑），payload 不解碼 */
+    public function changesSince(int $seq, int $limit): array
+    {
+        $rows = $this->db->all('SELECT ' . self::RECORD_COLUMNS . ' FROM fd_records WHERE seq > ? ORDER BY seq LIMIT ?', [$seq, $limit]);
+        return array_map(static fn (array $r): array => self::record($r, false), $rows);
+    }
+
+    // ───────── 稽核紀錄 ─────────
+
+    public function addAudit(int $at, string $deviceId, string $deviceName, string $entity, string $entityId, string $operation, string $summary): void
+    {
+        $this->db->run(
+            'INSERT INTO fd_audit (at, device_id, device_name, entity, entity_id, operation, summary) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            [$at, $deviceId, $deviceName, $entity, $entityId, $operation, $summary],
+        );
+    }
+
+    /** @return list<array<string, mixed>> 新的在前 */
+    public function listAudit(?int $before, int $limit): array
+    {
+        $columns = 'id, at, device_id, device_name, entity, entity_id, operation, summary';
+        if ($before === null) {
+            return $this->db->all("SELECT {$columns} FROM fd_audit ORDER BY id DESC LIMIT ?", [$limit]);
+        }
+        return $this->db->all("SELECT {$columns} FROM fd_audit WHERE id < ? ORDER BY id DESC LIMIT ?", [$before, $limit]);
+    }
+
+    // ───────── 即時位置 ─────────
+
+    /**
+     * 每趟只保留最新的一筆（在寫入交易中呼叫）。
+     *
+     * @param array{trip_id: string, device_id: string, device_name: string, plate: ?string, latitude: int|float, longitude: int|float, speed: int|float|null, course: int|float|null, ts: int|float, updated_at: int} $row
+     */
+    public function upsertLocation(array $row): void
+    {
+        $this->db->run('DELETE FROM fd_locations WHERE trip_id = ?', [$row['trip_id']]);
+        $this->db->run(
+            'INSERT INTO fd_locations (trip_id, device_id, device_name, plate, latitude, longitude, speed, course, ts, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [
+                $row['trip_id'], $row['device_id'], $row['device_name'], $row['plate'],
+                (float) $row['latitude'], (float) $row['longitude'],
+                $row['speed'] === null ? null : (float) $row['speed'],
+                $row['course'] === null ? null : (float) $row['course'],
+                (float) $row['ts'], $row['updated_at'],
+            ],
+        );
+    }
+
+    public function deleteLocation(string $tripId): void
+    {
+        $this->db->run('DELETE FROM fd_locations WHERE trip_id = ?', [$tripId]);
+    }
+
+    /** 移除太久沒有更新的位置。 */
+    public function purgeLocations(int $freshAfter): void
+    {
+        $this->db->run('DELETE FROM fd_locations WHERE updated_at < ?', [$freshAfter]);
+    }
+
+    /** @return list<array<string, mixed>> 新的在前 */
+    public function listLocations(int $freshAfter): array
+    {
+        return $this->db->all(
+            'SELECT trip_id, device_id, device_name, plate, latitude, longitude, speed, course, ts, updated_at FROM fd_locations
+             WHERE updated_at >= ? ORDER BY updated_at DESC',
+            [$freshAfter],
+        );
+    }
+}

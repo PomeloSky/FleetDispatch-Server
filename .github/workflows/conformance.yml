@@ -46,3 +46,75 @@ jobs:
         run: FD_BASE=http://127.0.0.1:8787 FD_SETUP_TOKEN=ci-setup-token-0123456789 node --test conformance/api.test.mjs
       - if: failure()
         run: cat "$RUNNER_TEMP/wrangler.log"
+
+  php-sqlite:
+    name: PHP 8.4＋SQLite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: pdo_sqlite
+          ini-values: error_reporting=-1
+      - name: 檢查語法
+        run: for f in php/src/*.php php/public/index.php php/config.sample.php; do php -l "$f"; done
+      - name: 啟動主機
+        run: |
+          mkdir -p "$RUNNER_TEMP/php"
+          printf "<?php\nreturn ['setup_token' => 'ci-setup-token-0123456789', 'db' => ['dsn' => 'sqlite:%s/php/fd.sqlite']];\n" "$RUNNER_TEMP" > "$RUNNER_TEMP/php/config.php"
+          FD_PHP_CONFIG="$RUNNER_TEMP/php/config.php" php -S 127.0.0.1:8080 php/public/index.php > "$RUNNER_TEMP/php.log" 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8080/api/v1/info > /dev/null && break; sleep 1; done
+      - name: 相容性測試
+        run: FD_BASE=http://127.0.0.1:8080 FD_SETUP_TOKEN=ci-setup-token-0123456789 node --test conformance/api.test.mjs
+      - if: failure()
+        run: cat "$RUNNER_TEMP/php.log"
+
+  php-mysql:
+    name: PHP ${{ matrix.php }}＋${{ matrix.db }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - php: '8.1'
+            db: mysql:8.0
+          - php: '8.4'
+            db: mariadb:10.6
+    services:
+      db:
+        image: ${{ matrix.db }}
+        env:
+          MYSQL_ROOT_PASSWORD: root-ci
+          MYSQL_DATABASE: fleetdispatch
+          MYSQL_USER: fleetdispatch
+          MYSQL_PASSWORD: fd-ci-password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot-ci || healthcheck.sh --connect"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: pdo_mysql
+          ini-values: error_reporting=-1
+      - name: 啟動主機
+        run: |
+          mkdir -p "$RUNNER_TEMP/php"
+          printf "<?php\nreturn ['setup_token' => 'ci-setup-token-0123456789', 'db' => ['dsn' => 'mysql:host=127.0.0.1;port=3306;dbname=fleetdispatch;charset=utf8mb4', 'user' => 'fleetdispatch', 'password' => 'fd-ci-password']];\n" > "$RUNNER_TEMP/php/config.php"
+          FD_PHP_CONFIG="$RUNNER_TEMP/php/config.php" php -S 127.0.0.1:8080 php/public/index.php > "$RUNNER_TEMP/php.log" 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8080/api/v1/info > /dev/null && break; sleep 1; done
+          curl -s http://127.0.0.1:8080/api/v1/info
+      - name: 相容性測試
+        run: FD_BASE=http://127.0.0.1:8080 FD_SETUP_TOKEN=ci-setup-token-0123456789 node --test conformance/api.test.mjs
+      - if: failure()
+        run: cat "$RUNNER_TEMP/php.log"

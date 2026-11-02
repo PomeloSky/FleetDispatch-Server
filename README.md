@@ -30,7 +30,7 @@
 core/          TypeScript 核心（Cloudflare 與 Docker 共用；只用 Web 標準 API，沒有框架相依）
 cloudflare/    Cloudflare Workers＋D1 的進入點與 wrangler 設定
 docker/        Node 24（內建 node:sqlite）的進入點與維護工具
-php/           PHP 8.1＋MySQL（或 SQLite）實作
+php/           PHP 8.1 以上＋MySQL 8.0／MariaDB 10.6 以上（或 SQLite）實作
 conformance/   相容性測試：對任何一台主機執行，三種實作都必須通過
 docs/          協定規格與各部署方式的架設說明
 ```
@@ -53,7 +53,7 @@ npm install
 npm run typecheck            # TypeScript 型別檢查
 npm run docker:dev           # 本機以 Node 執行（資料在 ./data）
 npm run cf:dev               # 本機以 wrangler 執行 Worker（本機 D1）
-php -S 127.0.0.1:8080 php/public/index.php   # PHP 版（見 docs/setup-php-mysql.md）
+FD_PHP_CONFIG=/path/to/config.php php -S 127.0.0.1:8080 php/public/index.php   # PHP 版（見 docs/setup-php-mysql.md）
 ```
 
 ## 更新

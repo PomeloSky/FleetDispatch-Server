@@ -1,0 +1,8 @@
+# 資料庫結構檔：不能從網站直接存取。
+<IfModule mod_authz_core.c>
+    Require all denied
+</IfModule>
+<IfModule !mod_authz_core.c>
+    Order allow,deny
+    Deny from all
+</IfModule>
