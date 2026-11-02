@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "description": "可自行架設的 FleetDispatch 主機（Cloudflare Workers＋D1、Docker／Node、PHP＋MySQL）",
+  "license": "AGPL-3.0-only",
   "type": "module",
   "engines": {
     "node": ">=24"

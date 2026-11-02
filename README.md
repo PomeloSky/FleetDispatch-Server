@@ -60,3 +60,13 @@ FD_PHP_CONFIG=/path/to/config.php php -S 127.0.0.1:8080 php/public/index.php   #
 
 - 三種實作的資料表會在啟動或第一次請求時自動建立；之後的版本若需要調整資料表，會在更新說明中寫明步驟。
 - 更新前請先備份（各部署方式的說明都有備份方法）。
+
+## 授權
+
+Copyright (C) 2026 PomeloSky
+
+本專案以 [GNU Affero General Public License v3.0](LICENSE)（AGPL-3.0-only）授權。
+
+- 照原樣架設自己使用、或在公司內部使用，不需要額外做任何事。
+- 修改了程式並提供給其他人透過網路連線使用（例如架成服務給別的公司用）時，必須讓這些使用者能取得修改後的完整原始碼，並同樣以 AGPL-3.0 授權。
+- 詳細條款以 [LICENSE](LICENSE) 的英文原文為準。
