@@ -28,8 +28,9 @@ final class App
         try {
             $config = null;
             $setupError = null;
+            $configPath = self::configPath($appDir);
             try {
-                $config = Config::load(self::configPath($appDir));
+                $config = Config::load($configPath);
             } catch (SetupError $e) {
                 $setupError = $e;
             }
@@ -55,6 +56,10 @@ final class App
                 throw new ApiError(404, 'not_found', '找不到這個端點');
             }
             if ($setupError !== null || $config === null) {
+                // 還沒有 config.php：安裝精靈的端點（網頁管理的安裝畫面使用）。安裝完成後這些路徑照一般 API 回 404。
+                if ($setupError instanceof MissingConfig && ($path === 'install' || $path === 'install/test')) {
+                    return Installer::handle($request, $path, $appDir, $configPath);
+                }
                 throw $setupError ?? new SetupError('找不到設定檔');
             }
             $db = Db::connect($config);

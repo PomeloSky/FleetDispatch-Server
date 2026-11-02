@@ -72,8 +72,14 @@ jobs:
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:8080/api/v1/info > /dev/null && break; sleep 1; done
       - name: 相容性測試
         run: FD_BASE=http://127.0.0.1:8080 FD_SETUP_TOKEN=ci-setup-token-0123456789 FD_ADMIN_PATH=/console-ci node --test conformance/api.test.mjs conformance/web.test.mjs
+      - name: 安裝精靈（SQLite；沒有 config.php 的程式資料夾）
+        run: |
+          cp -R php "$RUNNER_TEMP/php-app"
+          php -S 127.0.0.1:8081 "$RUNNER_TEMP/php-app/public/index.php" > "$RUNNER_TEMP/php-install.log" 2>&1 &
+          for i in $(seq 1 30); do curl -s -o /dev/null http://127.0.0.1:8081/ && break; sleep 1; done
+          FD_BASE=http://127.0.0.1:8081 FD_INSTALL_DB=sqlite node --test conformance/php-install.test.mjs
       - if: failure()
-        run: cat "$RUNNER_TEMP/php.log"
+        run: cat "$RUNNER_TEMP/php.log" "$RUNNER_TEMP/php-install.log" || true
 
   php-mysql:
     name: PHP ${{ matrix.php }}＋${{ matrix.db }}
@@ -118,5 +124,12 @@ jobs:
           curl -s http://127.0.0.1:8080/api/v1/info
       - name: 相容性測試
         run: FD_BASE=http://127.0.0.1:8080 FD_SETUP_TOKEN=ci-setup-token-0123456789 FD_ADMIN_PATH=/console-ci node --test conformance/api.test.mjs conformance/web.test.mjs
+      - name: 安裝精靈（另一個空的資料庫；沒有 config.php 的程式資料夾）
+        run: |
+          docker exec ${{ job.services.db.id }} mysql -uroot -proot-ci -e "CREATE DATABASE fd_install CHARACTER SET utf8mb4; GRANT ALL PRIVILEGES ON fd_install.* TO 'fleetdispatch'@'%'; FLUSH PRIVILEGES;"
+          cp -R php "$RUNNER_TEMP/php-app"
+          php -S 127.0.0.1:8081 "$RUNNER_TEMP/php-app/public/index.php" > "$RUNNER_TEMP/php-install.log" 2>&1 &
+          for i in $(seq 1 30); do curl -s -o /dev/null http://127.0.0.1:8081/ && break; sleep 1; done
+          FD_BASE=http://127.0.0.1:8081 FD_INSTALL_DB=mysql FD_DB_HOST=127.0.0.1 FD_DB_PORT=3306 FD_DB_NAME=fd_install FD_DB_USER=fleetdispatch FD_DB_PASSWORD=fd-ci-password node --test conformance/php-install.test.mjs
       - if: failure()
-        run: cat "$RUNNER_TEMP/php.log"
+        run: cat "$RUNNER_TEMP/php.log" "$RUNNER_TEMP/php-install.log" || true

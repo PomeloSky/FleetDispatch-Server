@@ -244,8 +244,8 @@
     }
   }
 
-  async function call(method, path, body, auth = true) {
-    const headers = { Accept: 'application/json' };
+  async function call(method, path, body, auth = true, extra = null) {
+    const headers = { Accept: 'application/json', ...(extra || {}) };
     if (auth && state.session) headers.Authorization = 'Bearer ' + state.session.token;
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     let res;
@@ -286,7 +286,10 @@
     try {
       state.info = await call('GET', 'info', undefined, false);
     } catch (e) {
-      renderFatal(e);
+      // PHP 版還沒有 config.php 時，改顯示安裝精靈。
+      const setup = await installStatus();
+      if (setup) renderInstall(setup);
+      else renderFatal(e);
       return;
     }
     document.title = `${state.info.name}｜FleetDispatch Server 管理`;
@@ -328,6 +331,178 @@
       h('h1', { text: '無法開啟網頁管理' }),
       banner('error', e.message, setupHint ? '請依主機的架設說明檢查設定，修正後重新整理這一頁。' : null),
       h('div', { class: 'row' }, h('button', { class: 'btn', type: 'button', text: '重試', onclick: boot })))));
+  }
+
+  // ───────── 安裝精靈（PHP 版，還沒有 config.php 時） ─────────
+
+  async function installStatus() {
+    try {
+      // 附上假的權杖，讓主機回報 Authorization 標頭能不能傳到 PHP。
+      const s = await call('GET', 'install', undefined, false, { Authorization: 'Bearer fd-install-header-check-000000000000' });
+      return s && s.installed === false ? s : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function field(id, label, control, hint) {
+    return h('div', { class: 'field' }, h('label', { for: id, text: label }), control, hint ? h('span', { class: 'hint', text: hint }) : null);
+  }
+
+  function copyButton(value, label) {
+    return h('button', { class: 'btn ghost small', type: 'button', text: label || '複製', onclick: () => copy(value) });
+  }
+
+  function installError(e) {
+    if (e.code === 'rate_limited') return `嘗試太多次，請 ${Math.ceil((e.retryAfter || 900) / 60)} 分鐘後再試。`;
+    return e.message;
+  }
+
+  function renderInstall(s) {
+    stopTimers();
+    const row = (ok, title, detail, level) => h('li', null,
+      h('span', { class: 'chip ' + (ok ? 'ok' : level || 'warn'), text: ok ? '正常' : level === 'danger' ? '需要處理' : '注意' }),
+      h('div', null, h('div', { text: title }), !ok && detail ? h('div', { class: 'muted', text: detail }) : null));
+    const drivers = [s.drivers.mysql ? 'MySQL／MariaDB' : null, s.drivers.sqlite ? 'SQLite' : null].filter(Boolean);
+    const checks = h('ul', { class: 'checks' },
+      row(true, `PHP ${s.phpVersion}`),
+      row(drivers.length > 0, '資料庫擴充功能：' + (drivers.join('、') || '沒有'), '請在主機控制台的 PHP 設定啟用 pdo_mysql（或 pdo_sqlite）後重新整理這一頁。', 'danger'),
+      row(s.rewrite, '網址改寫', '網址改寫沒有作用：App 的主機網址要加上 /index.php；或請主機商啟用 mod_rewrite 並允許 .htaccess。'),
+      row(s.authorization, '權杖標頭（Authorization）', 'PHP 收不到 Authorization 標頭，App 配對後會一直被要求重新配對。請照架設說明「疑難排解」的「一直回 401」修正。', 'danger'),
+      row(s.https, 'HTTPS', '目前不是用 HTTPS 開啟。App 只接受 HTTPS（區域網路位址除外），請先在主機控制台啟用 SSL 憑證。'),
+      row(s.writable, '自動建立設定檔', '程式資料夾不能寫入：完成時會顯示設定檔的內容，請用檔案管理員自己建立 config.php。'));
+
+    const page = h('div', { class: 'narrow wide' },
+      brand('安裝'),
+      h('h1', { text: '安裝 FleetDispatch Server' }),
+      h('p', { text: '這台主機還沒有設定。照下面的步驟完成安裝；完成後這個安裝畫面就會消失。' }),
+      card('1. 主機環境', null, checks));
+
+    if (!s.installable) {
+      page.append(banner('error', '設定檔的位置由環境變數 FD_PHP_CONFIG 指定', '請依架設說明手動建立設定檔。'));
+      clear(app).append(h('div', { class: 'center' }, page));
+      return;
+    }
+    if (drivers.length === 0) {
+      page.append(h('div', { class: 'row' }, h('button', { class: 'btn', type: 'button', text: '重新檢查', onclick: boot })));
+      clear(app).append(h('div', { class: 'center' }, page));
+      return;
+    }
+
+    const input = (id, value, extra) => h('input', { type: 'text', id, value, spellcheck: 'false', autocomplete: 'off', ...(extra || {}) });
+    const driver = h('select', { id: 'db-driver' },
+      s.drivers.mysql ? h('option', { value: 'mysql', text: 'MySQL／MariaDB（建議）' }) : null,
+      s.drivers.sqlite ? h('option', { value: 'sqlite', text: 'SQLite（測試或很小的車隊）' }) : null);
+    const host = input('db-host', 'localhost');
+    const port = input('db-port', '3306', { inputmode: 'numeric', maxlength: '5' });
+    const dbName = input('db-name', '', { placeholder: '例如 帳號_fleet', maxlength: '64' });
+    const user = input('db-user', '', { maxlength: '80' });
+    const pass = h('input', { type: 'password', id: 'db-pass', autocomplete: 'new-password', maxlength: '200' });
+    const serverName = input('server-name', 'FleetDispatch Server', { maxlength: '100' });
+    const mysqlFields = h('div', { class: 'grid2' },
+      field('db-host', '資料庫主機', host, '虛擬主機通常是 localhost'),
+      field('db-port', '連接埠', port, 'MySQL 通常是 3306'),
+      field('db-name', '資料庫名稱', dbName, '在主機控制台建立的資料庫'),
+      field('db-user', '使用者', user, '有這個資料庫全部權限的使用者'),
+      field('db-pass', '密碼', pass));
+    const sqliteNote = h('p', { class: 'muted', text: 'SQLite 的資料庫檔案會放在程式資料夾的 data/，不需要另外建立資料庫。正式使用、多台裝置同時同步時建議用 MySQL。' });
+    const sync = () => {
+      mysqlFields.hidden = driver.value !== 'mysql';
+      sqliteNote.hidden = driver.value === 'mysql';
+    };
+    driver.addEventListener('change', sync);
+    sync();
+    const body = () => ({
+      driver: driver.value, host: host.value.trim(), port: port.value.trim(), name: dbName.value.trim(),
+      user: user.value.trim(), password: pass.value, serverName: serverName.value.trim(),
+    });
+
+    const testResult = h('div');
+    const testBtn = h('button', { class: 'btn ghost', type: 'button', text: '測試連線' });
+    testBtn.addEventListener('click', async () => {
+      testBtn.disabled = true;
+      try {
+        const r = await call('POST', 'install/test', body(), false);
+        clear(testResult).append(banner(r.warning ? 'warn' : 'info', `可以連線：${r.version}`, r.warning));
+      } catch (e) {
+        clear(testResult).append(banner('error', installError(e)));
+      }
+      testBtn.disabled = false;
+    });
+    const result = h('div');
+    const installBtn = h('button', { class: 'btn', type: 'submit', text: '完成安裝' });
+    const form = h('form', { class: 'stack', novalidate: true },
+      card('2. 資料庫', '先在主機控制台建立資料庫與使用者（MySQL），再填入這裡。', field('db-driver', '資料庫類型', driver), mysqlFields, sqliteNote,
+        h('div', { class: 'row' }, testBtn), testResult),
+      card('3. 主機名稱', null, field('server-name', '名稱', serverName, 'App 的配對主機頁與網頁管理會顯示這個名稱，之後可以修改。')),
+      h('div', { class: 'row' }, installBtn),
+      result);
+    form.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      installBtn.disabled = true;
+      clear(result);
+      try {
+        const r = await call('POST', 'install', body(), false);
+        renderInstalled(r);
+        return;
+      } catch (e) {
+        clear(result).append(banner('error', installError(e),
+          e.code === 'already_installed' ? '如果不是你完成的安裝，請用檔案管理員刪除程式資料夾裡的 config.php，再重新整理這一頁。' : null));
+      }
+      installBtn.disabled = false;
+    });
+    page.append(form);
+    clear(app).append(h('div', { class: 'center' }, page));
+  }
+
+  function renderInstalled(r) {
+    const hostUrl = location.origin + BASE;
+    const adminUrl = hostUrl + r.adminPath;
+    const go = h('button', { class: 'btn', type: 'button', text: '以這個瀏覽器成為第一位管理員' });
+    const status = h('div');
+    go.addEventListener('click', async () => {
+      go.disabled = true;
+      try {
+        const deviceName = '網頁管理（' + browserName() + '）';
+        const p = await call('POST', 'pair', { code: r.setupToken, deviceId: uuid(), deviceName, platform: 'web' }, false);
+        saveSession({ token: p.token, deviceId: p.deviceId, deviceName }, true);
+        location.assign(adminUrl);
+      } catch (e) {
+        go.disabled = false;
+        clear(status).append(banner('error', e.message));
+      }
+    });
+    const keep = card('請保存這些資料', '存在密碼管理器等安全的地方。設定碼只在這裡顯示，管理員的裝置遺失時要用它恢復；網頁管理的網址不會出現在首頁。',
+      h('dl', { class: 'facts' },
+        h('dt', { text: '設定碼' }), h('dd', null, h('span', { class: 'mono', text: r.setupToken }), ' ', copyButton(r.setupToken)),
+        h('dt', { text: '網頁管理' }), h('dd', null, h('span', { class: 'mono', text: adminUrl }), ' ', copyButton(adminUrl)),
+        h('dt', { text: 'App 輸入的主機網址' }), h('dd', null, h('span', { class: 'mono', text: hostUrl }), ' ', copyButton(hostUrl))));
+    const next = card('下一步', '這個瀏覽器可以直接成為第一位管理員（之後在網頁管理建立配對碼給每一台 App）；也可以改在 App 用設定碼連線。',
+      h('div', { class: 'row' }, go), status);
+    const page = h('div', { class: 'narrow wide' }, brand('安裝'));
+    if (r.written) {
+      page.append(h('h1', { text: '安裝完成' }), banner('info', '已建立設定檔 config.php 與資料表', `資料庫：${r.database}`), keep, next);
+    } else {
+      go.disabled = true;
+      const check = h('button', { class: 'btn ghost', type: 'button', text: '我已建立設定檔' });
+      check.addEventListener('click', async () => {
+        try {
+          await call('GET', 'info', undefined, false);
+          go.disabled = false;
+          clear(status).append(banner('info', '已讀到設定檔，可以繼續。'));
+        } catch (e) {
+          clear(status).append(banner('error', '還讀不到設定檔', e.message));
+        }
+      });
+      page.append(h('h1', { text: '還差一步：建立設定檔' }),
+        banner('warn', '程式資料夾不能寫入，請自己建立 config.php', `資料表已經建立（${r.database}）。`),
+        card('建立 config.php', '用主機控制台的檔案管理員，在 config.sample.php 所在的資料夾建立 config.php，貼上下面的內容並儲存（權限設為 600），再按「我已建立設定檔」。',
+          h('pre', { class: 'config', text: r.config }),
+          h('div', { class: 'row' }, copyButton(r.config, '複製設定檔內容'), check)),
+        keep, next);
+    }
+    clear(app).append(h('div', { class: 'center' }, page));
+    window.scrollTo(0, 0);
   }
 
   const SETUP_SOURCE = {

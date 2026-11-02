@@ -367,4 +367,7 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
   角色不是管理員時只能登出。權杖存在瀏覽器（勾選「記住這個瀏覽器」時是 localStorage，否則是 sessionStorage）；登出是 `POST /unpair`；
   `401` 時清除權杖並回到登入頁。最後一位管理員不能登出（`409 last_admin`），頁面會提示先建立另一位管理員。
 - **相容性測試**：`conformance/web.test.mjs`（`FD_ADMIN_PATH` 與主機的設定相同）。
+- **PHP 版的安裝精靈**（只有 PHP 版、不屬於共同規格）：還沒有 `config.php` 時，網頁管理在預設的 `/admin` 顯示安裝畫面，使用
+  `GET /api/v1/install`（主機環境）、`POST /api/v1/install/test`（測試資料庫）、`POST /api/v1/install`（建立資料表並寫入設定，只能成功一次）。
+  安裝完成後這些路徑照一般 API 回 `404`。測試：`conformance/php-install.test.mjs`。
 

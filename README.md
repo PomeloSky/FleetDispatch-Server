@@ -8,7 +8,7 @@
 | 部署方式 | 適合 | 費用 | 難度 | 架設說明 |
 | --- | --- | --- | --- | --- |
 | **Cloudflare Workers＋D1** | 不想管伺服器、車隊規模中小 | 免費方案通常就夠用 | ★☆☆ | [docs/setup-cloudflare.md](docs/setup-cloudflare.md) |
-| **PHP＋MySQL** | 已經有虛擬主機（cPanel、DirectAdmin、Plesk）或 LAMP 主機 | 現有主機即可 | ★★☆ | [docs/setup-php-mysql.md](docs/setup-php-mysql.md) |
+| **PHP＋MySQL** | 已經有虛擬主機（cPanel、DirectAdmin、Plesk）或 LAMP 主機；有網頁安裝精靈，不需要 SSH | 現有主機即可 | ★★☆ | [docs/setup-php-mysql.md](docs/setup-php-mysql.md) |
 | **Docker** | NAS（Synology、QNAP）、VPS、公司內部伺服器、Raspberry Pi | 自有設備 | ★★☆ | [docs/setup-docker.md](docs/setup-docker.md) |
 
 - App 端的操作：**設定 › 使用模式 › 連線到自訂主機** → 輸入主機網址 → 驗證 → 第一次輸入部署時設定的**設定碼**（這台裝置成為管理員）。
@@ -48,6 +48,8 @@ docs/          協定規格與各部署方式的架設說明
   FD_BASE=https://你的主機網址 FD_SETUP_TOKEN=你的設定碼 FD_ADMIN_PATH=/admin node --test conformance/api.test.mjs conformance/web.test.mjs
   ```
 
+  PHP 版的安裝精靈另有 `conformance/php-install.test.mjs`（對還沒有 `config.php` 的主機執行，見檔案開頭的說明）。
+
   測試會建立管理員與測試資料，並讓執行的 IP 在 15 分鐘內無法配對；**不要對正式使用中的主機執行**。
 
 ## 開發
@@ -69,6 +71,7 @@ FD_PHP_CONFIG=/path/to/config.php php -S 127.0.0.1:8080 php/public/index.php   #
 - 三種實作的資料表會在啟動或第一次請求時自動建立；之後的版本若需要調整資料表，會在更新說明中寫明步驟。
 - 更新前請先備份（各部署方式的說明都有備份方法）。
 - 1.1.0 起提供網頁管理，預設網址是 `/admin`；不需要時設為 `off` 關閉（Cloudflare 與 Docker 的 `FD_ADMIN_PATH`、PHP 的 `admin_path`）。
+- PHP 版還沒有 `config.php` 時，網頁管理會顯示安裝精靈（檢查環境、測試資料庫、產生設定檔）；已經安裝過的主機不受影響。
 
 ## 授權
 

@@ -93,7 +93,24 @@ php/
 mysql -u fleetdispatch -p fleetdispatch < /home/帳號/fleetdispatch/schema/mysql.sql
 ```
 
-## 5. 設定 config.php
+## 5. 設定：安裝精靈或手動建立 config.php
+
+### A. 安裝精靈（建議；不需要 SSH）
+
+1. 上傳完成、建立好資料庫之後，用瀏覽器開啟 **`<基底網址>/admin`**（例如 `https://fleet.example.com/admin`；沒有網址改寫時是 `…/index.php/admin`）。
+   還沒有 `config.php` 時會顯示「安裝 FleetDispatch Server」。
+2. **主機環境**：PHP 版本與資料庫擴充功能、網址改寫、權杖標頭（`Authorization`）、HTTPS、程式資料夾能不能寫入。標示「需要處理」的項目要先修正（說明在第 13 節）。
+3. **資料庫**：選 MySQL／MariaDB，填入第 4 節建立的資料庫名稱、使用者與密碼（主機通常是 `localhost`），按「測試連線」。
+   也可以選 SQLite（資料庫檔案放在程式資料夾的 `data/`）。
+4. **主機名稱** → **完成安裝**：安裝精靈會建立資料表，產生**設定碼**與不容易猜到的**網頁管理網址**，寫入 `config.php`（權限 600）。
+   程式資料夾不能寫入時，會改為顯示設定檔的內容，請用檔案管理員在 `config.sample.php` 所在的資料夾建立 `config.php` 並貼上。
+5. 把設定碼與網頁管理網址存在密碼管理器（設定碼只在這時顯示），再按「以這個瀏覽器成為第一位管理員」，或改在 App 用設定碼連線（第 9 節）。
+
+> **上傳後請立刻完成安裝**：安裝完成之前，知道網址的任何人都能執行安裝精靈。完成後（`config.php` 存在）安裝精靈就不再出現，也無法再覆寫設定。
+> 如果打開 `/admin` 看到的是 App 介紹而不是安裝精靈，代表已經有 `config.php`；如果不是你完成的，請用檔案管理員刪除它，再重新安裝。
+> 設定檔位置以環境變數 `FD_PHP_CONFIG` 指定時，不提供安裝精靈。
+
+### B. 手動建立 config.php
 
 把 `config.sample.php` 複製成同一個資料夾裡的 `config.php`，再修改：
 
@@ -343,6 +360,9 @@ sqlite3 /home/帳號/fleetdispatch/data/fleetdispatch.sqlite \
 | App 顯示「請使用 HTTPS」或憑證錯誤 | 對外網址必須是 HTTPS，且憑證有效、網域相符（第 6 節） |
 | 打開網頁管理的網址卻看到 App 介紹（首頁） | 網址與 `admin_path` 不同（大小寫也要相同），或設成了 `'off'`；沒有網址改寫時網址是 `…/index.php/admin` |
 | 網頁管理顯示「找不到網頁管理的檔案」 | 上傳時漏了 `web/` 資料夾；請上傳完整的 `php` 資料夾 |
+| 安裝精靈「無法連到資料庫主機」 | 主機名稱或連接埠錯誤；虛擬主機通常是 `localhost`。資料庫在其他主機時，確認它允許從網站主機連線 |
+| 安裝精靈「找不到這個資料庫」或「沒有權限」 | 先在控制台建立資料庫，並把使用者加入資料庫、給予全部權限；名稱通常有帳號前綴（例如 `帳號_fleet`） |
+| 安裝精靈顯示設定檔內容，要我自己建立 | 程式資料夾不能讓 PHP 寫入；照畫面用檔案管理員建立 `config.php`，貼上內容後按「我已建立設定檔」 |
 
 ## 14. 網頁管理（瀏覽器）
 
@@ -358,6 +378,6 @@ sqlite3 /home/帳號/fleetdispatch/data/fleetdispatch.sqlite \
 
 - **管理網址**：`config.php` 的 `admin_path`。網址是基底網址加上管理網址，例如 `https://fleet.example.com/admin`、`https://example.com/fleet/admin`；
   沒有網址改寫時是 `https://example.com/fleet/index.php/admin`。
-- 還沒有建立 `config.php`、或設定檔有錯誤時，網頁管理仍會在預設的 `/admin` 顯示主機回報的設定錯誤，方便確認哪裡要修正；設定完成後才會改用 `admin_path`。
+- 還沒有 `config.php` 時，預設的 `/admin` 顯示安裝精靈（第 5 節）；設定檔有錯誤時顯示主機回報的設定錯誤，方便確認哪裡要修正。設定完成後改用 `admin_path`。
 - 網頁管理的檔案在 `web/`（和 `src/` 一樣不能從網站直接存取）。
 

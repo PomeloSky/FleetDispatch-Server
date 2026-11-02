@@ -27,7 +27,7 @@ final class Config
     public static function load(string $path): self
     {
         if ($path === '' || !is_file($path)) {
-            throw new SetupError('找不到設定檔 config.php（請依部署文件，複製 config.sample.php 成 config.php 後填寫）');
+            throw new MissingConfig('找不到設定檔 config.php（請打開網頁管理的安裝精靈，或依部署文件複製 config.sample.php 成 config.php 後填寫）');
         }
         if (!is_readable($path)) {
             throw new SetupError('無法讀取設定檔 config.php（請檢查檔案權限：PHP 必須能讀取它）');

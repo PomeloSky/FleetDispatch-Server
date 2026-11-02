@@ -83,6 +83,19 @@ final class Request
         return $dir === '.' ? '' : $dir;
     }
 
+    /** 這個請求是不是 HTTPS（包含前面的反向代理以 X-Forwarded-Proto 告知的；只用於安裝精靈的提醒）。 */
+    public function isHttps(): bool
+    {
+        $https = strtolower(self::serverString($this->server, 'HTTPS') ?? '');
+        if ($https !== '' && $https !== 'off') {
+            return true;
+        }
+        if ((self::serverString($this->server, 'SERVER_PORT') ?? '') === '443') {
+            return true;
+        }
+        return strtolower(self::serverString($this->server, 'HTTP_X_FORWARDED_PROTO') ?? '') === 'https';
+    }
+
     /** 瀏覽器開啟的請求（Accept 有 text/html）。 */
     public function acceptsHtml(): bool
     {

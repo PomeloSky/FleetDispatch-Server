@@ -112,6 +112,12 @@
 
   .center { min-height: 100vh; display: grid; place-items: center; padding-inline: 16px; padding-block: 32px; }
   .narrow { width: min(460px, 100%); display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+  .narrow.wide { width: min(760px, 100%); }
+  ul.checks { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; }
+  ul.checks li { display: grid; grid-template-columns: 5.5em minmax(0, 1fr); gap: 10px; align-items: start; }
+  ul.checks .chip { justify-self: start; }
+  pre.config { margin: 0; padding: 12px; border-radius: 8px; background: var(--sunken); border: 1px solid var(--line); font-family: var(--mono); font-size: 12px; overflow-x: auto; white-space: pre; }
+  dd .btn.small { vertical-align: 1px; }
   .narrow h1 { margin: 0; font-size: 22px; text-wrap: balance; }
   .narrow p { margin: 0; }
   ol.steps { margin: 0; padding-left: 20px; display: grid; gap: 4px; color: var(--muted); font-size: 14px; }
