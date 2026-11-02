@@ -370,7 +370,7 @@
       row(s.rewrite, '網址改寫', '網址改寫沒有作用：App 的主機網址要加上 /index.php；或請主機商啟用 mod_rewrite 並允許 .htaccess。'),
       row(s.authorization, '權杖標頭（Authorization）', 'PHP 收不到 Authorization 標頭，App 配對後會一直被要求重新配對。請照架設說明「疑難排解」的「一直回 401」修正。', 'danger'),
       row(s.https, 'HTTPS', '目前不是用 HTTPS 開啟。App 只接受 HTTPS（區域網路位址除外），請先在主機控制台啟用 SSL 憑證。'),
-      row(s.writable, '自動建立設定檔', '程式資料夾不能寫入：完成時會顯示設定檔的內容，請用檔案管理員自己建立 config.php。'));
+      row(s.writable, '程式資料夾可以寫入', '程式資料夾不能讓 PHP 寫入，無法使用安裝精靈：請把資料夾權限改成 PHP 可以寫入後重新整理，或依架設說明手動建立 config.php。', 'danger'));
 
     const page = h('div', { class: 'narrow wide' },
       brand('安裝'),
@@ -383,13 +383,14 @@
       clear(app).append(h('div', { class: 'center' }, page));
       return;
     }
-    if (drivers.length === 0) {
+    if (drivers.length === 0 || !s.keyFile) {
       page.append(h('div', { class: 'row' }, h('button', { class: 'btn', type: 'button', text: '重新檢查', onclick: boot })));
       clear(app).append(h('div', { class: 'center' }, page));
       return;
     }
 
     const input = (id, value, extra) => h('input', { type: 'text', id, value, spellcheck: 'false', autocomplete: 'off', ...(extra || {}) });
+    const key = input('install-key', '', { class: 'code', placeholder: 'XXXX-XXXX-XXXX', maxlength: '20', autocapitalize: 'characters' });
     const driver = h('select', { id: 'db-driver' },
       s.drivers.mysql ? h('option', { value: 'mysql', text: 'MySQL／MariaDB（建議）' }) : null,
       s.drivers.sqlite ? h('option', { value: 'sqlite', text: 'SQLite（測試或很小的車隊）' }) : null);
@@ -413,7 +414,7 @@
     driver.addEventListener('change', sync);
     sync();
     const body = () => ({
-      driver: driver.value, host: host.value.trim(), port: port.value.trim(), name: dbName.value.trim(),
+      installKey: key.value.trim(), driver: driver.value, host: host.value.trim(), port: port.value.trim(), name: dbName.value.trim(),
       user: user.value.trim(), password: pass.value, serverName: serverName.value.trim(),
     });
 
@@ -432,9 +433,11 @@
     const result = h('div');
     const installBtn = h('button', { class: 'btn', type: 'submit', text: '完成安裝' });
     const form = h('form', { class: 'stack', novalidate: true },
-      card('2. 資料庫', '先在主機控制台建立資料庫與使用者（MySQL），再填入這裡。', field('db-driver', '資料庫類型', driver), mysqlFields, sqliteNote,
+      card('2. 安裝金鑰', `為了確認是能管理這台主機的人在安裝，請用主機控制台的檔案管理員打開程式資料夾裡的 ${s.keyFile}（和 config.sample.php 在同一個資料夾），把「安裝金鑰」那一行的金鑰貼到這裡。安裝完成後這個檔案會自動刪除。`,
+        field('install-key', '安裝金鑰', key)),
+      card('3. 資料庫', '先在主機控制台建立資料庫與使用者（MySQL），再填入這裡。', field('db-driver', '資料庫類型', driver), mysqlFields, sqliteNote,
         h('div', { class: 'row' }, testBtn), testResult),
-      card('3. 主機名稱', null, field('server-name', '名稱', serverName, 'App 的配對主機頁與網頁管理會顯示這個名稱，之後可以修改。')),
+      card('4. 主機名稱', null, field('server-name', '名稱', serverName, 'App 的配對主機頁與網頁管理會顯示這個名稱，之後可以修改。')),
       h('div', { class: 'row' }, installBtn),
       result);
     form.addEventListener('submit', async (ev) => {

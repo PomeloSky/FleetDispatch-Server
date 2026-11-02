@@ -80,20 +80,25 @@ final class Db
     }
 
     /** SQLite 的資料夾不存在時建立（並加上禁止網站直接存取的 .htaccess）。 */
-    private static function prepareSqliteDir(string $path): void
+    /**
+     * SQLite 檔案所在的資料夾：不存在時建立；禁止網站直接存取的 .htaccess 與空白 index.html 缺少時補上
+     * （資料夾可能由其他方式建立，例如手動或安裝精靈）。
+     */
+    public static function prepareSqliteDir(string $path): void
     {
         if ($path === '' || $path === ':memory:' || str_starts_with($path, 'file:')) {
             return;
         }
         $dir = dirname($path);
-        if (is_dir($dir)) {
-            return;
-        }
-        if (!@mkdir($dir, 0770, true) && !is_dir($dir)) {
+        if (!is_dir($dir) && !@mkdir($dir, 0770, true) && !is_dir($dir)) {
             return; // 交給 PDO 回報無法開啟
         }
-        @file_put_contents($dir . '/.htaccess', self::DENY_HTACCESS);
-        @file_put_contents($dir . '/index.html', '');
+        if (!is_file($dir . '/.htaccess')) {
+            @file_put_contents($dir . '/.htaccess', self::DENY_HTACCESS);
+        }
+        if (!is_file($dir . '/index.html')) {
+            @file_put_contents($dir . '/index.html', '');
+        }
     }
 
     // ───────── 查詢 ─────────

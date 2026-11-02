@@ -9,9 +9,13 @@ namespace FleetDispatch;
  * 產生設定碼與管理網址，寫入 config.php。畫面在網頁管理（web/admin.js），透過下面三個端點操作；
  * 安裝完成（config.php 存在）後這些端點回 404，畫面也不再出現。
  *
- *   GET  /api/v1/install        主機環境（Authorization 標頭用來檢查權杖能不能傳到 PHP）
- *   POST /api/v1/install/test   測試資料庫連線
- *   POST /api/v1/install        建立資料表並寫入 config.php（只能成功一次）
+ *   GET  /api/v1/install        主機環境（Authorization 標頭用來檢查權杖能不能傳到 PHP）；建立安裝金鑰檔
+ *   POST /api/v1/install/test   測試資料庫連線（需要安裝金鑰）
+ *   POST /api/v1/install        建立資料表並寫入 config.php（需要安裝金鑰；只能成功一次）
+ *
+ * 安裝金鑰：程式資料夾裡的 install-key.php（PHP 檔，從網站直接開啟不會輸出內容）。只有能用檔案管理員
+ * 讀取主機檔案的人拿得到，避免知道網址的其他人搶先安裝，或拿測試連線探測其他主機。程式資料夾不能寫入時
+ * 無法建立金鑰檔，安裝精靈不提供測試與安裝（請手動建立 config.php）。
  */
 final class Installer
 {
@@ -19,6 +23,8 @@ final class Installer
     private const WINDOW_SECONDS = 900;
     private const MAX_ATTEMPTS = 20;
     private const SQLITE_FILE = '/data/fleetdispatch.sqlite';
+    private const KEY_FILE = '/install-key.php';
+    private const KEY_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 
     public static function handle(Request $request, string $path, string $appDir, string $configPath): Response
     {
@@ -29,11 +35,15 @@ final class Installer
             }
             if ($method === 'POST') {
                 self::limit($request, $appDir);
-                return Response::json(self::install(self::input($request), $appDir, $configPath));
+                $in = self::input($request);
+                self::requireKey($in, $appDir, $configPath);
+                return Response::json(self::install($in, $appDir, $configPath));
             }
         } elseif ($path === 'install/test' && $method === 'POST') {
             self::limit($request, $appDir);
-            return Response::json(self::test(self::input($request), $appDir));
+            $in = self::input($request);
+            self::requireKey($in, $appDir, $configPath);
+            return Response::json(self::test($in, $appDir));
         }
         throw new ApiError(405, 'method_not_allowed', '不支援這個方法');
     }
@@ -41,6 +51,8 @@ final class Installer
     /** @return array<string, mixed> */
     private static function status(Request $request, string $appDir, string $configPath): array
     {
+        $writable = is_dir($appDir) && is_writable($appDir);
+        $keyReady = $writable && self::installable($appDir, $configPath) && self::ensureKey($appDir) !== null;
         return [
             'installed' => false,
             'installable' => self::installable($appDir, $configPath),
@@ -51,8 +63,62 @@ final class Installer
             'rewrite' => !str_contains($request->path, '/index.php'),
             'authorization' => $request->authorization() !== '',
             'https' => $request->isHttps(),
-            'writable' => is_dir($appDir) && is_writable($appDir),
+            'writable' => $writable,
+            // 安裝金鑰檔的檔名（在 config.sample.php 所在的資料夾）；建立不了時是 null。
+            'keyFile' => $keyReady ? ltrim(self::KEY_FILE, '/') : null,
         ];
+    }
+
+    /** 讀取安裝金鑰；檔案不存在時建立（'x' 模式，不覆寫）。程式資料夾不能寫入時回 null。 */
+    private static function ensureKey(string $appDir): ?string
+    {
+        $file = $appDir . self::KEY_FILE;
+        $key = self::readKey($file);
+        if ($key !== null) {
+            return $key;
+        }
+        $key = self::random(4, self::KEY_ALPHABET) . '-' . self::random(4, self::KEY_ALPHABET) . '-' . self::random(4, self::KEY_ALPHABET);
+        $content = "<?php\n"
+            . "// FleetDispatch Server 安裝金鑰：網頁的安裝精靈會要求輸入下面這組金鑰，用來確認是能管理這台主機檔案的人在安裝。\n"
+            . "// 安裝完成後這個檔案會自動刪除。不要把金鑰告訴別人。\n"
+            . "// 安裝金鑰：{$key}\n";
+        $fh = @fopen($file, 'x');
+        if ($fh === false) {
+            return self::readKey($file); // 同時有另一個請求建立了
+        }
+        $ok = fwrite($fh, $content) === strlen($content);
+        fclose($fh);
+        if (!$ok) {
+            @unlink($file);
+            return null;
+        }
+        @chmod($file, 0600);
+        return $key;
+    }
+
+    private static function readKey(string $file): ?string
+    {
+        $raw = @file_get_contents($file);
+        if (!is_string($raw) || preg_match('/安裝金鑰：([A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4})/u', $raw, $m) !== 1) {
+            return null;
+        }
+        return $m[1];
+    }
+
+    /** 測試與安裝都要附上安裝金鑰（嘗試次數限制在檢查之前，猜測也會被計入）。 */
+    private static function requireKey(array $in, string $appDir, string $configPath): void
+    {
+        if (!self::installable($appDir, $configPath)) {
+            throw new ApiError(409, 'not_installable', '設定檔的位置由環境變數 FD_PHP_CONFIG 指定，請手動建立設定檔');
+        }
+        $expected = self::readKey($appDir . self::KEY_FILE);
+        if ($expected === null) {
+            throw new ApiError(409, 'not_writable', '程式資料夾不能寫入，無法使用安裝精靈；請依架設說明手動建立 config.php');
+        }
+        $given = is_string($in['installKey'] ?? null) ? strtoupper((string) preg_replace('/[^A-Za-z0-9]/', '', $in['installKey'])) : '';
+        if (!hash_equals(str_replace('-', '', $expected), $given)) {
+            throw new ApiError(403, 'invalid_install_key', '安裝金鑰不正確（請用檔案管理員打開程式資料夾裡的 install-key.php 查看）');
+        }
     }
 
     /** 設定檔位置由環境變數 FD_PHP_CONFIG 指定時不使用安裝精靈（進階的部署方式，請手動建立）。 */
@@ -142,8 +208,10 @@ final class Installer
     {
         $db = self::dbConfig($in, $appDir);
         if ($db['driver'] === 'sqlite') {
+            // 與正式執行相同的方式建立 data/（含禁止網站直接存取的 .htaccess 與空白 index.html）。
+            Db::prepareSqliteDir($appDir . self::SQLITE_FILE);
             $dir = $appDir . '/data';
-            if (!is_dir($dir) && !@mkdir($dir, 0700, true)) {
+            if (!is_dir($dir)) {
                 throw new ApiError(400, 'db_error', '無法建立 data 資料夾（程式資料夾必須讓 PHP 可以寫入）');
             }
             if (!is_writable($dir)) {
@@ -233,6 +301,9 @@ final class Installer
 
         $content = self::configText($db, $token, $name, $adminPath);
         $written = self::write($configPath, $content);
+        if ($written) {
+            @unlink($appDir . self::KEY_FILE);
+        }
         return [
             'written' => $written,
             'setupToken' => $token,

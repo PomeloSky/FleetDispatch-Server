@@ -77,7 +77,7 @@ jobs:
           cp -R php "$RUNNER_TEMP/php-app"
           php -S 127.0.0.1:8081 "$RUNNER_TEMP/php-app/public/index.php" > "$RUNNER_TEMP/php-install.log" 2>&1 &
           for i in $(seq 1 30); do curl -s -o /dev/null http://127.0.0.1:8081/ && break; sleep 1; done
-          FD_BASE=http://127.0.0.1:8081 FD_INSTALL_DB=sqlite node --test conformance/php-install.test.mjs
+          FD_BASE=http://127.0.0.1:8081 FD_APP_DIR="$RUNNER_TEMP/php-app" FD_INSTALL_DB=sqlite node --test conformance/php-install.test.mjs
       - if: failure()
         run: cat "$RUNNER_TEMP/php.log" "$RUNNER_TEMP/php-install.log" || true
 
@@ -130,6 +130,6 @@ jobs:
           cp -R php "$RUNNER_TEMP/php-app"
           php -S 127.0.0.1:8081 "$RUNNER_TEMP/php-app/public/index.php" > "$RUNNER_TEMP/php-install.log" 2>&1 &
           for i in $(seq 1 30); do curl -s -o /dev/null http://127.0.0.1:8081/ && break; sleep 1; done
-          FD_BASE=http://127.0.0.1:8081 FD_INSTALL_DB=mysql FD_DB_HOST=127.0.0.1 FD_DB_PORT=3306 FD_DB_NAME=fd_install FD_DB_USER=fleetdispatch FD_DB_PASSWORD=fd-ci-password node --test conformance/php-install.test.mjs
+          FD_BASE=http://127.0.0.1:8081 FD_APP_DIR="$RUNNER_TEMP/php-app" FD_INSTALL_DB=mysql FD_DB_HOST=127.0.0.1 FD_DB_PORT=3306 FD_DB_NAME=fd_install FD_DB_USER=fleetdispatch FD_DB_PASSWORD=fd-ci-password node --test conformance/php-install.test.mjs
       - if: failure()
         run: cat "$RUNNER_TEMP/php.log" "$RUNNER_TEMP/php-install.log" || true
