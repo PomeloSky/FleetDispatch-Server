@@ -687,6 +687,55 @@ test('FleetDispatch Server API v1', async (t) => {
   // 網頁管理以 HttpOnly Cookie 登入（1.2.0）
   await webSessionSuite(t, { api, expectError, tokens, uuid, base: BASE });
 
+  await t.test('1.2.0 輸入限制：請求本體最多 511 層、資料內容最多 64 層、範圍欄位最多 200 字；很長的姓名與很多欄位的內容能完整保存', async () => {
+    const nest = (n) => '['.repeat(n) + ']'.repeat(n);
+    expectError(await api('POST', 'events', { token: tokens.admin, raw: `{"events":[${nest(600)}]}` }), 400, 'invalid_request');
+    // 資料內容：本身 1 層，再加上 n - 1 層陣列
+    const deepPart = (levels) => {
+      const id = uuid();
+      const at = nowApple();
+      return {
+        id: uuid(), timestamp: at, actor: 'conformance', entity: 'part', operation: 'create', entityID: id,
+        payloadJSON: `{"entityUUID":"${id}","name":"巢狀","lastModifiedAt":${at},"deep":${nest(levels - 1)}}`,
+      };
+    };
+    const ok64 = deepPart(64);
+    assert.deepEqual(statuses(await send(tokens.admin, ok64, deepPart(65), deepPart(100000))), ['applied', 'rejected:invalid-payload', 'rejected:invalid-payload']);
+    // 64 層的內容在快照、管理清單與修改前後歷史都能完整回傳
+    const detail = await api('GET', `admin/records/part/${ok64.entityID}`, { token: tokens.admin });
+    assert.equal(detail.status, 200, JSON.stringify(detail.json));
+    assert.equal(JSON.stringify(detail.json.record.payload.deep), nest(63));
+    const hist = await api('GET', `admin/history?entity=part&id=${ok64.entityID}`, { token: tokens.admin });
+    assert.equal(hist.status, 200, JSON.stringify(hist.json));
+    assert.equal(JSON.stringify(hist.json.entries[0].after.deep), nest(63));
+
+    // 範圍欄位（車牌、駕駛姓名）：200 字可以、201 字拒絕
+    const long = (n) => '名'.repeat(n);
+    const trips = [200, 201].map((n) => fresh('trip', 'create', (id) => trip(id, { driverName: long(n), plate: 'LIM-0001', completed: true })));
+    const vehicles = [200, 201].map((n) => fresh('vehicle', 'create', (id) => vehicle(id, 'P'.repeat(n))));
+    assert.deepEqual(statuses(await send(tokens.admin, ...trips, ...vehicles)), ['applied', 'rejected:invalid-payload', 'applied', 'rejected:invalid-payload']);
+
+    // 很長的駕駛人姓名：資料完整保存，稽核摘要的姓名只留 200 字
+    const longDriver = fresh('driver', 'create', (id) => driver(id, long(30000)));
+    assert.deepEqual(statuses(await send(tokens.admin, longDriver)), ['applied']);
+    const saved = await api('GET', `admin/records/driver/${longDriver.entityID}`, { token: tokens.admin });
+    assert.equal(saved.json.record.payload.name.length, 30000);
+    const auditEntry = (await api('GET', 'admin/audit?limit=20', { token: tokens.admin })).json.entries.find((e) => e.entityId === longDriver.entityID);
+    assert.equal(JSON.parse(auditEntry.summary).name, long(200));
+
+    // 很多欄位的內容：修改前後歷史的欄位清單完整（超過 64 KB）
+    const many = fresh('part', 'create', (id) => {
+      const p = { entityUUID: id, name: '很多欄位', lastModifiedAt: nowApple() };
+      for (let i = 0; i < 8000; i++) p[`field${String(i).padStart(4, '0')}`] = i;
+      return p;
+    });
+    assert.deepEqual(statuses(await send(tokens.admin, many)), ['applied']);
+    const manyHist = await api('GET', `admin/history?entity=part&id=${many.entityID}`, { token: tokens.admin });
+    assert.equal(manyHist.status, 200);
+    assert.equal(manyHist.json.entries[0].changedFields.length, 8002, '8000 個欄位＋entityUUID、name');
+    assert.ok(JSON.stringify(manyHist.json.entries[0].changedFields).length > 65535);
+  });
+
   await t.test('限制：事件太多、裝置自行解除配對', async () => {
     const many = Array.from({ length: 501 }, () => ev('part', 'create', uuid(), null));
     expectError(await api('POST', 'events', { token: tokens.admin, body: { events: many } }), 400, 'invalid_request');

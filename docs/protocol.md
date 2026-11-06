@@ -103,6 +103,7 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 
 同一個來源 IP 在 15 分鐘內配對失敗 10 次後，該 IP 的 `POST /pair` 與 `POST /web/login` 回 `429 rate_limited`（`Retry-After` 秒數），
 直到最早一次失敗滿 15 分鐘。兩個端點共用同一個計數；成功的配對不計入。
+1.2.0 起 IPv6 以 /64 網段計算（同一個網段的位址通常屬於同一個使用者），IPv4 對應的 IPv6（`::ffff:a.b.c.d`）視為 IPv4。
 
 來源 IP：Cloudflare 版用 `CF-Connecting-IP`；Docker 與 PHP 版預設用連線的位址，設定了信任的反向代理層數 N（≥ 1）時，
 取 `X-Forwarded-For` 從右邊數來第 N 個值（最左邊的值由用戶端自己填，可以偽造，不得使用）。
@@ -135,10 +136,12 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 | `expectedRevision` | 整數（選填，1.2.0） | 送出者看到的版本（§6 的 `revision`）。與主機上的版本不同時不寫入、回傳 `conflict`；沒有這筆資料時版本是 0。不帶時依最後寫入者勝 |
 
 限制：每次最多 500 筆、請求本體最多 5 MB、單筆內容最多 1 MB；超過回 `413 payload_too_large` 或 `400 invalid_request`。
+請求本體的 JSON 最多 511 層陣列或物件（1.2.0 起三種實作相同；超過回 `400 invalid_request`）。
 
 處理順序（逐筆、依陣列順序，每一筆自成一個交易）：
 
-1. **格式**：種類、操作、UUID 不合法，或建立／修改的內容不是 JSON 物件、`entityUUID` 與 `entityID` 不同（不分大小寫）、`lastModifiedAt` 不是數字 →
+1. **格式**：種類、操作、UUID 不合法，或建立／修改的內容不是 JSON 物件、`entityUUID` 與 `entityID` 不同（不分大小寫）、`lastModifiedAt` 不是數字、
+   內容超過 64 層陣列或物件、範圍欄位（車牌、駕駛姓名、`driverEntityUUID`、`requestedByDeviceID`）超過 200 個字元（1.2.0）→
    `rejected`（`invalid-payload`）。`expectedRevision` 不是非負整數 → `rejected`（`invalid-expected-revision`）。
    **冪等（1.2.0）**：同一台裝置（權杖）已處理過同一個事件 `id`（1–100 字元）時，直接回傳第一次的結果並加上 `"duplicate": true`，
    不重複寫入、不重複稽核與歷史（回應遺失後重送是安全的）。已處理的事件保留 30 天。
@@ -504,6 +507,7 @@ App 的資料格式中，巡檢、工單與車趟之間沒有直接的關聯欄�
 - 只在 HTTPS 上提供服務（Docker 版本身是 HTTP，必須放在反向代理後面；只在區域網路測試時例外）。App 拒絕 `http://`，私有網段（10/8、172.16/12、192.168/16、127/8、`.local`）在使用者確認後例外。
 - 權杖、配對碼、設定碼只存雜湊或只放在部署的機密設定；不得寫入日誌。
 - 所有 SQL 一律使用參數化查詢。
+- 輸入的長度與層數限制三種實作相同（§3.4、§4），所有資料庫的欄位都放得下（MySQL 的 TEXT 最多 64 KB）；檢查結果見 [`security-review.md`](security-review.md)。
 - 不回傳 `Access-Control-Allow-Origin`（App 是原生程式，不需要跨來源存取；避免網頁冒用）。
 - 網頁管理的登入（§13.1）：權杖只放在 HttpOnly、SameSite=Strict 的 Cookie；非 GET 的請求檢查 CSRF 權杖、`Sec-Fetch-Site` 與 JSON 本體。
 - 回應加上 `Cache-Control: no-store`、`X-Content-Type-Options: nosniff`。
@@ -542,6 +546,8 @@ App 的資料格式中，巡檢、工單與車趟之間沒有直接的關聯欄�
 - **標頭**：管理頁 `Content-Type: text/html; charset=utf-8`，程式 `text/javascript; charset=utf-8`；兩者都有 `Cache-Control: no-store`、
   `X-Content-Type-Options: nosniff`、`X-Robots-Tag: noindex, nofollow`、`Referrer-Policy: no-referrer`。管理頁另外有
   `X-Frame-Options: DENY` 與 `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`。
+  1.2.0 起管理頁與程式另有 `Cross-Origin-Resource-Policy: same-origin`，管理頁另有 `Cross-Origin-Opener-Policy: same-origin` 與
+  `Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=()`。
 - **登入**（1.2.0）：`POST /web/login`（§13.1），權杖由主機以 HttpOnly Cookie 保存，網頁的程式不保存也讀不到。登出是 `POST /unpair`；
   `401` 時回到登入頁。沒有其他可以使用的管理員時不能登出（`409 last_admin`），頁面會提示先建立另一位管理員。
   1.0–1.1 以 `POST /pair` 配對、把權杖存在瀏覽器（localStorage／sessionStorage）；1.2.0 的頁面開啟時以 `POST /web/upgrade` 換成 Cookie，並刪除瀏覽器裡的權杖。

@@ -48,3 +48,71 @@ export function intParam(url: URL, key: string, fallback: number, min: number, m
   if (!Number.isSafeInteger(n)) throw badRequest(`${key} 太大`);
   return Math.min(Math.max(n, min), max);
 }
+
+/**
+ * JSON 的巢狀層數上限（陣列與物件）：與 PHP 版 json_decode 的 depth 512 相同（最多 511 層），三種實作對同一份內容的判斷一致；
+ * 也避免極深的內容讓之後的處理耗盡堆疊（docs/security-review.md §4.7）。
+ */
+export const MAX_JSON_NESTING = 511;
+
+/** JSON 文字的陣列／物件巢狀層數不超過 max（逐字掃描、不遞迴；字串裡的括號不算）。格式是否正確交給 JSON.parse。 */
+export function withinJsonNesting(text: string, max: number): boolean {
+  let depth = 0;
+  let inString = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (inString) {
+      if (c === 0x5c) i++; // 反斜線：略過被跳脫的字元
+      else if (c === 0x22) inString = false;
+      continue;
+    }
+    if (c === 0x22) inString = true;
+    else if (c === 0x5b || c === 0x7b) {
+      if (++depth > max) return false;
+    } else if (c === 0x5d || c === 0x7d) depth--;
+  }
+  return true;
+}
+
+/** 字串的字元（Unicode 碼位）數。 */
+export function codePointLength(s: string): number {
+  let n = 0;
+  for (const _ of s) n++;
+  return n;
+}
+
+/** IPv6 位址的 8 個 16 位元群組；不是 IPv6 時回傳 null。接受 `[…]`、zone（`%eth0`）與結尾的 IPv4（`::ffff:1.2.3.4`）。 */
+function parseIPv6(input: string): number[] | null {
+  let s = input.trim();
+  if (s.startsWith('[') && s.endsWith(']')) s = s.slice(1, -1);
+  const zone = s.indexOf('%');
+  if (zone >= 0) s = s.slice(0, zone);
+  if (!s.includes(':')) return null;
+  const halves = s.split('::');
+  if (halves.length > 2) return null;
+  const head = halves[0] === '' ? [] : halves[0].split(':');
+  const tail = halves.length === 2 ? (halves[1] === '' ? [] : halves[1].split(':')) : [];
+  const last = halves.length === 2 ? tail : head;
+  if (last.length > 0 && last[last.length - 1].includes('.')) {
+    const parts = last[last.length - 1].split('.');
+    if (parts.length !== 4 || !parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255)) return null;
+    const b = parts.map(Number);
+    last.splice(last.length - 1, 1, ((b[0] << 8) | b[1]).toString(16), ((b[2] << 8) | b[3]).toString(16));
+  }
+  const count = head.length + tail.length;
+  if (halves.length === 1 ? count !== 8 : count > 7) return null;
+  const groups = [...head, ...Array<string>(halves.length === 2 ? 8 - count : 0).fill('0'), ...tail];
+  if (!groups.every((g) => /^[0-9A-Fa-f]{1,4}$/.test(g))) return null;
+  return groups.map((g) => parseInt(g, 16));
+}
+
+/**
+ * 配對嘗試次數限制的來源：IPv6 以 /64 網段計算（同一個網段的位址通常屬於同一個使用者、可以任意更換）；
+ * IPv4 對應的 IPv6（`::ffff:a.b.c.d`）視為 IPv4；其他照原樣（最多 64 個字元）。
+ */
+export function rateLimitKey(ip: string): string {
+  const g = parseIPv6(ip);
+  if (g === null) return ip.slice(0, 64);
+  if (g.slice(0, 5).every((x) => x === 0) && g[5] === 0xffff) return `${g[6] >> 8}.${g[6] & 255}.${g[7] >> 8}.${g[7] & 255}`;
+  return `${g.slice(0, 4).map((x) => x.toString(16)).join(':')}::/64`;
+}

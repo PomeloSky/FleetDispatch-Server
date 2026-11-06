@@ -70,7 +70,8 @@ final class Api
         private readonly Db $db,
     ) {
         $this->repo = new Repo($db);
-        $this->ip = $req->clientIp($config->trustedProxies);
+        // 配對嘗試次數限制的來源（IPv6 以 /64 網段計算，docs/security-review.md §4.5）
+        $this->ip = Util::rateLimitKey($req->clientIp($config->trustedProxies));
     }
 
     /** 取 `/api/v1/` 之後的路徑（支援基底路徑與 `/index.php/api/v1/`）；不是 API 路徑時回傳 null。 */

@@ -2,7 +2,13 @@
 
 import type { DriverBinding, Entity, Operation, Role, ScopeFields, Session, StoredRecord } from './types.ts';
 import { ENTITIES, OPERATIONS } from './types.ts';
-import { isObject, normalizeUuid, num, str } from './util.ts';
+import { codePointLength, isObject, normalizeUuid, num, str, withinJsonNesting } from './util.ts';
+
+/**
+ * App 送來的資料內容最多 64 層陣列或物件（App 的資料只有 3–4 層）。回應會把內容放進幾層外框再編碼，
+ * 這個上限讓三種實作都能完整回傳（PHP 的 json_encode 最多 512 層；docs/security-review.md §4.7）。
+ */
+export const MAX_PAYLOAD_NESTING = 64;
 
 export const isEntity = (v: unknown): v is Entity => typeof v === 'string' && (ENTITIES as readonly string[]).includes(v);
 export const isOperation = (v: unknown): v is Operation =>
@@ -160,6 +166,7 @@ export function validateEvent(raw: unknown):
   if (!isEntity(entity) || !isOperation(op) || entityId === null || timestamp === null) return { ok: false, id, reason: 'invalid-payload' };
   const payloadText = typeof raw.payloadJSON === 'string' ? raw.payloadJSON : '';
   if (op === 'delete') return { ok: true, id, entity, op, entityId, timestamp, payload: null, payloadText: '' };
+  if (!withinJsonNesting(payloadText, MAX_PAYLOAD_NESTING)) return { ok: false, id, reason: 'invalid-payload' };
   let payload: unknown;
   try {
     payload = JSON.parse(payloadText);
@@ -169,7 +176,19 @@ export function validateEvent(raw: unknown):
   if (!isObject(payload)) return { ok: false, id, reason: 'invalid-payload' };
   if (normalizeUuid(payload.entityUUID) !== entityId) return { ok: false, id, reason: 'invalid-payload' };
   if (num(payload.lastModifiedAt) === null) return { ok: false, id, reason: 'invalid-payload' };
+  if (!scopeWithinLimits(entity, payload)) return { ok: false, id, reason: 'invalid-payload' };
   return { ok: true, id, entity, op, entityId, timestamp, payload, payloadText };
+}
+
+/**
+ * 範圍欄位（車牌、駕駛姓名、駕駛人 UUID、申請的裝置）的長度上限（字元）。這些值另外存在資料表的欄位，用於權限與連鎖刪除；
+ * 限制長度讓所有資料庫（MySQL 的 TEXT 最多 64 KB）都放得下，正常的資料遠小於這個長度（docs/security-review.md §4.6）。
+ */
+export const MAX_SCOPE_TEXT = 200;
+
+function scopeWithinLimits(entity: Entity, payload: Record<string, unknown>): boolean {
+  const f = scopeFields(entity, payload);
+  return [f.driverUuid, f.driverName, f.requesterDevice, f.vehiclePlate].every((v) => v === null || codePointLength(v) <= MAX_SCOPE_TEXT);
 }
 
 /** 綁定的駕駛人：`{driverUuid, driverName}`；`null` 表示清除；格式錯誤回傳 undefined。 */

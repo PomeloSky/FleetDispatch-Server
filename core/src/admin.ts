@@ -240,7 +240,11 @@ export function auditSummary(entity: string, payloadText: string | null): string
   if (entity === 'driver') {
     const p = parsePayload(payloadText);
     if (!p) return '';
-    return JSON.stringify({ entityUUID: typeof p.entityUUID === 'string' ? p.entityUUID : '', name: typeof p.name === 'string' ? p.name : '' });
+    // 姓名最多 200 個字元（稽核紀錄只為了辨認是哪一位；MySQL 的 TEXT 最多 64 KB）
+    return JSON.stringify({
+      entityUUID: typeof p.entityUUID === 'string' ? p.entityUUID : '',
+      name: typeof p.name === 'string' ? codePoints(p.name).slice(0, 200).join('') : '',
+    });
   }
   return codePoints(payloadText).slice(0, 2000).join('');
 }

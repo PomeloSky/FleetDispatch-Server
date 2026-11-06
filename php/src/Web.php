@@ -116,6 +116,8 @@ final class Web
             'X-Content-Type-Options' => 'nosniff',
             'X-Robots-Tag' => 'noindex, nofollow',
             'Referrer-Policy' => 'no-referrer',
+            // 1.2.0：其他網站不能載入管理頁的程式、不能取得管理頁視窗的參照
+            'Cross-Origin-Resource-Policy' => 'same-origin',
         ];
         $name = $kind === 'script' ? 'admin.js' : 'admin.html';
         $content = @file_get_contents($appDir . '/web/' . $name);
@@ -131,6 +133,9 @@ final class Web
             'Content-Type' => 'text/html; charset=utf-8',
             'Content-Security-Policy' => self::CSP,
             'X-Frame-Options' => 'DENY',
+            // 管理頁用不到相機、麥克風、定位等功能（與 core/src/web.ts 的 ADMIN_PAGE_HEADERS 相同）
+            'Cross-Origin-Opener-Policy' => 'same-origin',
+            'Permissions-Policy' => 'camera=(), microphone=(), geolocation=(), payment=(), usb=()',
         ]);
     }
 }

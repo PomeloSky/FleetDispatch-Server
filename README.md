@@ -61,7 +61,7 @@ docs/          協定規格與各部署方式的架設說明
   ```sh
   FD_BASE=http://127.0.0.1:8080 FD_SETUP_TOKEN=你的設定碼 FD_ADMIN_PATH=/admin node --test conformance/api.test.mjs conformance/web.test.mjs
   node --test conformance/migration-node.test.mjs conformance/migration-php.test.mjs   # 1.1 → 1.2 遷移（本機暫存資料夾）
-  node --test conformance/web-session-local.test.mjs   # 網頁登入的期限與管理員的恢復（本機暫存資料夾）
+  node --test conformance/web-session-local.test.mjs conformance/rate-limit-local.test.mjs   # 網頁登入的期限、管理員的恢復、IPv6 的嘗試次數限制（本機暫存資料夾）
   ```
 
   PHP 版的安裝精靈另有 `conformance/php-install.test.mjs`（對還沒有 `config.php` 的主機執行，見檔案開頭的說明）。

@@ -64,6 +64,10 @@ test('網頁', async (t) => {
       assert.equal(r.headers.get('x-frame-options'), 'DENY');
       const csp = r.headers.get('content-security-policy') ?? '';
       for (const part of ["default-src 'none'", "script-src 'self'", "connect-src 'self'", "frame-ancestors 'none'"]) assert.ok(csp.includes(part), csp);
+      // 1.2.0：其他網站不能取得管理頁視窗、載入它的程式；用不到的瀏覽器功能關閉
+      assert.equal(r.headers.get('cross-origin-opener-policy'), 'same-origin');
+      assert.equal(r.headers.get('cross-origin-resource-policy'), 'same-origin');
+      assert.match(r.headers.get('permissions-policy') ?? '', /geolocation=\(\)/);
       const html = await r.text();
       assert.ok(html.includes(`data-base="${basePath}"`), 'data-base');
       assert.ok(html.includes(`data-admin="${ADMIN}"`), 'data-admin');
@@ -77,6 +81,7 @@ test('網頁', async (t) => {
     assert.equal(r.status, 200);
     assert.match(r.headers.get('content-type') ?? '', /^text\/javascript/);
     assert.equal(r.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(r.headers.get('cross-origin-resource-policy'), 'same-origin');
     const js = await r.text();
     assert.ok(js.length > 1000);
     assert.ok(js.includes('/api/v1/'));

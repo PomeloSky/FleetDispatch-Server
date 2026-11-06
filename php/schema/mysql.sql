@@ -122,7 +122,7 @@ CREATE TABLE IF NOT EXISTS fd_record_history (
     actor_name VARCHAR(255) NULL,
     before_json LONGTEXT NULL,
     after_json LONGTEXT NULL,
-    changed_fields TEXT NULL,
+    changed_fields MEDIUMTEXT NULL,
     reason VARCHAR(500) NULL,
     seq BIGINT NOT NULL,
     revision BIGINT NOT NULL,

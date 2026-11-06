@@ -9,7 +9,9 @@ import { Repo } from './db.ts';
 import { authorize, outgoingPayload, parseBinding, scopeFields, validateEvent, visible } from './rules.ts';
 import type { DriverBinding, Entity, EventResult, Role, ServerConfig, Session, StoredRecord, SyncEvent } from './types.ts';
 import { ApiError, ENTITIES, ROLES, SNAPSHOT_KEYS, VEHICLE_CHILDREN } from './types.ts';
-import { badRequest, cleanName, intParam, isObject, msToApple, normalizeUuid, nowMs, num, str } from './util.ts';
+import {
+  MAX_JSON_NESTING, badRequest, cleanName, intParam, isObject, msToApple, normalizeUuid, nowMs, num, rateLimitKey, str, withinJsonNesting,
+} from './util.ts';
 import { SERVER_VERSION } from './version.ts';
 import { acceptsHtml, adminResponse, homeResponse, isHome, matchAdmin } from './web.ts';
 import {
@@ -148,6 +150,8 @@ async function readJson(request: Request): Promise<Record<string, unknown>> {
   if (declared > LIMITS.maxBodyBytes) throw new ApiError(413, 'payload_too_large', '請求本體超過 5 MB');
   const text = await request.text();
   if (new TextEncoder().encode(text).length > LIMITS.maxBodyBytes) throw new ApiError(413, 'payload_too_large', '請求本體超過 5 MB');
+  // 巢狀層數與 PHP 版相同（docs/security-review.md §4.7）
+  if (!withinJsonNesting(text, MAX_JSON_NESTING)) throw badRequest('請求本體不是合法的 JSON');
   try {
     const v: unknown = JSON.parse(text);
     if (!isObject(v)) throw badRequest('請求本體必須是 JSON 物件');
@@ -195,7 +199,8 @@ export class Api {
   constructor(ctx: RequestContext) {
     this.repo = new Repo(ctx.db);
     this.config = ctx.config;
-    this.ip = ctx.clientIp;
+    // 配對嘗試次數限制的來源（IPv6 以 /64 網段計算，docs/security-review.md §4.5）
+    this.ip = rateLimitKey(ctx.clientIp);
   }
 
   async handle(request: Request): Promise<Response> {

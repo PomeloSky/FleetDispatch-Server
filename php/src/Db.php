@@ -430,6 +430,10 @@ final class Db
                     ? 'ALTER TABLE fd_devices ADD COLUMN session_until INTEGER'
                     : 'ALTER TABLE fd_devices ADD COLUMN session_until BIGINT NULL');
             }
+            if ($this->driver === 'mysql') {
+                // 修改的欄位清單可能超過 TEXT 的 64 KB（欄位很多的內容）；SQLite 沒有長度限制
+                $this->pdo->exec('ALTER TABLE fd_record_history MODIFY changed_fields MEDIUMTEXT NULL');
+            }
             // 1.0–1.1 的網頁管理把權杖存在瀏覽器：不再延長，最多再用 30 天（期間內開啟網頁管理會自動換成 Cookie）
             $cap = Util::nowMs() + WebSession::LEGACY_WEB_TTL_MS;
             $this->run(

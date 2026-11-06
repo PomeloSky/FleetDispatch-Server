@@ -288,7 +288,8 @@ final class Admin
             }
             return Json::encode([
                 'entityUUID' => is_string($p->entityUUID ?? null) ? $p->entityUUID : '',
-                'name' => is_string($p->name ?? null) ? $p->name : '',
+                // 姓名最多 200 個字元（與 core/src/admin.ts 相同）
+                'name' => is_string($p->name ?? null) ? Util::firstCodePoints($p->name, 200) : '',
             ]);
         }
         return Util::firstCodePoints($payloadText, 2000);

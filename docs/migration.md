@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | 1 | 1.0.0–1.1.x | 初版 |
 | 2 | 1.2.0 | `fd_records.revision`（每筆資料的版本；既有資料從 1 開始）、`fd_record_history`（修改前後歷史，含 `outcome` 套用結果）、`fd_processed_events`（已處理事件，冪等）；清除 1.0–1.1 稽核紀錄中駕駛人的摘要（個資）；`fd_meta` 的 `guard`（多筆不可分割寫入用） |
-| 3 | 1.2.0 | `fd_devices.web_session`、`session_until`（網頁管理以 HttpOnly Cookie 登入的種類與期限，[`protocol.md`](protocol.md) §13.1）；1.0–1.1 網頁管理存在瀏覽器的權杖（`platform` 是 `web`）最多再用 30 天、不再延長（期間內開啟網頁管理會自動換成 Cookie） |
+| 3 | 1.2.0 | `fd_devices.web_session`、`session_until`（網頁管理以 HttpOnly Cookie 登入的種類與期限，[`protocol.md`](protocol.md) §13.1）；1.0–1.1 網頁管理存在瀏覽器的權杖（`platform` 是 `web`）最多再用 30 天、不再延長（期間內開啟網頁管理會自動換成 Cookie）；MySQL 的 `fd_record_history.changed_fields` 改為 `MEDIUMTEXT`（欄位很多的內容超過 TEXT 的 64 KB） |
 
 1.2.0 從 1.1.x 升級時依序執行 1 → 2 → 3。
 

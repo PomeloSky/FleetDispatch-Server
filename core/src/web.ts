@@ -65,6 +65,14 @@ const COMMON_HEADERS: Record<string, string> = {
   'X-Content-Type-Options': 'nosniff',
   'X-Robots-Tag': 'noindex, nofollow',
   'Referrer-Policy': 'no-referrer',
+  // 1.2.0：其他網站不能載入管理頁的程式、不能取得管理頁視窗的參照；管理頁用不到相機、麥克風、定位等功能
+  'Cross-Origin-Resource-Policy': 'same-origin',
+};
+
+/** 管理頁（HTML）另外的標頭（1.2.0）。 */
+export const ADMIN_PAGE_HEADERS: Record<string, string> = {
+  'Cross-Origin-Opener-Policy': 'same-origin',
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=(), usb=()',
 };
 
 /** 管理頁的內容（基底路徑與管理網址填進 HTML，頁面的程式依此呼叫 API）。 */
@@ -115,6 +123,7 @@ export function adminResponse(kind: 'page' | 'script', base: string, adminPath: 
       'Content-Type': 'text/html; charset=utf-8',
       'Content-Security-Policy': ADMIN_CSP,
       'X-Frame-Options': 'DENY',
+      ...ADMIN_PAGE_HEADERS,
     },
   });
 }

@@ -14,10 +14,16 @@ final class Json
     public const FLAGS = JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_LINE_TERMINATORS | JSON_PRESERVE_ZERO_FRACTION | JSON_INVALID_UTF8_SUBSTITUTE;
     public const DEPTH = 512;
 
-    /** 解析 JSON 物件；格式錯誤或不是物件時回傳 null。 */
-    public static function decodeObject(string $text): ?\stdClass
+    /**
+     * App 送來的資料內容最多 64 層陣列或物件（json_decode 的 depth 是層數加 1；與 core/src/rules.ts 的 MAX_PAYLOAD_NESTING 相同）。
+     * 回應會把內容放進幾層外框再編碼，所以要比 DEPTH 小得多（docs/security-review.md §4.7）。
+     */
+    public const PAYLOAD_DEPTH = 65;
+
+    /** 解析 JSON 物件；格式錯誤、超過深度或不是物件時回傳 null。 */
+    public static function decodeObject(string $text, int $depth = self::DEPTH): ?\stdClass
     {
-        $v = json_decode($text, false, self::DEPTH);
+        $v = json_decode($text, false, $depth);
         return $v instanceof \stdClass ? $v : null;
     }
 

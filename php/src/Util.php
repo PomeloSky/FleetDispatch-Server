@@ -179,4 +179,30 @@ final class Util
         }
         return min(max($n, $min), $max);
     }
+
+    /**
+     * 配對嘗試次數限制的來源（與 core/src/util.ts 的 rateLimitKey 相同）：IPv6 以 /64 網段計算（同一個網段的位址通常屬於
+     * 同一個使用者、可以任意更換）；IPv4 對應的 IPv6（::ffff:a.b.c.d）視為 IPv4；其他照原樣（最多 64 個字元）。
+     */
+    public static function rateLimitKey(string $ip): string
+    {
+        $s = trim($ip);
+        if (str_starts_with($s, '[') && str_ends_with($s, ']')) {
+            $s = substr($s, 1, -1);
+        }
+        $zone = strpos($s, '%');
+        if ($zone !== false) {
+            $s = substr($s, 0, $zone);
+        }
+        $bin = str_contains($s, ':') ? @inet_pton($s) : false;
+        if ($bin === false || strlen($bin) !== 16) {
+            return substr($ip, 0, 64);
+        }
+        /** @var array<int, int> $g */
+        $g = array_values(unpack('n8', $bin));
+        if ($g[0] === 0 && $g[1] === 0 && $g[2] === 0 && $g[3] === 0 && $g[4] === 0 && $g[5] === 0xFFFF) {
+            return sprintf('%d.%d.%d.%d', $g[6] >> 8, $g[6] & 255, $g[7] >> 8, $g[7] & 255);
+        }
+        return sprintf('%x:%x:%x:%x::/64', $g[0], $g[1], $g[2], $g[3]);
+    }
 }
