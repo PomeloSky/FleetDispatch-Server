@@ -17,6 +17,7 @@
   - Cloudflare：`npx wrangler dev --config cloudflare/wrangler.toml --local --persist-to <暫存資料夾> --var FD_SETUP_TOKEN:…`，同上
   - PHP＋MySQL：在有 MySQL 的環境（CI）執行
 - [ ] 遷移測試：`node --test conformance/migration-node.test.mjs conformance/migration-php.test.mjs`（本機暫存資料夾）。
+- [ ] 網頁管理的瀏覽器實測（選用，網頁有修改時）：`scripts/check-admin-ui.mjs` 對本機新建、空的主機執行（見檔案開頭的說明）。
 - [ ] `core/src/version.ts`、`php/src/Version.php`、`package.json` 的版本一致。
 - [ ] `docs/protocol.md` 的版本與相容性表、`docs/migration.md` 已更新。
 

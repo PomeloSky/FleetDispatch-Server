@@ -530,7 +530,9 @@ App 的資料格式中，巡檢、工單與車趟之間沒有直接的關聯欄�
 - **登入**：瀏覽器以 `POST /pair` 配對（`platform: "web"`，每次登入產生新的 `deviceId`）：沒有管理員時用設定碼成為管理員，否則用管理員建立的配對碼；
   角色不是管理員時只能登出。權杖存在瀏覽器（勾選「記住這個瀏覽器」時是 localStorage，否則是 sessionStorage）；登出是 `POST /unpair`；
   `401` 時清除權杖並回到登入頁。最後一位管理員不能登出（`409 last_admin`），頁面會提示先建立另一位管理員。
-- **相容性測試**：`conformance/web.test.mjs`（`FD_ADMIN_PATH` 與主機的設定相同）。
+- **1.2.0 的網頁管理**：13 個管理區塊、資料清單與詳情、受控修改、刪除的影響預覽、用車申請的簽核、報表、修改前後歷史，
+  使用 §7.1–7.8 的端點（沒有其他端點）。畫面說明見 [`admin-management.md`](admin-management.md) §8。
+- **相容性測試**：`conformance/web.test.mjs`（`FD_ADMIN_PATH` 與主機的設定相同）；畫面的瀏覽器實測 `scripts/check-admin-ui.mjs`（選用）。
 - **PHP 版的安裝精靈**（只有 PHP 版、不屬於共同規格）：還沒有 `config.php` 時，網頁管理在預設的 `/admin` 顯示安裝畫面，使用
   `GET /api/v1/install`（主機環境；在程式資料夾建立安裝金鑰檔 `install-key.php`）、`POST /api/v1/install/test`（測試資料庫）、
   `POST /api/v1/install`（建立資料表並寫入設定，只能成功一次）。後兩者需要 `installKey`（安裝金鑰檔裡的金鑰，證明能管理主機的檔案；

@@ -31,7 +31,9 @@
   駕駛不能核准自己的申請、不能修改或改派別人的車趟。
 - 用車申請與核准、巡檢、工單、零件、保養等 10 種資料；即時位置（出車中的車輛位置）；稽核紀錄（誰在什麼時候改了什麼）。
 - 裝置管理：配對碼（單次有效、可設定期限）、改角色、綁定駕駛人、解除配對。
-- 網頁（1.1.0 起）：首頁是 App 的介紹與 App Store 下載連結（Android 版測試中，Google Play 公開上架後才放下載連結）；網頁管理在設定的管理網址，用瀏覽器做上面的管理工作，並查看即時位置、稽核紀錄與資料（唯讀）。登入方式與 App 相同（設定碼或配對碼）。
+- 網頁（1.1.0 起）：首頁是 App 的介紹與 App Store 下載連結（Android 版測試中，Google Play 公開上架後才放下載連結）；網頁管理在設定的管理網址，用瀏覽器做上面的管理工作。
+  1.2.0 起網頁管理有 13 個區塊：總覽、使用者與駕駛、裝置、車輛、車趟、用車申請、巡檢與工單、保養與零件、即時位置、報表、修改歷史與稽核、配對碼、主機設定——
+  可以搜尋、篩選、排序、查看詳情與關聯，並以受控的方式修改（預覽差異、填寫原因）、刪除（影響預覽）、簽核用車申請、下載報表 CSV。登入方式與 App 相同（設定碼或配對碼）。
 - 安全：只在 HTTPS 上使用；權杖與配對碼只存雜湊；配對失敗太多次會暫時鎖定；所有 SQL 參數化。
 
 ## 架構
@@ -43,7 +45,7 @@ docker/        Node 24（內建 node:sqlite）的進入點與維護工具
 php/           PHP 8.1 以上＋MySQL 8.0／MariaDB 10.6 以上（或 SQLite）實作
 web/           網頁：首頁 home.html、網頁管理 admin.html／admin.js（npm run build:web 產生 core/src/web-assets.ts 與 php/web/）
 spec/          網頁管理的資料規格 admin-entities.json（npm run build:web 產生 core/src/admin-spec.ts 與 php/src/AdminSpec.php）
-scripts/       開發工具（build-web.mjs）
+scripts/       開發工具（build-web.mjs；選用的瀏覽器實測 check-admin-ui.mjs）
 conformance/   相容性測試：對任何一台主機執行，三種實作都必須通過
 docs/          協定規格與各部署方式的架設說明
 ```
