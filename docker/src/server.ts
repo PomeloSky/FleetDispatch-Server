@@ -165,8 +165,13 @@ async function onRequest(req: IncomingMessage, res: ServerResponse): Promise<voi
     const request = new Request(url, { method, headers, body: body && body.length > 0 ? body : undefined });
     const response = await handleRequest(request, { db, config, clientIp: clientIp(req) });
     status = response.status;
-    const out: Record<string, string> = {};
-    response.headers.forEach((v, k) => (out[k] = v));
+    const out: Record<string, string | string[]> = {};
+    response.headers.forEach((v, k) => {
+      if (k !== 'set-cookie') out[k] = v;
+    });
+    // Set-Cookie 不能以逗號合併（日期裡有逗號），逐一送出
+    const cookies = response.headers.getSetCookie();
+    if (cookies.length > 0) out['set-cookie'] = cookies;
     res.writeHead(response.status, out);
     res.end(Buffer.from(await response.arrayBuffer()));
   } catch (e) {

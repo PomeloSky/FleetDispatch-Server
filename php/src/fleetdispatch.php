@@ -18,6 +18,7 @@ require_once __DIR__ . '/Db.php';
 require_once __DIR__ . '/Repo.php';
 require_once __DIR__ . '/Request.php';
 require_once __DIR__ . '/Response.php';
+require_once __DIR__ . '/WebSession.php';
 require_once __DIR__ . '/Web.php';
 require_once __DIR__ . '/Installer.php';
 require_once __DIR__ . '/AdminSpec.php';

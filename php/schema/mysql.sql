@@ -7,6 +7,7 @@
 -- 數值欄位：毫秒時間與序號用 BIGINT，Apple 秒與座標用 DOUBLE（不可用 FLOAT，精度不夠）。
 -- fd_attempts 多一個自動編號的主鍵（有些主機要求每個資料表都要有主鍵）。
 -- fd_devices.identity 是主機在每次配對時產生的身分，fd_records.created_by 記錄建立那筆資料的身分。
+-- fd_devices.web_session、session_until（資料表版本 3）是網頁管理以 Cookie 登入的種類與期限。
 -- 注意：這個檔案由程式以分號切開執行，註解只能寫成整行的 -- 註解，而且註解裡不能有分號。
 
 CREATE TABLE IF NOT EXISTS fd_meta (
@@ -48,6 +49,8 @@ CREATE TABLE IF NOT EXISTS fd_devices (
     last_seen_at BIGINT NULL,
     revoked_at BIGINT NULL,
     identity VARCHAR(36) NULL,
+    web_session VARCHAR(16) NULL,
+    session_until BIGINT NULL,
     PRIMARY KEY (device_id),
     UNIQUE KEY fd_devices_token (token_hash)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;

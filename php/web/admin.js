@@ -1,6 +1,7 @@
 // FleetDispatch Server 網頁管理（說明見 docs/protocol.md「網頁管理」與 docs/admin-management.md）。
-// 只使用公開的 API v1：這個瀏覽器像 App 一樣「配對」取得權杖（第一次設定用設定碼，之後用管理員建立的配對碼），
-// 再呼叫 /admin/* 等端點。不載入任何外部資源；伺服器資料一律以 textContent 顯示。
+// 只使用公開的 API v1：以管理員的配對碼（第一次設定用設定碼）登入（POST /web/login），權杖由主機以 HttpOnly Cookie 保存，
+// 這個程式不保存也讀不到權杖；非 GET 的請求帶 X-FleetDispatch-CSRF（docs/security-review.md）。
+// 不載入任何外部資源；伺服器資料一律以 textContent 顯示。
 // 1.2.0：13 個管理區塊、資料清單（搜尋、篩選、排序、分頁）、詳情與關聯、受控修改（預覽差異 → 原因 → 確認）、
 // 刪除的影響預覽、用車申請的簽核、報表與 CSV、修改前後歷史與版本比較。
 (() => {
@@ -10,7 +11,9 @@
   const BASE = root.dataset.base || '';
   const ADMIN = root.dataset.admin || '';
   const API = BASE + '/api/v1/';
+  /** 1.0–1.1 把權杖存在瀏覽器的位置：1.2.0 只用來把舊的登入換成 Cookie，之後刪除。 */
   const STORE_KEY = 'fd.admin.session';
+  const CSRF_HEADER = 'X-FleetDispatch-CSRF';
   const APPLE_EPOCH = 978307200;
   const app = document.getElementById('app');
 
@@ -62,7 +65,7 @@
   const TTL_OPTIONS = [[60, '1 小時'], [1440, '1 天'], [4320, '3 天'], [10080, '7 天']];
 
   const state = {
-    info: null, session: null, me: null, schema: null, vehicles: null, drivers: null,
+    info: null, csrf: null, me: null, schema: null, vehicles: null, drivers: null,
     devices: null, codes: null, codePreset: null, showRevoked: false,
   };
   let timers = [];
@@ -197,15 +200,6 @@
     return (out && out()) || '—';
   }
 
-  /** 隨機 UUID（http 的區域網路位址不是安全環境，沒有 crypto.randomUUID）。 */
-  function uuid() {
-    const b = crypto.getRandomValues(new Uint8Array(16));
-    b[6] = (b[6] & 0x0f) | 0x40;
-    b[8] = (b[8] & 0x3f) | 0x80;
-    const x = Array.from(b, (v) => v.toString(16).padStart(2, '0')).join('').toUpperCase();
-    return `${x.slice(0, 8)}-${x.slice(8, 12)}-${x.slice(12, 16)}-${x.slice(16, 20)}-${x.slice(20)}`;
-  }
-
   function browserName() {
     const ua = navigator.userAgent || '';
     const b = /Edg\//.test(ua) ? 'Edge' : /Firefox\//.test(ua) ? 'Firefox' : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : '瀏覽器';
@@ -222,7 +216,7 @@
     }
   }
 
-  // ───────── 登入資料（只存在這個瀏覽器） ─────────
+  // ───────── 1.0–1.1 的登入資料（權杖存在瀏覽器；1.2.0 換成 Cookie 後刪除） ─────────
 
   function stores() {
     const out = [];
@@ -238,11 +232,12 @@
     }
     return out;
   }
-  function loadSession() {
+  /** 舊的登入：權杖與是否「記住這個瀏覽器」（存在 localStorage）。 */
+  function loadLegacy() {
     for (const s of stores()) {
       try {
         const v = JSON.parse(s.getItem(STORE_KEY) || 'null');
-        if (v && typeof v.token === 'string' && v.token.length >= 20) return v;
+        if (v && typeof v.token === 'string' && v.token.length >= 20) return { token: v.token, remember: s === window.localStorage };
       } catch {
         /* 損壞的資料視為沒有登入 */
       }
@@ -258,15 +253,6 @@
       }
     }
   }
-  function saveSession(v, remember) {
-    clearStored();
-    try {
-      (remember ? window.localStorage : window.sessionStorage).setItem(STORE_KEY, JSON.stringify(v));
-      return true;
-    } catch {
-      return false;
-    }
-  }
 
   // ───────── API ─────────
 
@@ -279,14 +265,15 @@
     }
   }
 
+  /** 呼叫 API。登入 Cookie 由瀏覽器自動帶上；`auth` 是 false 的請求（登入前）收到 401 不會結束登入。 */
   async function call(method, path, body, auth = true, extra = null) {
     const headers = { Accept: 'application/json', ...(extra || {}) };
-    if (auth && state.session) headers.Authorization = 'Bearer ' + state.session.token;
+    if (method !== 'GET' && method !== 'HEAD') headers[CSRF_HEADER] = state.csrf || 'login';
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     let res;
     try {
       res = await fetch(API + path, {
-        method, headers, body: body === undefined ? undefined : JSON.stringify(body), cache: 'no-store', credentials: 'omit',
+        method, headers, body: body === undefined ? undefined : JSON.stringify(body), cache: 'no-store', credentials: 'same-origin',
       });
     } catch {
       throw new ApiFailure(0, 'network', '無法連線到主機，請檢查網路後再試一次。');
@@ -303,7 +290,7 @@
       const failure = new ApiFailure(res.status, err.code || 'error', err.message || `主機回應錯誤（HTTP ${res.status}）`,
         Number(res.headers.get('Retry-After')) || undefined);
       failure.data = err; // 補充資料：fields（欄位錯誤）、current（版本衝突）、cascade（影響範圍改變）
-      if (res.status === 401 && auth && state.session) expire();
+      if (res.status === 401 && auth && state.me) expire();
       throw failure;
     }
     return data;
@@ -329,16 +316,31 @@
       return;
     }
     document.title = `${state.info.name}｜FleetDispatch Server 管理`;
-    state.session = state.session || loadSession();
-    if (!state.session) {
-      renderLogin();
-      return;
+    // 1.0–1.1 的登入（權杖存在瀏覽器）：換成主機保存的 Cookie，瀏覽器不再保存權杖
+    const legacy = loadLegacy();
+    let notice = null;
+    if (legacy) {
+      try {
+        adopt(await call('POST', 'web/upgrade', { remember: legacy.remember }, false, { Authorization: 'Bearer ' + legacy.token }));
+        clearStored();
+        toast('登入方式已更新：登入資料改由主機保存（瀏覽器的程式讀不到），這個瀏覽器不再保存權杖。', 'ok');
+      } catch (e) {
+        if (e.status !== 401 && e.status !== 403) {
+          renderFatal(e);
+          return;
+        }
+        clearStored();
+        notice = '網頁管理的登入方式已更新為更安全的方式，舊的登入已經失效，請用管理員的配對碼重新登入。';
+      }
     }
-    try {
-      state.me = await call('GET', 'session');
-    } catch (e) {
-      if (e.status !== 401) renderFatal(e);
-      return;
+    if (!state.me) {
+      try {
+        adopt(await call('GET', 'session', undefined, false));
+      } catch (e) {
+        if (e.status === 401) renderLogin(notice);
+        else renderFatal(e);
+        return;
+      }
     }
     if (state.me.role !== 'admin') {
       renderNotAdmin();
@@ -347,15 +349,21 @@
     renderConsole();
   }
 
+  /** 登入成功（GET /session、POST /web/login、/web/upgrade 的回應）：記下這次登入與 CSRF 權杖（不含登入權杖）。 */
+  function adopt(me) {
+    state.me = me;
+    state.csrf = me && me.web ? me.web.csrfToken : null;
+  }
+
   function endSession(notice) {
     stopTimers();
     clearStored();
-    Object.assign(state, { session: null, me: null, schema: null, vehicles: null, drivers: null, devices: null, codes: null });
+    Object.assign(state, { csrf: null, me: null, schema: null, vehicles: null, drivers: null, devices: null, codes: null });
     renderLogin(notice);
   }
 
   function expire() {
-    endSession('登入已失效（可能已被解除配對，或超過 90 天沒有使用），請重新登入。');
+    endSession('登入已失效（閒置太久、超過登入期限，或已被解除配對），請用管理員的配對碼重新登入。');
   }
 
   function renderFatal(e) {
@@ -501,8 +509,7 @@
       go.disabled = true;
       try {
         const deviceName = '網頁管理（' + browserName() + '）';
-        const p = await call('POST', 'pair', { code: r.setupToken, deviceId: uuid(), deviceName, platform: 'web' }, false);
-        saveSession({ token: p.token, deviceId: p.deviceId, deviceName }, true);
+        await call('POST', 'web/login', { code: r.setupToken, deviceName, remember: true }, false);
         location.assign(adminUrl);
       } catch (e) {
         go.disabled = false;
@@ -556,7 +563,7 @@
       clear(app).append(h('div', { class: 'center' }, h('div', { class: 'narrow' },
         brand('網頁管理'),
         h('h1', { text: '還不能建立管理員' }),
-        h('p', { text: '這台主機還沒有管理員，也還沒有設定「設定碼」，所以目前沒有人可以登入。' }),
+        h('p', { text: '這台主機目前沒有可以使用的管理員，也還沒有設定「設定碼」，所以目前沒有人可以登入。' }),
         h('ol', { class: 'steps' },
           h('li', { text: info.variant === 'php' ? '在 config.php 填入 setup_token（至少 16 個字元）。'
             : info.variant === 'cloudflare' ? '執行 npx wrangler secret put FD_SETUP_TOKEN 設定一組至少 16 個字元的設定碼。'
@@ -573,7 +580,7 @@
     });
     const nameInput = h('input', { type: 'text', id: 'login-name', maxlength: '100', required: true, value: '網頁管理（' + browserName() + '）' });
     const remember = h('input', { type: 'checkbox', id: 'login-remember' });
-    const submit = h('button', { class: 'btn', type: 'submit', text: setup ? '建立第一位管理員' : '登入' });
+    const submit = h('button', { class: 'btn', type: 'submit', text: setup ? '建立管理員' : '登入' });
     const status = h('div');
 
     const form = h('form', { class: 'stack', novalidate: true },
@@ -587,9 +594,10 @@
         nameInput,
         h('span', { class: 'hint', text: '會出現在裝置清單，方便辨認。' })),
       setup
-        ? h('p', { class: 'muted', text: '這個瀏覽器會記住登入。建立後請在「配對碼」建立管理員配對碼，讓手機或平板的 App 也成為管理員。' })
+        ? h('p', { class: 'muted', text: '這個瀏覽器會記住登入（90 天內有效，30 天沒有使用需要重新登入）。建立後請在「配對碼」建立管理員配對碼，讓手機或平板的 App 也成為管理員。' })
         : h('label', { class: 'check', for: 'login-remember' }, remember,
-          h('span', null, '記住這個瀏覽器', h('br'), h('span', { class: 'muted', text: '公用電腦請不要勾選，用完請登出。' }))),
+          h('span', null, '記住這個瀏覽器', h('br'),
+            h('span', { class: 'muted', text: '勾選：90 天內有效，30 天沒有使用需要重新登入。不勾選：關閉瀏覽器、閒置 2 小時或登入 12 小時後需要重新登入。公用電腦請不要勾選，用完請登出。' }))),
       status,
       h('div', { class: 'row' }, submit));
 
@@ -604,18 +612,15 @@
       submit.disabled = true;
       clear(status);
       try {
-        const deviceId = uuid();
-        const r = await call('POST', 'pair', { code: setup ? raw : raw.toUpperCase(), deviceId, deviceName, platform: 'web' }, false);
-        const session = { token: r.token, deviceId: r.deviceId || deviceId, deviceName };
-        const saved = saveSession(session, setup || remember.checked);
-        state.session = session;
-        if (!saved) toast('瀏覽器不允許保存登入資料：關閉這個分頁後需要重新登入。');
+        adopt(await call('POST', 'web/login', { code: setup ? raw : raw.toUpperCase(), deviceName, remember: setup || remember.checked }, false));
         await boot();
       } catch (e) {
         submit.disabled = false;
         const msg = e.code === 'rate_limited'
           ? `嘗試太多次，請 ${Math.ceil((e.retryAfter || 900) / 60)} 分鐘後再試。`
-          : e.code === 'invalid_code' ? (setup ? '設定碼不正確。' : '配對碼錯誤、已使用或已過期。') : e.message;
+          : e.code === 'invalid_code' ? (setup ? '設定碼不正確。' : '配對碼錯誤、已使用或已過期。')
+            : e.code === 'admin_only' ? '這不是「管理員」的配對碼：網頁管理只能用管理員配對碼登入（這組配對碼沒有被用掉，仍可在 App 使用）。'
+              : e.message;
         clear(status).append(banner('error', msg));
         codeInput.focus();
       }
@@ -623,8 +628,8 @@
 
     clear(app).append(h('div', { class: 'center' }, h('div', { class: 'narrow' },
       brand('網頁管理'),
-      h('h1', { text: setup ? '建立第一位管理員' : '登入網頁管理' }),
-      setup ? h('p', { text: '這台主機還沒有管理員。輸入部署時設定的設定碼，這個瀏覽器就會成為第一位管理員；設定碼之後就不能再用。' }) : null,
+      h('h1', { text: setup ? '建立管理員' : '登入網頁管理' }),
+      setup ? h('p', { text: '這台主機目前沒有可以使用的管理員（第一次設定，或所有管理員的登入都已失效）。輸入部署時設定的設定碼，這個瀏覽器就會成為管理員；之後有可以使用的管理員時，設定碼就不能用來登入。' }) : null,
       notice ? banner('info', notice) : null,
       h('section', { class: 'card' }, form))));
     codeInput.focus();
@@ -639,12 +644,12 @@
   }
 
   async function logout() {
-    if (!window.confirm('要登出並解除這個瀏覽器的配對嗎？之後要再登入，需要新的配對碼。')) return;
+    if (!window.confirm('要登出並解除這個瀏覽器的配對嗎？之後要再登入，需要新的管理員配對碼。')) return;
     try {
-      await call('POST', 'unpair');
+      await call('POST', 'unpair', undefined, false);
     } catch (e) {
       if (e.code === 'last_admin') {
-        toast('你是目前唯一的管理員，不能登出。請先在「配對碼」建立管理員配對碼，讓另一台裝置成為管理員。');
+        toast('目前沒有其他可以使用的管理員，不能登出。請先在「配對碼」建立管理員配對碼，讓另一台裝置成為管理員。');
         return;
       }
       if (e.status !== 401) {
@@ -1765,7 +1770,12 @@
     const admins = live.filter((d) => d.role === 'admin');
     const fresh = loc.locations.filter((l) => !l.stale);
     const parts = [];
-    if (admins.length === 1 && admins[0].deviceId === state.session.deviceId) {
+    const web = state.me.web;
+    if (web && web.remember && web.sessionUntil - Date.now() < 3 * 86400000) {
+      parts.push(banner('warn', `這個瀏覽器的登入將在 ${fmtTime(web.sessionUntil)} 到期`,
+        '到期後要用新的管理員配對碼重新登入。請先在「配對碼」建立管理員配對碼，或確認手機或平板的 App 也是管理員。'));
+    }
+    if (admins.length === 1 && admins[0].deviceId === state.me.deviceId) {
       parts.push(banner('warn', '目前只有這個瀏覽器是管理員',
         '建議建立一組「管理員」配對碼，讓你的手機或平板也成為管理員；這個瀏覽器的登入資料被清除時才不會失去管理權限。',
         h('button', { class: 'btn small', type: 'button', text: '建立管理員配對碼', onclick: () => { state.codePreset = 'admin'; navigate('#codes'); } })));
@@ -1807,7 +1817,7 @@
       .filter((d) => state.showRevoked || d.revokedAt === null)
       .sort((a, b) => (isActive(b) - isActive(a)) || ((b.lastSeenAt || 0) - (a.lastSeenAt || 0)));
     const rows = shown.map((d) => {
-      const mine = d.deviceId === state.session.deviceId;
+      const mine = d.deviceId === state.me.deviceId;
       const active = isActive(d);
       const roleSel = h('select', { class: 'inline', 'aria-label': `${d.name} 的角色`, disabled: !active || mine },
         Object.entries(ROLE).map(([v, label]) => h('option', { value: v, selected: d.role === v, text: label })));
@@ -1830,9 +1840,12 @@
       const statusChip = d.revokedAt !== null ? h('span', { class: 'chip', text: '已解除配對' })
         : active ? h('span', { class: 'chip ok', text: '使用中' }) : h('span', { class: 'chip warn', text: '權杖已過期' });
       const bound = d.driverBinding && driverById(d.driverBinding.driverUuid);
+      const webLogin = d.webSession === 'remember' ? '記住瀏覽器' : d.webSession === 'session' ? '不記住瀏覽器'
+        : d.platform === 'web' ? '舊的登入方式' : null;
       return h('tr', { class: active ? null : 'dim' },
         h('td', null, h('div', { text: d.name }),
-          h('div', { class: 'muted', text: [PLATFORM[d.platform] || d.platform, shortId(d.deviceId)].filter(Boolean).join('・') }),
+          h('div', { class: 'muted', text: [PLATFORM[d.platform] || d.platform, webLogin, shortId(d.deviceId)].filter(Boolean).join('・') }),
+          d.sessionUntil && active ? h('div', { class: 'muted', text: `登入期限 ${fmtTime(d.sessionUntil)}` }) : null,
           mine ? h('span', { class: 'chip accent', text: '這個瀏覽器' }) : null),
         h('td', null, roleSel),
         h('td', null, bindSel, bound ? h('div', null, recordLink('driver', bound.id, '駕駛人資料')) : null),
@@ -1848,7 +1861,7 @@
       state.showRevoked = toggle.checked;
       renderRoute();
     });
-    clear(panel).append(card('裝置', '配對到這台主機的 App 與瀏覽器（主機沒有使用者帳號，角色屬於裝置）。角色與綁定的駕駛人改了之後，該裝置下次同步時生效；解除配對後它就不能再連線。「最近連線」每小時更新一次。',
+    clear(panel).append(card('裝置', '配對到這台主機的 App 與瀏覽器（主機沒有使用者帳號，角色屬於裝置）。角色與綁定的駕駛人改了之後，該裝置下次同步時生效；解除配對後它就不能再連線，網頁管理的登入也立即失效。「最近連線」App 每小時、網頁管理每 5 分鐘更新一次。',
       h('div', { class: 'row' }, h('label', { class: 'check', for: 'show-revoked' }, toggle, '顯示已解除配對的裝置'), h('span', { class: 'spacer' }), refreshButton()),
       table(['裝置', '角色', '綁定駕駛人', '最近連線', '配對日期', '狀態', '資料', ''], rows, '還沒有配對的裝置。')));
   }
@@ -1859,7 +1872,7 @@
       toast('已更新', 'ok');
     } catch (e) {
       if (e.status === 401) return;
-      toast(e.code === 'last_admin' ? '最後一位管理員不能降級。' : e.message);
+      toast(e.code === 'last_admin' ? '最後一位可以使用的管理員不能降級。' : e.message);
     }
     state.devices = null;
     renderRoute();
@@ -1872,7 +1885,7 @@
       toast('已解除配對', 'ok');
     } catch (e) {
       if (e.status === 401) return;
-      toast(e.code === 'last_admin' ? '最後一位管理員不能解除配對。' : e.message);
+      toast(e.code === 'last_admin' ? '最後一位可以使用的管理員不能解除配對。' : e.message);
     }
     state.devices = null;
     renderRoute();
@@ -2099,13 +2112,11 @@
       card('每日里程', null, table(['日期', '車趟', '里程 (km)', ''], dayRows, '這段期間沒有車趟。')));
   }
 
-  /** 下載 CSV（需要權杖，不能用一般的連結）。 */
+  /** 下載 CSV（以 fetch 取得後存檔，檔名依主機的 Content-Disposition）。 */
   async function downloadCsv(path, button) {
     if (button) button.disabled = true;
     try {
-      const headers = { Accept: 'text/csv' };
-      if (state.session) headers.Authorization = 'Bearer ' + state.session.token;
-      const res = await fetch(API + path, { headers, cache: 'no-store', credentials: 'omit' });
+      const res = await fetch(API + path, { headers: { Accept: 'text/csv' }, cache: 'no-store', credentials: 'same-origin' });
       if (!res.ok) {
         let msg = `主機回應錯誤（HTTP ${res.status}）`;
         try {
@@ -2242,10 +2253,13 @@
         h('dt', { text: '資料表版本' }), h('dd', { class: 'mono', text: String(info.schemaVersion ?? '—') }),
         h('dt', { text: '能力' }), h('dd', { class: 'mono', text: (info.features || []).join('、') }),
         h('dt', { text: '部署方式' }), h('dd', { text: VARIANT[info.variant] || info.variant }))),
-      card('這個瀏覽器', '這個瀏覽器以管理員的身分配對到主機；登出會解除配對。', h('dl', { class: 'facts' },
+      card('這個瀏覽器', '這個瀏覽器以管理員的身分配對到主機；登入資料由主機以 HttpOnly Cookie 保存（網頁的程式讀不到）。登出會解除配對。', h('dl', { class: 'facts' },
         h('dt', { text: '名稱' }), h('dd', { text: me.deviceName }),
         h('dt', { text: '裝置 ID' }), h('dd', { class: 'mono', text: me.deviceId }),
-        h('dt', { text: '登入有效到' }), h('dd', { text: `${fmtTime(me.tokenExpiresAt)}（使用時自動延長）` })),
+        h('dt', { text: '登入方式' }), h('dd', { text: me.web && me.web.remember
+          ? '記住這個瀏覽器：30 天沒有使用或登入 90 天後需要重新登入' : '不記住：關閉瀏覽器、閒置 2 小時或登入 12 小時後需要重新登入' }),
+        h('dt', { text: '目前有效到' }), h('dd', { text: `${fmtTime(me.tokenExpiresAt)}（使用時延長，最晚到登入期限）` }),
+        me.web ? h('dt', { text: '登入期限' }) : null, me.web ? h('dd', { text: fmtTime(me.web.sessionUntil) }) : null),
         h('div', { class: 'row' }, h('button', { class: 'btn danger', type: 'button', text: '登出並解除配對', onclick: logout }))),
       card('網頁管理的網址', '首頁不會顯示管理頁面；請記下這個網址（可以加入書籤），不要公開分享。',
         h('p', { class: 'mono', text: location.origin + BASE + ADMIN })));

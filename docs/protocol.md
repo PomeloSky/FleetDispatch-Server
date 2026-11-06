@@ -77,8 +77,10 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 
 ### 3.1 第一次設定（第一位管理員）
 
-部署時必須設定**設定碼**（setup token，至少 16 個字元；各實作的設定方式見部署文件）。主機上沒有任何有效的管理員裝置時，
-`POST /pair` 接受設定碼，配對的裝置成為管理員。之後設定碼不再有效；要恢復（例如管理員裝置遺失），由主機管理者依部署文件撤銷所有管理員後，設定碼重新生效。
+部署時必須設定**設定碼**（setup token，至少 16 個字元；各實作的設定方式見部署文件）。主機上沒有**可以使用的管理員**
+（角色是管理員、沒有解除配對、權杖還沒過期）時，`POST /pair` 與 `POST /web/login`（§13.1）接受設定碼，配對的裝置成為管理員。
+有可以使用的管理員時設定碼無效。要恢復（例如管理員裝置遺失），由主機管理者依部署文件撤銷所有管理員後，設定碼重新生效；
+1.2.0 起，所有管理員的權杖都過期時（例如只用網頁管理、超過期限沒有使用）設定碼也會自動重新生效。
 第一位管理員也可以是網頁管理的瀏覽器（§13）。
 
 ### 3.2 配對碼
@@ -92,13 +94,15 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 
 - 配對成功時發給 32 位元組的隨機權杖（base64url，無 padding），主機只存 SHA-256（十六進位小寫），以常數時間比對。
 - 有效期限 90 天，**使用時自動延長**（為了減少寫入，同一台裝置最多每小時更新一次 `lastSeenAt` 與期限）。
+- 網頁管理（1.2.0）的權杖只放在 HttpOnly Cookie，期限另計（§13.1）；這種權杖放在 `Authorization` 標頭使用時回 `401`。
+  1.0–1.1 網頁管理（`platform` 是 `web`）以 `POST /pair` 取得、存在瀏覽器的權杖不再延長，升級到資料表版本 3 時最多再用 30 天。
 - 權杖失效（過期、裝置被解除配對、未知）→ `401 unauthorized`，用戶端必須重新配對。
 - 同一個 `deviceId` 仍有有效權杖時，新的配對被拒絕（`409 device_conflict`）；要由管理員先解除配對，或由該裝置自己 `POST /unpair`。
 
 ### 3.4 嘗試次數限制
 
-同一個來源 IP 在 15 分鐘內配對失敗 10 次後，該 IP 的 `POST /pair` 回 `429 rate_limited`（`Retry-After` 秒數），直到最早一次失敗滿 15 分鐘。
-成功的配對不計入。
+同一個來源 IP 在 15 分鐘內配對失敗 10 次後，該 IP 的 `POST /pair` 與 `POST /web/login` 回 `429 rate_limited`（`Retry-After` 秒數），
+直到最早一次失敗滿 15 分鐘。兩個端點共用同一個計數；成功的配對不計入。
 
 來源 IP：Cloudflare 版用 `CF-Connecting-IP`；Docker 與 PHP 版預設用連線的位址，設定了信任的反向代理層數 N（≥ 1）時，
 取 `X-Forwarded-For` 從右邊數來第 N 個值（最左邊的值由用戶端自己填，可以偽造，不得使用）。
@@ -254,6 +258,9 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 
 `driverBinding` 沒有時是 `null`。角色或綁定被管理員改變時，用戶端在下一次回應就會看到；角色改變後應做一次全量同步（資料範圍不同）。
 
+以網頁管理的登入 Cookie（§13.1）驗證時另外有 `web`：`{ "remember": false, "sessionUntil": 1793659200000, "csrfToken": "32 個十六進位字元" }`
+（`remember`：記住這個瀏覽器；`sessionUntil`：登入期限；`csrfToken`：非 GET 請求的 `X-FleetDispatch-CSRF`）。App 的回應沒有這個欄位。
+
 ## 7. 管理（admin）
 
 | 端點 | 說明 |
@@ -274,10 +281,12 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 | `POST /admin/requests/{id}/approve`、`…/reject` | 用車申請的核准、退回（§7.7，1.2.0） |
 | `GET /admin/reports/summary`、`GET /admin/reports/export` | 報表的期間摘要與 CSV 匯出（§7.8，1.2.0） |
 
-`Device`：`{ "deviceId", "name", "platform", "role", "driverBinding", "pairedAt", "lastSeenAt", "tokenExpiresAt", "revokedAt" }`（時間為毫秒，沒有時 `null`）。
+`Device`：`{ "deviceId", "name", "platform", "role", "driverBinding", "pairedAt", "lastSeenAt", "tokenExpiresAt", "revokedAt", "webSession", "sessionUntil" }`
+（時間為毫秒，沒有時 `null`）。`webSession`（1.2.0）：網頁管理以 Cookie 登入時是 `session`（不記住）或 `remember`（記住這個瀏覽器），
+App 與 1.1 的網頁權杖是 `null`；`sessionUntil`：網頁登入的期限。
 
-限制：最後一位有效的管理員不能被降級或解除配對（`409 last_admin`）。1.2.0 起這個檢查與更新是同一個不可分割的操作：兩位管理員同時互相降級或解除配對時，
-至少留下一位。
+限制：沒有其他**可以使用的管理員**（§3.1）時，管理員不能被降級或解除配對（`409 last_admin`）。1.2.0 起這個檢查與更新是同一個不可分割的操作：
+兩位管理員同時互相降級或解除配對時，至少留下一位。
 
 ### 7.1 修改前後歷史 `GET /admin/history?entity=<種類>&id=<UUID>&outcome=<applied|notApplied>&source=<來源>&pii=1&before=<id>&limit=<筆數>`（1.2.0）
 
@@ -428,15 +437,15 @@ App 的資料格式中，巡檢、工單與車趟之間沒有直接的關聯欄�
   "product": "FleetDispatch Server", "apiVersion": 1, "serverVersion": "1.0.0", "variant": "docker",
   "serverId": "UUID", "name": "優良運輸", "time": 1793616000000,
   "setupRequired": false, "setupConfigured": true,
-  "features": ["liveLocations", "audit", "idempotency", "revision", "history"], "schemaVersion": 2,
+  "features": ["liveLocations", "audit", "idempotency", "revision", "history", "webSession"], "schemaVersion": 3,
   "limits": { "maxEventsPerRequest": 500, "maxBodyBytes": 5242880 }
 }
 ```
 
-- `features`（1.2.0 新增 `idempotency`、`revision`、`history`）：用戶端只在主機宣告時使用對應的能力。`schemaVersion`：資料表版本（1.2.0 是 2）。
+- `features`（1.2.0 新增 `idempotency`、`revision`、`history`、`webSession`）：用戶端只在主機宣告時使用對應的能力。`schemaVersion`：資料表版本（1.2.0 是 3）。
 
 - `variant`：`cloudflare`、`php`、`docker`。
-- `setupRequired`：沒有任何有效的管理員（下一次配對要用設定碼）。`setupConfigured`：部署時有設定設定碼。
+- `setupRequired`：沒有可以使用的管理員（§3.1；下一次配對要用設定碼）。`setupConfigured`：部署時有設定設定碼。
 - App 驗證主機時先呼叫這個端點：`product` 必須是 `FleetDispatch Server`、`apiVersion` 必須是 1。
 
 ### `POST /api/v1/pair`（不需權杖）
@@ -457,7 +466,8 @@ App 的資料格式中，巡檢、工單與車趟之間沒有直接的關聯欄�
 
 ### `POST /api/v1/unpair`（需要權杖）
 
-裝置自行解除配對（例如使用者改回單人或區網模式）→ `204`。最後一位管理員不能自行解除（`409 last_admin`）。
+裝置自行解除配對（例如使用者改回單人或區網模式）→ `204`。沒有其他可以使用的管理員時，管理員不能自行解除（`409 last_admin`）。
+網頁管理以 Cookie 登入時，這就是登出：回應同時以 `Set-Cookie`（`Max-Age=0`）刪除登入 Cookie。
 
 ## 10. 錯誤
 
@@ -475,12 +485,16 @@ App 的資料格式中，巡檢、工單與車趟之間沒有直接的關聯欄�
 | 401 | `unauthorized` | 沒有權杖、權杖無效或過期、裝置已解除配對 |
 | 401 | `invalid_code` | 配對碼或設定碼錯誤、用過、過期 |
 | 403 | `forbidden` | 角色不允許這個端點或操作 |
+| 403 | `csrf_failed` | 網頁管理的請求沒有通過來源檢查（§13.1） |
+| 403 | `admin_only` | `POST /web/login` 用了不是管理員的配對碼（配對碼不會被用掉） |
+| 403 | `not_web_session` | `POST /web/upgrade` 用了 App 的權杖 |
 | 404 | `not_found` | 端點或資源不存在 |
 | 405 | `method_not_allowed` | 方法不支援 |
 | 400 | `invalid_changes` | 網頁管理的修改內容不正確（`error.fields`） |
 | 409 | `device_conflict`、`last_admin`、`setup_not_configured` | 見上 |
 | 409 | `revision_mismatch`、`impact_changed`、`vehicle_has_active_trips`、`request_not_pending` | 網頁管理（§7.5–7.7） |
 | 413 | `payload_too_large` | 請求本體超過限制 |
+| 415 | `unsupported_media_type` | 網頁管理的請求本體不是 JSON（§13.1） |
 | 429 | `rate_limited` | 配對嘗試太多次（附 `Retry-After`） |
 | 503 | `busy` | 同一筆資料被連續修改，這批事件稍後重送（附 `Retry-After`；1.2.0 起事件冪等，重送安全） |
 | 500 | `server_error` | 主機內部錯誤（不得洩漏堆疊或 SQL） |
@@ -491,6 +505,7 @@ App 的資料格式中，巡檢、工單與車趟之間沒有直接的關聯欄�
 - 權杖、配對碼、設定碼只存雜湊或只放在部署的機密設定；不得寫入日誌。
 - 所有 SQL 一律使用參數化查詢。
 - 不回傳 `Access-Control-Allow-Origin`（App 是原生程式，不需要跨來源存取；避免網頁冒用）。
+- 網頁管理的登入（§13.1）：權杖只放在 HttpOnly、SameSite=Strict 的 Cookie；非 GET 的請求檢查 CSRF 權杖、`Sec-Fetch-Site` 與 JSON 本體。
 - 回應加上 `Cache-Control: no-store`、`X-Content-Type-Options: nosniff`。
 - 主機錯誤不得洩漏內部細節（堆疊、SQL、檔案路徑）。
 - 網頁（§13）：管理頁只在設定的管理網址回應，首頁與管理頁都不把請求內容（基底路徑除外）填進頁面，並加上 §13 的安全標頭；`GET /info` 與首頁都不透露管理網址。
@@ -506,7 +521,7 @@ App 的資料格式中，巡檢、工單與車趟之間沒有直接的關聯欄�
 ## 13. 網頁（1.1.0 起）：首頁與網頁管理
 
 主機的網址也提供兩種網頁：**首頁**是 FleetDispatch App 的介紹與下載連結（任何人都看得到）；**網頁管理**只在一個設定的網址出現，
-讓管理員用瀏覽器管理。網頁管理只使用本文件的 API，不需要額外的端點。
+讓管理員用瀏覽器管理。網頁管理只使用本文件的 API（登入是 §13.1 的 `POST /web/login`）。
 
 - **首頁**（只有 `GET`、`HEAD`）：基底路徑本身（`/`；PHP 是 `index.php` 所在的資料夾），以及 `…/index.php`、`…/index.html` 回 `200` 的 HTML。
   其他找不到的非 API 網址：`Accept` 有 `text/html`（瀏覽器）時回 `404` 狀態與同樣的首頁內容，否則照 API 的規則回 `404 not_found`（JSON）。
@@ -527,12 +542,49 @@ App 的資料格式中，巡檢、工單與車趟之間沒有直接的關聯欄�
 - **標頭**：管理頁 `Content-Type: text/html; charset=utf-8`，程式 `text/javascript; charset=utf-8`；兩者都有 `Cache-Control: no-store`、
   `X-Content-Type-Options: nosniff`、`X-Robots-Tag: noindex, nofollow`、`Referrer-Policy: no-referrer`。管理頁另外有
   `X-Frame-Options: DENY` 與 `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`。
-- **登入**：瀏覽器以 `POST /pair` 配對（`platform: "web"`，每次登入產生新的 `deviceId`）：沒有管理員時用設定碼成為管理員，否則用管理員建立的配對碼；
-  角色不是管理員時只能登出。權杖存在瀏覽器（勾選「記住這個瀏覽器」時是 localStorage，否則是 sessionStorage）；登出是 `POST /unpair`；
-  `401` 時清除權杖並回到登入頁。最後一位管理員不能登出（`409 last_admin`），頁面會提示先建立另一位管理員。
+- **登入**（1.2.0）：`POST /web/login`（§13.1），權杖由主機以 HttpOnly Cookie 保存，網頁的程式不保存也讀不到。登出是 `POST /unpair`；
+  `401` 時回到登入頁。沒有其他可以使用的管理員時不能登出（`409 last_admin`），頁面會提示先建立另一位管理員。
+  1.0–1.1 以 `POST /pair` 配對、把權杖存在瀏覽器（localStorage／sessionStorage）；1.2.0 的頁面開啟時以 `POST /web/upgrade` 換成 Cookie，並刪除瀏覽器裡的權杖。
 - **1.2.0 的網頁管理**：13 個管理區塊、資料清單與詳情、受控修改、刪除的影響預覽、用車申請的簽核、報表、修改前後歷史，
   使用 §7.1–7.8 的端點（沒有其他端點）。畫面說明見 [`admin-management.md`](admin-management.md) §8。
-- **相容性測試**：`conformance/web.test.mjs`（`FD_ADMIN_PATH` 與主機的設定相同）；畫面的瀏覽器實測 `scripts/check-admin-ui.mjs`（選用）。
+- **相容性測試**：`conformance/web.test.mjs`（`FD_ADMIN_PATH` 與主機的設定相同）、`conformance/web-session-suite.mjs`（登入，由 `api.test.mjs` 執行）、
+  `conformance/web-session-local.test.mjs`（期限與管理員的恢復，改本機暫存資料庫的時間）；畫面的瀏覽器實測 `scripts/check-admin-ui.mjs`（選用）。
+
+### 13.1 網頁管理的登入（1.2.0）
+
+權杖只放在 HttpOnly Cookie：網頁被插入惡意程式時也讀不到、帶不走（1.1 存在 localStorage）。App 不受影響（照舊用 `Authorization`）。
+
+**`POST /api/v1/web/login`**（不需權杖）：`{ "code": "管理員配對碼或設定碼", "deviceName": "網頁管理（Chrome・macOS）", "remember": false }`
+
+- 檢查與 `POST /pair` 相同（§3.1、§3.4）；配對碼的角色必須是管理員，否則 `403 admin_only`（配對碼不會被用掉）。
+  主機產生新的 `deviceId`，裝置的 `platform` 是 `web`。
+- `200`：Session（§6.3，含 `web`；**沒有權杖**）與 `Set-Cookie`。錯誤同 `POST /pair`，另有 `csrf_failed`、`unsupported_media_type`、`admin_only`。
+
+**`POST /api/v1/web/upgrade`**（`Authorization: Bearer <1.0–1.1 網頁管理的權杖>`）：`{ "remember": true }`
+
+- 只接受 `platform` 是 `web`、還沒有轉換的權杖（App 的權杖 `403 not_web_session`；無效、過期或已轉換 `401 unauthorized`）。
+  同一台網頁裝置換新的權杖（`deviceId` 不變），舊權杖立即失效。回應同 `POST /web/login`。
+
+**Cookie**：名稱 `fd_admin`（HTTPS 時 `__Secure-fd_admin` 並加 `Secure`；HTTPS 依網址或 `X-Forwarded-Proto`），`HttpOnly`、`SameSite=Strict`、
+`Path=<基底路徑>/api/v1`（網頁管理的頁面與其他路徑收不到）。「記住這個瀏覽器」時有 `Max-Age`（到登入期限），否則瀏覽器關閉時刪除。
+請求同時有 `Authorization` 標頭時以標頭為準（不看 Cookie）。
+
+**來源檢查**（`web/login`、`web/upgrade` 與以 Cookie 驗證的非 GET 請求）：
+- `X-FleetDispatch-CSRF`：以 Cookie 驗證時必須等於 Session 的 `web.csrfToken`（由登入權杖推導，不另外保存）；`web/login`、`web/upgrade` 只要不是空的。
+  自訂標頭讓跨站請求一定要先經過 CORS 預檢，而主機不回應 CORS。
+- `Sec-Fetch-Site` 有送時必須是 `same-origin`。
+- 有本體時 `Content-Type` 必須是 `application/json`（否則 `415 unsupported_media_type`）。
+- 不通過時 `403 csrf_failed`，不延長期限。GET 不檢查（SameSite=Strict 已經讓跨站請求不帶 Cookie，回應也讀不到）。
+
+**期限**：
+
+| | 閒置 | 登入期限 |
+| --- | --- | --- |
+| 不記住這個瀏覽器 | 2 小時 | 12 小時 |
+| 記住這個瀏覽器 | 30 天 | 90 天 |
+
+使用時延長閒置期限（最多每 5 分鐘寫入一次），但不超過登入期限；期限到了、管理員解除配對或登出後 `401`，要用新的管理員配對碼重新登入。
+`tokenExpiresAt` 是目前的有效期限（閒置期限與登入期限中較早的）。
 - **PHP 版的安裝精靈**（只有 PHP 版、不屬於共同規格）：還沒有 `config.php` 時，網頁管理在預設的 `/admin` 顯示安裝畫面，使用
   `GET /api/v1/install`（主機環境；在程式資料夾建立安裝金鑰檔 `install-key.php`）、`POST /api/v1/install/test`（測試資料庫）、
   `POST /api/v1/install`（建立資料表並寫入設定，只能成功一次）。後兩者需要 `installKey`（安裝金鑰檔裡的金鑰，證明能管理主機的檔案；
@@ -546,5 +598,7 @@ App 的資料格式中，巡檢、工單與車趟之間沒有直接的關聯欄�
 | 1.0.x、1.1.x | 支援 | 支援（不使用 1.2.0 的能力） |
 | 1.2.0 | 支援：不帶 `expectedRevision`、不讀 `revision`／`revisions`／`duplicate`，行為與 1.1 相同；刪除有進行中車趟的車輛會被拒絕（App 本身也不允許） | 支援 |
 
-- 資料表版本 2：第一次請求時自動遷移，可重複執行；升級前的備份與降版限制見 `docs/migration.md`。
+- 資料表版本 3（版本 2：revision、修改前後歷史、已處理事件；版本 3：網頁登入的期限）：第一次請求時自動遷移，可重複執行；
+  升級前的備份與降版限制見 `docs/migration.md`。
+- 網頁管理（§13.1）：1.1 存在瀏覽器的登入在第一次開啟 1.2.0 的網頁管理時自動換成 Cookie；App 8.0／8.1 的權杖不受影響。
 - 新的結果狀態 `conflict` 只會回給帶了 `expectedRevision` 的用戶端。

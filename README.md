@@ -33,8 +33,10 @@
 - 裝置管理：配對碼（單次有效、可設定期限）、改角色、綁定駕駛人、解除配對。
 - 網頁（1.1.0 起）：首頁是 App 的介紹與 App Store 下載連結（Android 版測試中，Google Play 公開上架後才放下載連結）；網頁管理在設定的管理網址，用瀏覽器做上面的管理工作。
   1.2.0 起網頁管理有 13 個區塊：總覽、使用者與駕駛、裝置、車輛、車趟、用車申請、巡檢與工單、保養與零件、即時位置、報表、修改歷史與稽核、配對碼、主機設定——
-  可以搜尋、篩選、排序、查看詳情與關聯，並以受控的方式修改（預覽差異、填寫原因）、刪除（影響預覽）、簽核用車申請、下載報表 CSV。登入方式與 App 相同（設定碼或配對碼）。
-- 安全：只在 HTTPS 上使用；權杖與配對碼只存雜湊；配對失敗太多次會暫時鎖定；所有 SQL 參數化。
+  可以搜尋、篩選、排序、查看詳情與關聯，並以受控的方式修改（預覽差異、填寫原因）、刪除（影響預覽）、簽核用車申請、下載報表 CSV。
+  以管理員的配對碼（第一次是設定碼）登入，登入資料由主機以 HttpOnly Cookie 保存（網頁的程式讀不到）。
+- 安全：只在 HTTPS 上使用；權杖與配對碼只存雜湊；配對失敗太多次會暫時鎖定；所有 SQL 參數化；網頁管理的登入有期限、CSRF 防護。
+  檢查項目與結果見 [`docs/security-review.md`](docs/security-review.md)。
 
 ## 架構
 
@@ -52,13 +54,14 @@ docs/          協定規格與各部署方式的架設說明
 
 - 協定規格：[docs/protocol.md](docs/protocol.md)（HTTP JSON API v1）；同步一致性 [docs/sync-consistency.md](docs/sync-consistency.md)、
   稽核與修改歷史 [docs/audit-history.md](docs/audit-history.md)、網頁管理的資料 [docs/admin-management.md](docs/admin-management.md)、報表 [docs/reports.md](docs/reports.md)、
-  資料表升級 [docs/migration.md](docs/migration.md)、
+  資料表升級 [docs/migration.md](docs/migration.md)、安全檢查 [docs/security-review.md](docs/security-review.md)、
   發布檢查與提交身分 [docs/release-checklist.md](docs/release-checklist.md)。
 - 相容性測試：**只對本機新建、空的主機執行**（測試會建立管理員並寫入資料；不要對正式主機執行）：
 
   ```sh
   FD_BASE=http://127.0.0.1:8080 FD_SETUP_TOKEN=你的設定碼 FD_ADMIN_PATH=/admin node --test conformance/api.test.mjs conformance/web.test.mjs
   node --test conformance/migration-node.test.mjs conformance/migration-php.test.mjs   # 1.1 → 1.2 遷移（本機暫存資料夾）
+  node --test conformance/web-session-local.test.mjs   # 網頁登入的期限與管理員的恢復（本機暫存資料夾）
   ```
 
   PHP 版的安裝精靈另有 `conformance/php-install.test.mjs`（對還沒有 `config.php` 的主機執行，見檔案開頭的說明）。

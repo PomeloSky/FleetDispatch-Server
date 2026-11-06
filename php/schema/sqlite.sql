@@ -19,7 +19,8 @@ CREATE INDEX IF NOT EXISTS fd_records_plate ON fd_records (vehicle_plate);
 CREATE TABLE IF NOT EXISTS fd_devices (
     device_id TEXT PRIMARY KEY, name TEXT NOT NULL, platform TEXT NOT NULL DEFAULT '', role TEXT NOT NULL,
     driver_uuid TEXT, driver_name TEXT, token_hash TEXT, token_expires_at INTEGER,
-    paired_at INTEGER NOT NULL, last_seen_at INTEGER, revoked_at INTEGER, identity TEXT);
+    paired_at INTEGER NOT NULL, last_seen_at INTEGER, revoked_at INTEGER, identity TEXT,
+    web_session TEXT, session_until INTEGER);
 
 CREATE UNIQUE INDEX IF NOT EXISTS fd_devices_token ON fd_devices (token_hash);
 

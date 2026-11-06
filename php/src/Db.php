@@ -16,7 +16,7 @@ namespace FleetDispatch;
 final class Db
 {
     /** 資料表版本：1（1.0–1.1）、2（1.2.0：每筆資料的 revision、修改前後歷史、已處理事件）。 */
-    public const SCHEMA_VERSION = 2;
+    public const SCHEMA_VERSION = 3;
 
     /** 1.2.0 新增的資料表（從版本 1 遷移時，從結構檔取出這些敘述執行）。 */
     private const V2_TABLES = ['fd_record_history', 'fd_processed_events'];
@@ -325,7 +325,8 @@ final class Db
             $this->migrate($schemaDir);
             return;
         }
-        if (!$this->tablesExist()) {
+        $existed = $this->tablesExist();
+        if (!$existed) {
             foreach ($this->schemaStatements($schemaDir) as $sql) {
                 $this->pdo->exec($sql);
             }
@@ -338,7 +339,8 @@ final class Db
             ['serverId', Crypto::uuid4()],
             ['name', $defaultName],
             ['createdAt', (string) Util::nowMs()],
-            ['schema', (string) self::SCHEMA_VERSION], // 最後寫入：有這一列表示初始化完成
+            // 最後寫入：有這一列表示初始化完成。手動匯入的資料表沒有版本紀錄：依實際的欄位判斷，之後的遷移只補缺少的部分
+            ['schema', (string) ($existed ? $this->detectVersion() : self::SCHEMA_VERSION)],
         ];
         foreach ($rows as [$k, $v]) {
             $this->run($insert, [$k, $v]);
@@ -414,7 +416,51 @@ final class Db
             $this->run("UPDATE fd_audit SET summary = '' WHERE entity = 'driver'");
             $this->run("UPDATE fd_meta SET v = '2' WHERE k = 'schema'");
             error_log('[fleetdispatch-server] 資料表已由版本 ' . $v . ' 升級到 2');
+            $v = 2;
         }
+        if ($v < 3) {
+            // 網頁管理以 Cookie 登入的種類與期限（docs/security-review.md §1）
+            if (!$this->hasColumn('fd_devices', 'web_session')) {
+                $this->pdo->exec($this->driver === 'sqlite'
+                    ? 'ALTER TABLE fd_devices ADD COLUMN web_session TEXT'
+                    : 'ALTER TABLE fd_devices ADD COLUMN web_session VARCHAR(16) NULL');
+            }
+            if (!$this->hasColumn('fd_devices', 'session_until')) {
+                $this->pdo->exec($this->driver === 'sqlite'
+                    ? 'ALTER TABLE fd_devices ADD COLUMN session_until INTEGER'
+                    : 'ALTER TABLE fd_devices ADD COLUMN session_until BIGINT NULL');
+            }
+            // 1.0–1.1 的網頁管理把權杖存在瀏覽器：不再延長，最多再用 30 天（期間內開啟網頁管理會自動換成 Cookie）
+            $cap = Util::nowMs() + WebSession::LEGACY_WEB_TTL_MS;
+            $this->run(
+                "UPDATE fd_devices SET token_expires_at = ? WHERE platform = 'web' AND web_session IS NULL AND revoked_at IS NULL AND token_expires_at > ?",
+                [$cap, $cap],
+            );
+            $this->run("UPDATE fd_meta SET v = '3' WHERE k = 'schema'");
+            error_log('[fleetdispatch-server] 資料表已由版本 ' . $v . ' 升級到 3');
+        }
+    }
+
+    /**
+     * 手動匯入（帳號沒有建表權限時，以 phpMyAdmin 匯入結構檔）的資料表的版本：1.1 的結構檔是 1；1.2.0 的結構檔是目前版本，
+     * 不需要遷移（這種帳號通常也沒有 ALTER 權限）。
+     */
+    private function detectVersion(): int
+    {
+        if (!$this->hasColumn('fd_records', 'revision')) {
+            return 1;
+        }
+        foreach (self::V2_TABLES as $table) {
+            try {
+                $this->pdo->query("SELECT 1 FROM {$table} WHERE 1 = 0");
+            } catch (\PDOException) {
+                return 1;
+            }
+        }
+        if (!$this->hasColumn('fd_devices', 'web_session') || !$this->hasColumn('fd_devices', 'session_until')) {
+            return 2;
+        }
+        return self::SCHEMA_VERSION;
     }
 
     private function hasColumn(string $table, string $column): bool

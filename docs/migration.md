@@ -6,30 +6,43 @@
 | --- | --- | --- |
 | 1 | 1.0.0–1.1.x | 初版 |
 | 2 | 1.2.0 | `fd_records.revision`（每筆資料的版本；既有資料從 1 開始）、`fd_record_history`（修改前後歷史，含 `outcome` 套用結果）、`fd_processed_events`（已處理事件，冪等）；清除 1.0–1.1 稽核紀錄中駕駛人的摘要（個資）；`fd_meta` 的 `guard`（多筆不可分割寫入用） |
+| 3 | 1.2.0 | `fd_devices.web_session`、`session_until`（網頁管理以 HttpOnly Cookie 登入的種類與期限，[`protocol.md`](protocol.md) §13.1）；1.0–1.1 網頁管理存在瀏覽器的權杖（`platform` 是 `web`）最多再用 30 天、不再延長（期間內開啟網頁管理會自動換成 Cookie） |
+
+1.2.0 從 1.1.x 升級時依序執行 1 → 2 → 3。
 
 ## 升級前備份
 
 | 實作 | 自動備份 | 建議 |
 | --- | --- | --- |
-| Docker／Node | 有：資料庫是舊版本時，啟動時先以 `VACUUM INTO` 複製一份 `fleetdispatch.sqlite.before-v2-<時間>.bak`（同一個資料夾） | 另外保留 volume 的快照 |
-| PHP＋SQLite | 有：遷移前以 `VACUUM INTO` 複製 `<資料庫檔>.before-v2-<時間>.bak`（同一個資料夾，已禁止從網站存取） | — |
+| Docker／Node | 有：資料庫是舊版本時，啟動時先以 `VACUUM INTO` 複製一份 `fleetdispatch.sqlite.before-v3-<時間>.bak`（同一個資料夾；檔名是升級後的版本） | 另外保留 volume 的快照 |
+| PHP＋SQLite | 有：遷移前以 `VACUUM INTO` 複製 `<資料庫檔>.before-v3-<時間>.bak`（同一個資料夾，已禁止從網站存取） | — |
 | PHP＋MySQL | 沒有（無法從 PHP 安全地備份整個資料庫） | **升級前**以 `mysqldump --single-transaction <資料庫> > backup.sql` 或主機商的備份功能備份 |
 | Cloudflare D1 | 沒有 | 部署前 `wrangler d1 export fleetdispatch --remote --output backup.sql`；D1 也有 Time Travel 可回到過去的時間點 |
 
 ## 遷移的細節
 
 - **Docker／Node、Cloudflare D1**（`core/src/db.ts` 的 `Repo.migrate`）：版本 1 → 2 的敘述（補 `revision` 欄位、建立新資料表、既有資料的版本設為 1、清除駕駛人的稽核摘要、更新版本）在同一個 batch（交易）中執行；欄位已存在時略過。
+  版本 2 → 3（補 `fd_devices` 的兩個欄位、縮短 1.1 網頁權杖的期限、更新版本）也是同一個 batch。
 - **PHP＋SQLite**（`php/src/Db.php`）：同上，整步在 `BEGIN IMMEDIATE` 的交易中。
 - **PHP＋MySQL**：MySQL 的 DDL 會自動提交，所以以 `GET_LOCK('fleetdispatch_migrate')` 避免兩個請求同時遷移，並逐項檢查（欄位是否已存在、`CREATE TABLE IF NOT EXISTS`），最後才更新版本；中途失敗時下一個請求會從未完成的項目繼續。
-- 資料表已經手動匯入（帳號沒有建表權限）：請先匯入新版的 `php/schema/mysql.sql` 中 1.2.0 的兩個資料表，並以 `ALTER TABLE fd_records ADD COLUMN revision BIGINT NOT NULL DEFAULT 0` 補欄位，主機會把版本更新為 2。
+- 資料表已經手動匯入（帳號沒有建表權限）：請先匯入新版的 `php/schema/mysql.sql` 中 1.2.0 的兩個資料表，並以
+  `ALTER TABLE fd_records ADD COLUMN revision BIGINT NOT NULL DEFAULT 0` 與
+  `ALTER TABLE fd_devices ADD COLUMN web_session VARCHAR(16) NULL, ADD COLUMN session_until BIGINT NULL` 補欄位，主機會把版本更新為 3。
+- 手動匯入、還沒有版本紀錄的資料表（主機第一次啟動前以 phpMyAdmin 匯入結構檔）：主機依實際的欄位與資料表判斷版本
+  （1.1 的結構檔視為 1、1.2.0 的結構檔視為 3），只補缺少的部分。
 
 ## 降版
 
 不支援。升級到 1.2.0 後若要回到 1.1.x，請還原升級前的備份（1.1.x 讀得到 1.2.0 的資料表，但不會更新 `revision`、不寫歷史；之後再升級時版本不會再遷移，`revision` 會與實際的修改次數不符）。
+不還原備份而直接換回 1.1.x 的程式時，1.2.0 的網頁登入（權杖只在 Cookie）在 1.1.x 不能使用，網頁管理要重新登入；App 不受影響。
+
+還原備份（任何版本）會讓備份之後解除配對的裝置、用掉的配對碼回到備份當時的狀態：還原後請在「裝置」檢查並解除不該存在的配對，刪除還沒使用的配對碼
+（[`security-review.md`](security-review.md) §3）。
 
 ## 測試
 
-- `conformance/migration-node.test.mjs`：以 1.1.0 的資料表建立 Docker／Node 版的資料庫，啟動目前版本：自動備份、資料不變、既有資料的版本是 1、駕駛人的稽核摘要被清除（其他摘要不變）、新的寫入留下歷史；再次啟動不重複遷移與備份。
+- `conformance/migration-node.test.mjs`：以 1.1.0 的資料表建立 Docker／Node 版的資料庫，啟動目前版本：自動備份、資料不變、既有資料的版本是 1、駕駛人的稽核摘要被清除（其他摘要不變）、
+  1.1 網頁權杖的期限縮短為 30 天（App 的不變）、新的寫入留下歷史；再次啟動不重複遷移與備份。
 - `conformance/migration-php.test.mjs`：PHP＋SQLite 版的相同測試（需要 `php` 與 `pdo_sqlite`）。
 - Cloudflare D1：以 `wrangler d1 execute --local` 建立 1.1.0 的資料表與資料，再以 `wrangler dev --local` 啟動確認（2026-11-06 手動驗證：版本 1 → 2、既有資料 `revision = 1`、歷史資料表已建立）。
 - MySQL：需要有 MySQL 的環境（CI）執行 `conformance/` 的測試。

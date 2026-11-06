@@ -53,6 +53,18 @@ export interface Session {
   role: Role;
   binding: DriverBinding | null;
   tokenExpiresAt: number;
+  /** 以 Cookie 登入的網頁管理（1.2.0）；App 與 1.1 的網頁權杖（Authorization 標頭）是 null。 */
+  web: WebSession | null;
+}
+
+/** 網頁管理的登入（docs/security-review.md §1）。 */
+export interface WebSession {
+  /** `session`：不記住這個瀏覽器；`remember`：記住。 */
+  kind: 'session' | 'remember';
+  /** 登入期限（不論是否使用，到期就要重新登入）。 */
+  until: number;
+  /** 非 GET 請求要放在 X-FleetDispatch-CSRF 標頭的值。 */
+  csrf: string;
 }
 
 /** App 的同步事件（區網同步相同的形狀）。 */

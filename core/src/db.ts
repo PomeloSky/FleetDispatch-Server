@@ -3,6 +3,7 @@
 
 import type { DriverBinding, Entity, Role, ScopeFields, StoredRecord, WriteSource } from './types.ts';
 import { ENTITIES } from './types.ts';
+import { LEGACY_WEB_TTL_MS } from './web-session.ts';
 
 export interface SqlStatement {
   sql: string;
@@ -17,8 +18,11 @@ export interface SqlDb {
   batch(statements: SqlStatement[]): Promise<{ changes: number }[]>;
 }
 
-/** 資料表版本：1（1.0–1.1）、2（1.2.0：每筆資料的 revision、修改前後歷史、已處理事件）。 */
-export const SCHEMA_VERSION = 2;
+/**
+ * 資料表版本：1（1.0–1.1）、2（1.2.0：每筆資料的 revision、修改前後歷史、已處理事件）、
+ * 3（1.2.0：網頁管理以 Cookie 登入的期限 fd_devices.web_session、session_until）。
+ */
+export const SCHEMA_VERSION = 3;
 
 /** 1.2.0 新增的資料表（新安裝與從版本 1 遷移共用；都可重複執行）。 */
 export const SCHEMA_V2_TABLES: string[] = [
@@ -52,7 +56,8 @@ export const SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS fd_devices (
     device_id TEXT PRIMARY KEY, name TEXT NOT NULL, platform TEXT NOT NULL DEFAULT '', role TEXT NOT NULL,
     driver_uuid TEXT, driver_name TEXT, token_hash TEXT, token_expires_at INTEGER,
-    paired_at INTEGER NOT NULL, last_seen_at INTEGER, revoked_at INTEGER, identity TEXT)`,
+    paired_at INTEGER NOT NULL, last_seen_at INTEGER, revoked_at INTEGER, identity TEXT,
+    web_session TEXT, session_until INTEGER)`,
   `CREATE UNIQUE INDEX IF NOT EXISTS fd_devices_token ON fd_devices (token_hash)`,
   `CREATE TABLE IF NOT EXISTS fd_pairing_codes (
     id TEXT PRIMARY KEY, code_hash TEXT NOT NULL UNIQUE, role TEXT NOT NULL, driver_uuid TEXT, driver_name TEXT,
@@ -90,6 +95,10 @@ export interface DeviceRow {
   last_seen_at: number | null;
   revoked_at: number | null;
   identity: string | null;
+  /** 網頁管理以 Cookie 登入（`session`、`remember`）；App 與 1.1 的網頁權杖是 NULL。 */
+  web_session: string | null;
+  /** 網頁登入的期限（毫秒）。 */
+  session_until: number | null;
 }
 
 export interface CodeRow {
@@ -303,7 +312,7 @@ export class Repo {
       // 多筆寫入的守衛旗標（writeAll）：同一個交易內設為 1、結束前改回 0
       { sql: `INSERT OR IGNORE INTO fd_meta (k, v) VALUES ('guard', '0')` },
     ]);
-    await this.migrate();
+    await this.migrate(now);
   }
 
   /** 目前資料庫的結構版本。 */
@@ -316,7 +325,7 @@ export class Repo {
    * 結構遷移（1.2.0 起）：依 fd_meta 的 schema 逐步升級。每一步都可以重複執行（中途失敗後重新啟動會再試），
    * 同一步的敘述在同一個交易內；完成後才更新版本。升級前請先備份（docs/migration.md）。
    */
-  async migrate(): Promise<{ from: number; to: number }> {
+  async migrate(now: number = Date.now()): Promise<{ from: number; to: number }> {
     const from = await this.schemaVersion();
     let v = from;
     if (v < 2) {
@@ -331,6 +340,20 @@ export class Repo {
       steps.push({ sql: `UPDATE fd_meta SET v = '2' WHERE k = 'schema'` });
       await this.db.batch(steps);
       v = 2;
+    }
+    if (v < 3) {
+      const columns = new Set((await this.db.all<{ name: string }>(`PRAGMA table_info(fd_devices)`)).map((c) => String(c.name)));
+      const steps: SqlStatement[] = [];
+      if (!columns.has('web_session')) steps.push({ sql: `ALTER TABLE fd_devices ADD COLUMN web_session TEXT` });
+      if (!columns.has('session_until')) steps.push({ sql: `ALTER TABLE fd_devices ADD COLUMN session_until INTEGER` });
+      // 1.0–1.1 的網頁管理把權杖存在瀏覽器：不再延長，最多再用 30 天（期間內開啟網頁管理會自動換成 Cookie）
+      steps.push({
+        sql: `UPDATE fd_devices SET token_expires_at = ? WHERE platform = 'web' AND web_session IS NULL AND revoked_at IS NULL AND token_expires_at > ?`,
+        params: [now + LEGACY_WEB_TTL_MS, now + LEGACY_WEB_TTL_MS],
+      });
+      steps.push({ sql: `UPDATE fd_meta SET v = '3' WHERE k = 'schema'` });
+      await this.db.batch(steps);
+      v = 3;
     }
     return { from, to: v };
   }
@@ -352,8 +375,12 @@ export class Repo {
 
   // ───────── 裝置 ─────────
 
-  async countActiveAdmins(): Promise<number> {
-    const row = await this.db.first<{ n: number }>(`SELECT COUNT(*) AS n FROM fd_devices WHERE role = 'admin' AND revoked_at IS NULL`);
+  /**
+   * 可以使用的管理員（沒有解除配對、權杖還沒過期）的數量。是 0 時設定碼有效：第一次設定，或所有管理員的登入都已失效
+   * （例如只用網頁管理、超過期限沒有使用）時可以用設定碼重新建立管理員（docs/security-review.md §2）。
+   */
+  async countActiveAdmins(now: number): Promise<number> {
+    const row = await this.db.first<{ n: number }>(`SELECT COUNT(*) AS n FROM fd_devices WHERE ${Repo.USABLE_ADMIN}`, [now]);
     return row ? Number(row.n) : 0;
   }
 
@@ -373,29 +400,46 @@ export class Repo {
     await this.db.run(`UPDATE fd_devices SET last_seen_at = ?, token_expires_at = ? WHERE device_id = ?`, [now, expiresAt, id]);
   }
 
-  /** 配對：先以條件式更新用掉配對碼（若有），再建立或覆寫裝置。每次配對都產生新的主機端身分（identity），
-   * 以同一個 deviceId 重新配對不會繼承之前建立的資料的擁有權。配對碼已被用掉時回傳 false、不建立裝置。 */
+  /**
+   * 配對：先以條件式更新用掉配對碼（若有），再建立或覆寫裝置。每次配對都產生新的主機端身分（identity），
+   * 以同一個 deviceId 重新配對不會繼承之前建立的資料的擁有權。配對碼已被用掉時回傳 false、不建立裝置。
+   * 以設定碼配對（codeHash 是 null）時，同一句 SQL 確認沒有可以使用的管理員：同時送出的兩個設定碼請求只有一個成功。
+   * `web`：網頁管理以 Cookie 登入（1.2.0）的種類與期限。
+   */
   async pairDevice(
-    device: { id: string; name: string; platform: string; role: Role; binding: DriverBinding | null; tokenHash: string; expiresAt: number },
+    device: {
+      id: string; name: string; platform: string; role: Role; binding: DriverBinding | null; tokenHash: string; expiresAt: number;
+      web?: { kind: string; until: number } | null;
+    },
     now: number,
     codeHash: string | null,
   ): Promise<boolean> {
-    const upsert: SqlStatement = {
-      sql: `INSERT INTO fd_devices (device_id, name, platform, role, driver_uuid, driver_name, token_hash, token_expires_at, paired_at, last_seen_at, revoked_at, identity)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
-            ON CONFLICT (device_id) DO UPDATE SET name = excluded.name, platform = excluded.platform, role = excluded.role,
+    const values = [
+      device.id, device.name, device.platform, device.role, device.binding?.driverUuid ?? null, device.binding?.driverName ?? null,
+      device.tokenHash, device.expiresAt, now, now, crypto.randomUUID().toUpperCase(), device.web?.kind ?? null, device.web?.until ?? null,
+    ];
+    const columns = `(device_id, name, platform, role, driver_uuid, driver_name, token_hash, token_expires_at, paired_at, last_seen_at, revoked_at, identity,
+              web_session, session_until)`;
+    const conflict = `ON CONFLICT (device_id) DO UPDATE SET name = excluded.name, platform = excluded.platform, role = excluded.role,
               driver_uuid = excluded.driver_uuid, driver_name = excluded.driver_name, token_hash = excluded.token_hash,
               token_expires_at = excluded.token_expires_at, paired_at = excluded.paired_at, last_seen_at = excluded.last_seen_at, revoked_at = NULL,
-              identity = excluded.identity`,
-      params: [
-        device.id, device.name, device.platform, device.role, device.binding?.driverUuid ?? null, device.binding?.driverName ?? null,
-        device.tokenHash, device.expiresAt, now, now, crypto.randomUUID().toUpperCase(),
-      ],
-    };
+              identity = excluded.identity, web_session = excluded.web_session, session_until = excluded.session_until`;
     if (codeHash === null) {
-      await this.db.batch([upsert]);
-      return true;
+      const r = await this.db.run(
+        `INSERT INTO fd_devices ${columns}
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?
+            WHERE NOT EXISTS (SELECT 1 FROM fd_devices WHERE ${Repo.USABLE_ADMIN})
+            ${conflict}`,
+        [...values, now],
+      );
+      return r.changes > 0;
     }
+    const upsert: SqlStatement = {
+      sql: `INSERT INTO fd_devices ${columns}
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+            ${conflict}`,
+      params: values,
+    };
     const consumed = await this.db.run(
       `UPDATE fd_pairing_codes SET used_at = ?, used_by = ? WHERE code_hash = ? AND used_at IS NULL AND expires_at > ?`,
       [now, device.id, codeHash, now],
@@ -405,24 +449,41 @@ export class Repo {
     return true;
   }
 
-  /** 其他仍有效的管理員（不含 [id]）存在。寫在同一句 SQL 的條件中，兩位管理員同時互相降級或解除配對時不會一個都不剩。 */
-  private static readonly OTHER_ADMIN = `(SELECT COUNT(*) FROM fd_devices WHERE role = 'admin' AND revoked_at IS NULL AND device_id != ?) > 0`;
+  /** 可以使用的管理員（參數：現在的時間）。 */
+  private static readonly USABLE_ADMIN = `role = 'admin' AND revoked_at IS NULL AND token_hash IS NOT NULL AND token_expires_at > ?`;
+  /**
+   * 其他可以使用的管理員（不含 [id]）存在（參數：現在的時間、id）。寫在同一句 SQL 的條件中，
+   * 兩位管理員同時互相降級或解除配對時不會一個都不剩。
+   */
+  private static readonly OTHER_ADMIN = `(SELECT COUNT(*) FROM fd_devices WHERE ${Repo.USABLE_ADMIN} AND device_id != ?) > 0`;
 
-  /** 解除配對；最後一位管理員不解除（回傳 false）。 */
+  /** 解除配對；沒有其他可以使用的管理員時不解除管理員（回傳 false）。 */
   async revokeDevice(id: string, now: number): Promise<boolean> {
     const r = await this.db.run(
       `UPDATE fd_devices SET revoked_at = ?, token_hash = NULL WHERE device_id = ? AND revoked_at IS NULL AND (role != 'admin' OR ${Repo.OTHER_ADMIN})`,
-      [now, id, id],
+      [now, id, now, id],
     );
     return r.changes > 0;
   }
 
-  /** 改角色或綁定；把最後一位管理員改成非管理員時不寫入（回傳 false）。 */
-  async updateDevice(id: string, role: Role, binding: DriverBinding | null): Promise<boolean> {
+  /** 改角色或綁定；把管理員改成非管理員、而沒有其他可以使用的管理員時不寫入（回傳 false）。 */
+  async updateDevice(id: string, role: Role, binding: DriverBinding | null, now: number): Promise<boolean> {
     const r = await this.db.run(
       `UPDATE fd_devices SET role = ?, driver_uuid = ?, driver_name = ? WHERE device_id = ?
          AND (? = 'admin' OR role != 'admin' OR revoked_at IS NOT NULL OR ${Repo.OTHER_ADMIN})`,
-      [role, binding?.driverUuid ?? null, binding?.driverName ?? null, id, role, id],
+      [role, binding?.driverUuid ?? null, binding?.driverName ?? null, id, role, now, id],
+    );
+    return r.changes > 0;
+  }
+
+  /**
+   * 1.1 的網頁權杖換成 Cookie 登入（POST /web/upgrade）：以舊權杖為條件換新權杖與期限，同時送出的兩個請求只有一個成功。
+   */
+  async upgradeWebSession(id: string, oldHash: string, s: { tokenHash: string; kind: string; until: number; expiresAt: number }, now: number): Promise<boolean> {
+    const r = await this.db.run(
+      `UPDATE fd_devices SET token_hash = ?, token_expires_at = ?, web_session = ?, session_until = ?, last_seen_at = ?
+         WHERE device_id = ? AND token_hash = ? AND revoked_at IS NULL AND web_session IS NULL AND token_expires_at > ?`,
+      [s.tokenHash, s.expiresAt, s.kind, s.until, now, id, oldHash, now],
     );
     return r.changes > 0;
   }

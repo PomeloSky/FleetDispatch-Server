@@ -27,6 +27,8 @@ jobs:
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:8080/api/v1/info > /dev/null && break; sleep 1; done
       - name: 相容性測試
         run: FD_BASE=http://127.0.0.1:8080 FD_SETUP_TOKEN=ci-setup-token-0123456789 FD_ADMIN_PATH=/console-ci node --test conformance/api.test.mjs conformance/web.test.mjs
+      - name: 資料表遷移、網頁登入的期限與管理員的恢復（暫存資料庫）
+        run: FD_LOCAL_VARIANTS=node node --test conformance/migration-node.test.mjs conformance/web-session-local.test.mjs
       - if: failure()
         run: cat "$RUNNER_TEMP/server.log"
 
@@ -78,6 +80,8 @@ jobs:
           php -S 127.0.0.1:8081 "$RUNNER_TEMP/php-app/public/index.php" > "$RUNNER_TEMP/php-install.log" 2>&1 &
           for i in $(seq 1 30); do curl -s -o /dev/null http://127.0.0.1:8081/ && break; sleep 1; done
           FD_BASE=http://127.0.0.1:8081 FD_APP_DIR="$RUNNER_TEMP/php-app" FD_INSTALL_DB=sqlite node --test conformance/php-install.test.mjs
+      - name: 資料表遷移、網頁登入的期限與管理員的恢復（暫存資料庫）
+        run: FD_LOCAL_VARIANTS=php node --test conformance/migration-php.test.mjs conformance/web-session-local.test.mjs
       - if: failure()
         run: cat "$RUNNER_TEMP/php.log" "$RUNNER_TEMP/php-install.log" || true
 

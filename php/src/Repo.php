@@ -11,7 +11,9 @@ namespace FleetDispatch;
 final class Repo
 {
     private const RECORD_COLUMNS = 'entity, id, seq, modified_at, deleted, payload, driver_uuid, driver_name, requester_device, vehicle_plate, created_by, revision';
-    private const DEVICE_COLUMNS = 'device_id, name, platform, role, driver_uuid, driver_name, token_hash, token_expires_at, paired_at, last_seen_at, revoked_at, identity';
+    private const DEVICE_COLUMNS = 'device_id, name, platform, role, driver_uuid, driver_name, token_hash, token_expires_at, paired_at, last_seen_at, revoked_at, identity, web_session, session_until';
+    /** 可以使用的管理員（參數：現在的時間）。 */
+    private const USABLE_ADMIN = "role = 'admin' AND revoked_at IS NULL AND token_hash IS NOT NULL AND token_expires_at > ?";
     private const CODE_COLUMNS = 'id, code_hash, role, driver_uuid, driver_name, label, created_by, created_at, expires_at, used_at';
 
     public function __construct(private readonly Db $db)
@@ -71,12 +73,24 @@ final class Repo
             'last_seen_at' => self::nint($r['last_seen_at']),
             'revoked_at' => self::nint($r['revoked_at']),
             'identity' => self::nstr($r['identity']),
+            'web_session' => self::nstr($r['web_session']),
+            'session_until' => self::nint($r['session_until']),
         ];
     }
 
-    public function countActiveAdmins(): int
+    /**
+     * 可以使用的管理員（沒有解除配對、權杖還沒過期）的數量。是 0 時設定碼有效：第一次設定，或所有管理員的登入都已失效時
+     * 可以用設定碼重新建立管理員（docs/security-review.md §2）。
+     */
+    public function countActiveAdmins(int $now): int
     {
-        return (int) $this->db->value("SELECT COUNT(*) AS n FROM fd_devices WHERE role = 'admin' AND revoked_at IS NULL");
+        return (int) $this->db->value('SELECT COUNT(*) AS n FROM fd_devices WHERE ' . self::USABLE_ADMIN, [$now]);
+    }
+
+    /** 不含 $id 的其他可以使用的管理員數量（解除配對、降級前檢查；在寫入交易中呼叫）。 */
+    public function countOtherAdmins(string $id, int $now): int
+    {
+        return (int) $this->db->value('SELECT COUNT(*) AS n FROM fd_devices WHERE ' . self::USABLE_ADMIN . ' AND device_id != ?', [$now, $id]);
     }
 
     /** @return array<string, mixed>|null */
@@ -108,26 +122,45 @@ final class Repo
      * 配對成功：建立裝置，或覆寫同一個 ID 的舊裝置（解除配對或權杖過期的）。在寫入交易中呼叫。
      * 每次配對都產生新的主機端身分（identity）：以同一個 deviceId 重新配對不會繼承之前建立的資料的擁有權。
      *
-     * @param array{id: string, name: string, platform: string, role: string, binding: array{driverUuid: string, driverName: string}|null, tokenHash: string, expiresAt: int} $d
+     * `web`：網頁管理以 Cookie 登入（1.2.0）的種類與期限；App 是 null。
+     *
+     * @param array{id: string, name: string, platform: string, role: string, binding: array{driverUuid: string, driverName: string}|null, tokenHash: string, expiresAt: int, web?: array{kind: string, until: int}|null} $d
      */
     public function saveDevice(bool $exists, array $d, int $now): void
     {
         $uuid = $d['binding']['driverUuid'] ?? null;
         $name = $d['binding']['driverName'] ?? null;
         $identity = Crypto::uuid4();
+        $webKind = $d['web']['kind'] ?? null;
+        $webUntil = $d['web']['until'] ?? null;
         if ($exists) {
             $this->db->run(
                 'UPDATE fd_devices SET name = ?, platform = ?, role = ?, driver_uuid = ?, driver_name = ?, token_hash = ?, token_expires_at = ?,
-                   paired_at = ?, last_seen_at = ?, revoked_at = NULL, identity = ? WHERE device_id = ?',
-                [$d['name'], $d['platform'], $d['role'], $uuid, $name, $d['tokenHash'], $d['expiresAt'], $now, $now, $identity, $d['id']],
+                   paired_at = ?, last_seen_at = ?, revoked_at = NULL, identity = ?, web_session = ?, session_until = ? WHERE device_id = ?',
+                [$d['name'], $d['platform'], $d['role'], $uuid, $name, $d['tokenHash'], $d['expiresAt'], $now, $now, $identity, $webKind, $webUntil, $d['id']],
             );
             return;
         }
         $this->db->run(
-            'INSERT INTO fd_devices (device_id, name, platform, role, driver_uuid, driver_name, token_hash, token_expires_at, paired_at, last_seen_at, revoked_at, identity)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)',
-            [$d['id'], $d['name'], $d['platform'], $d['role'], $uuid, $name, $d['tokenHash'], $d['expiresAt'], $now, $now, $identity],
+            'INSERT INTO fd_devices (device_id, name, platform, role, driver_uuid, driver_name, token_hash, token_expires_at, paired_at, last_seen_at, revoked_at, identity,
+                web_session, session_until)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)',
+            [$d['id'], $d['name'], $d['platform'], $d['role'], $uuid, $name, $d['tokenHash'], $d['expiresAt'], $now, $now, $identity, $webKind, $webUntil],
         );
+    }
+
+    /**
+     * 1.1 的網頁權杖換成 Cookie 登入（POST /web/upgrade）：以舊權杖為條件換新權杖與期限，同時送出的兩個請求只有一個成功。
+     *
+     * @param array{tokenHash: string, kind: string, until: int, expiresAt: int} $s
+     */
+    public function upgradeWebSession(string $id, string $oldHash, array $s, int $now): bool
+    {
+        return $this->db->run(
+            'UPDATE fd_devices SET token_hash = ?, token_expires_at = ?, web_session = ?, session_until = ?, last_seen_at = ?
+               WHERE device_id = ? AND token_hash = ? AND revoked_at IS NULL AND web_session IS NULL AND token_expires_at > ?',
+            [$s['tokenHash'], $s['expiresAt'], $s['kind'], $s['until'], $now, $id, $oldHash, $now],
+        ) > 0;
     }
 
     public function revokeDevice(string $id, int $now): void

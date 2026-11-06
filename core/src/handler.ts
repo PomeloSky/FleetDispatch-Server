@@ -12,6 +12,11 @@ import { ApiError, ENTITIES, ROLES, SNAPSHOT_KEYS, VEHICLE_CHILDREN } from './ty
 import { badRequest, cleanName, intParam, isObject, msToApple, normalizeUuid, nowMs, num, str } from './util.ts';
 import { SERVER_VERSION } from './version.ts';
 import { acceptsHtml, adminResponse, homeResponse, isHome, matchAdmin } from './web.ts';
+import {
+  CSRF_HEADER, WEB_SESSION_LIFETIME, WEB_TOUCH_INTERVAL_MS, clearSessionCookie, crossSite, csrfToken, isJsonContent,
+  readSessionCookie, sessionCookie, webExpiry, webSessionKind,
+} from './web-session.ts';
+import type { WebSessionKind } from './web-session.ts';
 
 export const LIMITS = { maxEventsPerRequest: 500, maxBodyBytes: 5 * 1024 * 1024, maxPayloadBytes: 1024 * 1024 };
 const TOKEN_TTL_MS = 90 * 24 * 3600 * 1000;
@@ -57,6 +62,9 @@ function ensureInit(repo: Repo, config: ServerConfig): Promise<void> {
 const ROUTES: [string, string[]][] = [
   ['info', ['GET']],
   ['pair', ['POST']],
+  // 1.2.0：網頁管理以 HttpOnly Cookie 登入（docs/protocol.md §13.1）
+  ['web/login', ['POST']],
+  ['web/upgrade', ['POST']],
   ['session', ['GET']],
   ['unpair', ['POST']],
   ['snapshot', ['GET']],
@@ -118,8 +126,8 @@ function csvResponse(r: { filename: string; body: string }): Response {
   });
 }
 
-const noContent = (): Response =>
-  new Response(null, { status: 204, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
+const noContent = (extra: Record<string, string> = {}): Response =>
+  new Response(null, { status: 204, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', ...extra } });
 
 function errorResponse(e: ApiError): Response {
   const extra: Record<string, string> = {};
@@ -165,7 +173,18 @@ function deviceJson(d: DeviceRow) {
     lastSeenAt: d.last_seen_at === null ? null : Number(d.last_seen_at),
     tokenExpiresAt: d.token_expires_at === null || d.revoked_at !== null ? null : Number(d.token_expires_at),
     revokedAt: d.revoked_at === null ? null : Number(d.revoked_at),
+    // 1.2.0：網頁管理的登入（`session` 不記住、`remember` 記住；App 與 1.1 的網頁權杖是 null）與登入期限
+    webSession: webSessionKind(d.web_session),
+    sessionUntil: webSessionKind(d.web_session) === null || d.session_until === null ? null : Number(d.session_until),
   };
+}
+
+/** 網頁登入與轉換（沒有登入 Cookie 的請求）：自訂標頭、同一個來源、JSON 本體。 */
+function requireWebRequest(request: Request): void {
+  if ((request.headers.get(CSRF_HEADER) ?? '').trim() === '' || crossSite(request)) {
+    throw new ApiError(403, 'csrf_failed', '請求來源驗證失敗，請重新整理網頁後再試');
+  }
+  if (!isJsonContent(request)) throw new ApiError(415, 'unsupported_media_type', '請求本體必須是 JSON（Content-Type: application/json）');
 }
 
 export class Api {
@@ -214,12 +233,20 @@ export class Api {
 
     if (is('GET', 'info')) return json(await this.info());
     if (is('POST', 'pair')) return json(await this.pair(await readJson(request)));
+    if (is('POST', 'web/login')) {
+      requireWebRequest(request);
+      return this.webLogin(request, await readJson(request));
+    }
+    if (is('POST', 'web/upgrade')) {
+      requireWebRequest(request);
+      return this.webUpgrade(request, await readJson(request));
+    }
 
-    // 以下需要權杖。
+    // 以下需要權杖（App：Authorization 標頭；網頁管理：登入 Cookie）。
     const session = await this.authenticate(request);
 
     if (is('GET', 'session')) return json(await this.sessionJson(session));
-    if (is('POST', 'unpair')) return this.unpairSelf(session);
+    if (is('POST', 'unpair')) return this.unpairSelf(request, session);
     if (is('GET', 'snapshot')) return json(await this.snapshot(session));
     if (is('GET', 'changes')) return json(await this.changes(session, url));
     if (is('POST', 'events')) return json(await this.events(session, await readJson(request)));
@@ -264,11 +291,11 @@ export class Api {
       serverId: meta.serverId,
       name: meta.name,
       time: nowMs(),
-      setupRequired: (await this.repo.countActiveAdmins()) === 0,
+      setupRequired: (await this.repo.countActiveAdmins(nowMs())) === 0,
       setupConfigured: this.config.setupToken !== null,
       // 1.2.0：idempotency（重送同一個事件回傳第一次的結果）、revision（每筆資料的版本、expectedRevision 與 conflict）、
-      // history（修改前後歷史）。舊版 App 不使用這些能力，照舊運作。
-      features: ['liveLocations', 'audit', 'idempotency', 'revision', 'history'],
+      // history（修改前後歷史）、webSession（網頁管理以 Cookie 登入）。舊版 App 不使用這些能力，照舊運作。
+      features: ['liveLocations', 'audit', 'idempotency', 'revision', 'history', 'webSession'],
       schemaVersion: await this.repo.schemaVersion(),
       limits: { maxEventsPerRequest: LIMITS.maxEventsPerRequest, maxBodyBytes: LIMITS.maxBodyBytes },
     };
@@ -287,31 +314,7 @@ export class Api {
     if (!code || !deviceId || !deviceName) throw badRequest('需要 code、deviceId（UUID）與 deviceName');
 
     const now = nowMs();
-    const f = await this.repo.failures(this.ip, now - ATTEMPT_WINDOW_MS);
-    if (f.count >= MAX_FAILURES) {
-      const retry = Math.max(1, Math.ceil(((f.oldest ?? now) + ATTEMPT_WINDOW_MS - now) / 1000));
-      throw new ApiError(429, 'rate_limited', '嘗試太多次，請稍後再試', retry);
-    }
-    const fail = async (): Promise<never> => {
-      await this.repo.recordFailure(this.ip, now);
-      throw new ApiError(401, 'invalid_code', '配對碼錯誤、已使用或已過期');
-    };
-
-    let role: Role;
-    let binding: DriverBinding | null = null;
-    let codeHash: string | null = null;
-    if ((await this.repo.countActiveAdmins()) === 0) {
-      if (this.config.setupToken === null) throw new ApiError(409, 'setup_not_configured', '主機尚未設定設定碼（請依部署文件設定 FD_SETUP_TOKEN）');
-      if (!constantTimeEqual(code.trim(), this.config.setupToken)) return fail();
-      role = 'admin';
-    } else {
-      codeHash = await sha256Hex(normalizePairingCode(code));
-      const row = await this.repo.findUsableCode(codeHash, now);
-      if (!row) return fail();
-      role = row.role;
-      binding = role === 'driver' ? bindingOf(row) : null;
-    }
-
+    const grant = await this.checkCode(code, now);
     const existing = await this.repo.deviceById(deviceId);
     if (existing && existing.revoked_at === null && existing.token_hash !== null && Number(existing.token_expires_at ?? 0) > now) {
       throw new ApiError(409, 'device_conflict', '這台裝置已經配對；請由管理員先解除配對');
@@ -320,28 +323,132 @@ export class Api {
     const token = newToken();
     const expiresAt = now + TOKEN_TTL_MS;
     const ok = await this.repo.pairDevice(
-      { id: deviceId, name: deviceName, platform, role, binding, tokenHash: await sha256Hex(token), expiresAt },
+      { id: deviceId, name: deviceName, platform, role: grant.role, binding: grant.binding, tokenHash: await sha256Hex(token), expiresAt },
       now,
-      codeHash,
+      grant.codeHash,
     );
-    if (!ok) return fail();
-    return { token, deviceId, role, driverBinding: binding, server: await this.serverJson(), tokenExpiresAt: expiresAt };
+    if (!ok) return this.failCode(now);
+    return { token, deviceId, role: grant.role, driverBinding: grant.binding, server: await this.serverJson(), tokenExpiresAt: expiresAt };
+  }
+
+  /**
+   * 檢查配對碼或設定碼（配對與網頁登入共用）：嘗試次數限制、沒有可以使用的管理員時比對設定碼、否則找可以使用的配對碼。
+   * 錯誤時記一次失敗並回 401（還沒有用掉配對碼）。
+   */
+  private async checkCode(code: string, now: number): Promise<{ role: Role; binding: DriverBinding | null; codeHash: string | null }> {
+    const f = await this.repo.failures(this.ip, now - ATTEMPT_WINDOW_MS);
+    if (f.count >= MAX_FAILURES) {
+      const retry = Math.max(1, Math.ceil(((f.oldest ?? now) + ATTEMPT_WINDOW_MS - now) / 1000));
+      throw new ApiError(429, 'rate_limited', '嘗試太多次，請稍後再試', retry);
+    }
+    if ((await this.repo.countActiveAdmins(now)) === 0) {
+      if (this.config.setupToken === null) throw new ApiError(409, 'setup_not_configured', '主機尚未設定設定碼（請依部署文件設定 FD_SETUP_TOKEN）');
+      if (!constantTimeEqual(code.trim(), this.config.setupToken)) return this.failCode(now);
+      return { role: 'admin', binding: null, codeHash: null };
+    }
+    const codeHash = await sha256Hex(normalizePairingCode(code));
+    const row = await this.repo.findUsableCode(codeHash, now);
+    if (!row) return this.failCode(now);
+    return { role: row.role, binding: row.role === 'driver' ? bindingOf(row) : null, codeHash };
+  }
+
+  private async failCode(now: number): Promise<never> {
+    await this.repo.recordFailure(this.ip, now);
+    throw new ApiError(401, 'invalid_code', '配對碼錯誤、已使用或已過期');
+  }
+
+  // ───────── 網頁管理的登入（1.2.0） ─────────
+
+  /**
+   * 網頁管理登入：以管理員的配對碼（或沒有可以使用的管理員時的設定碼）建立一個網頁裝置，權杖只放在 HttpOnly Cookie。
+   * 不是管理員的配對碼回 403 admin_only，配對碼不會被用掉。
+   */
+  private async webLogin(request: Request, body: Record<string, unknown>): Promise<Response> {
+    const code = str(body.code);
+    const deviceName = cleanName(body.deviceName, 100);
+    if (!code || !deviceName) throw badRequest('需要 code 與 deviceName');
+    if (body.remember !== undefined && typeof body.remember !== 'boolean') throw badRequest('remember 必須是 true 或 false');
+    const kind: WebSessionKind = body.remember === true ? 'remember' : 'session';
+
+    const now = nowMs();
+    const grant = await this.checkCode(code, now);
+    if (grant.role !== 'admin') throw new ApiError(403, 'admin_only', '網頁管理只能用「管理員」的配對碼登入');
+    const deviceId = crypto.randomUUID().toUpperCase();
+    const token = newToken();
+    const until = now + WEB_SESSION_LIFETIME[kind].maxMs;
+    const expiresAt = webExpiry(kind, now, until);
+    const ok = await this.repo.pairDevice(
+      { id: deviceId, name: deviceName, platform: 'web', role: 'admin', binding: null, tokenHash: await sha256Hex(token), expiresAt, web: { kind, until } },
+      now,
+      grant.codeHash,
+    );
+    if (!ok) return this.failCode(now);
+    return this.webSessionResponse(request, token, deviceId, kind, until, now);
+  }
+
+  /**
+   * 1.1 的網頁登入（瀏覽器保存的權杖，以 Authorization 標頭送來）換成 Cookie：同一台網頁裝置換新權杖，舊權杖立即失效。
+   * 只接受網頁（platform 是 web）且還沒有轉換的權杖；App 的權杖回 403 not_web_session。
+   */
+  private async webUpgrade(request: Request, body: Record<string, unknown>): Promise<Response> {
+    if (body.remember !== undefined && typeof body.remember !== 'boolean') throw badRequest('remember 必須是 true 或 false');
+    const kind: WebSessionKind = body.remember === true ? 'remember' : 'session';
+    const match = /^Bearer\s+([A-Za-z0-9_-]{20,200})$/.exec((request.headers.get('Authorization') ?? '').trim());
+    if (!match) throw new ApiError(401, 'unauthorized', '需要權杖');
+    const oldHash = await sha256Hex(match[1]);
+    const device = await this.repo.deviceByTokenHash(oldHash);
+    const now = nowMs();
+    if (!device || device.token_expires_at === null || Number(device.token_expires_at) <= now || !device.identity
+      || webSessionKind(device.web_session) !== null) {
+      throw new ApiError(401, 'unauthorized', '權杖無效或已過期，請重新登入');
+    }
+    if (device.platform !== 'web') throw new ApiError(403, 'not_web_session', '只有網頁管理的登入可以轉換');
+    const token = newToken();
+    const until = now + WEB_SESSION_LIFETIME[kind].maxMs;
+    const expiresAt = webExpiry(kind, now, until);
+    if (!(await this.repo.upgradeWebSession(device.device_id, oldHash, { tokenHash: await sha256Hex(token), kind, until, expiresAt }, now))) {
+      throw new ApiError(401, 'unauthorized', '權杖無效或已過期，請重新登入');
+    }
+    return this.webSessionResponse(request, token, device.device_id, kind, until, now);
+  }
+
+  /** 網頁登入成功：回應不含權杖（只在 Set-Cookie），附上這次登入的資訊與 CSRF 權杖。 */
+  private async webSessionResponse(request: Request, token: string, deviceId: string, kind: WebSessionKind, until: number, now: number) {
+    const device = (await this.repo.deviceById(deviceId))!;
+    const role = (ROLES as readonly string[]).includes(device.role) ? device.role : 'viewer';
+    const session: Session = {
+      deviceId,
+      identity: device.identity ?? '',
+      deviceName: device.name,
+      role,
+      binding: role === 'driver' ? bindingOf(device) : null,
+      tokenExpiresAt: Number(device.token_expires_at),
+      web: { kind, until, csrf: await csrfToken(token) },
+    };
+    return json(await this.sessionJson(session), 200, { 'Set-Cookie': sessionCookie(request, token, kind, until, now) });
   }
 
   // ───────── 驗證 ─────────
 
+  /** 有 Authorization 標頭時以權杖驗證（App）；否則以網頁管理的登入 Cookie 驗證。 */
   private async authenticate(request: Request): Promise<Session> {
-    const header = request.headers.get('Authorization') ?? '';
-    const match = /^Bearer\s+([A-Za-z0-9_-]{20,200})$/.exec(header.trim());
+    const header = (request.headers.get('Authorization') ?? '').trim();
+    if (header === '') {
+      const cookie = readSessionCookie(request);
+      if (cookie !== null) return this.cookieSession(request, cookie);
+    }
+    const match = /^Bearer\s+([A-Za-z0-9_-]{20,200})$/.exec(header);
     if (!match) throw new ApiError(401, 'unauthorized', '需要權杖');
     const device = await this.repo.deviceByTokenHash(await sha256Hex(match[1]));
     const now = nowMs();
-    if (!device || device.token_expires_at === null || Number(device.token_expires_at) <= now) {
+    // 網頁管理的 Cookie 權杖不能放在 Authorization 標頭使用（期限與 CSRF 檢查只在 Cookie 的路徑）
+    if (!device || device.token_expires_at === null || Number(device.token_expires_at) <= now || webSessionKind(device.web_session) !== null) {
       throw new ApiError(401, 'unauthorized', '權杖無效或已過期，請重新配對');
     }
     let expiresAt = Number(device.token_expires_at);
     if (device.last_seen_at === null || now - Number(device.last_seen_at) >= TOUCH_INTERVAL_MS) {
-      expiresAt = now + TOKEN_TTL_MS;
+      // 1.1 的網頁權杖（存在瀏覽器）只更新最後使用時間、不再延長（docs/security-review.md §1）
+      if (device.platform !== 'web') expiresAt = now + TOKEN_TTL_MS;
       await this.repo.touchDevice(device.device_id, now, expiresAt);
     }
     const role = (ROLES as readonly string[]).includes(device.role) ? device.role : 'viewer';
@@ -353,6 +460,47 @@ export class Api {
       role,
       binding: role === 'driver' ? bindingOf(device) : null,
       tokenExpiresAt: expiresAt,
+      web: null,
+    };
+  }
+
+  /**
+   * 網頁管理的登入 Cookie：閒置期限與登入期限；非 GET 的請求檢查 CSRF 權杖、Sec-Fetch-Site 與 JSON 本體
+   * （檢查不通過時不延長期限）。
+   */
+  private async cookieSession(request: Request, token: string): Promise<Session> {
+    const device = await this.repo.deviceByTokenHash(await sha256Hex(token));
+    const now = nowMs();
+    const kind = device ? webSessionKind(device.web_session) : null;
+    if (!device || kind === null || device.token_expires_at === null || Number(device.token_expires_at) <= now || !device.identity) {
+      throw new ApiError(401, 'unauthorized', '登入已失效，請重新登入');
+    }
+    const csrf = await csrfToken(token);
+    const method = request.method.toUpperCase();
+    if (method !== 'GET' && method !== 'HEAD') {
+      if (!constantTimeEqual((request.headers.get(CSRF_HEADER) ?? '').trim(), csrf) || crossSite(request)) {
+        throw new ApiError(403, 'csrf_failed', '請求來源驗證失敗，請重新整理網頁後再試');
+      }
+      const length = Number(request.headers.get('Content-Length') ?? '0');
+      if (((request.headers.get('Content-Type') ?? '') !== '' || length > 0) && !isJsonContent(request)) {
+        throw new ApiError(415, 'unsupported_media_type', '請求本體必須是 JSON（Content-Type: application/json）');
+      }
+    }
+    const until = Number(device.session_until ?? 0);
+    let expiresAt = Number(device.token_expires_at);
+    if (device.last_seen_at === null || now - Number(device.last_seen_at) >= WEB_TOUCH_INTERVAL_MS) {
+      expiresAt = webExpiry(kind, now, until);
+      await this.repo.touchDevice(device.device_id, now, expiresAt);
+    }
+    const role = (ROLES as readonly string[]).includes(device.role) ? device.role : 'viewer';
+    return {
+      deviceId: device.device_id,
+      identity: device.identity,
+      deviceName: device.name,
+      role,
+      binding: role === 'driver' ? bindingOf(device) : null,
+      tokenExpiresAt: expiresAt,
+      web: { kind, until, csrf },
     };
   }
 
@@ -364,14 +512,17 @@ export class Api {
       driverBinding: s.binding,
       server: await this.serverJson(),
       tokenExpiresAt: s.tokenExpiresAt,
+      // 網頁管理的登入（1.2.0）：種類、登入期限與 CSRF 權杖；App 的回應沒有這個欄位
+      ...(s.web ? { web: { remember: s.web.kind === 'remember', sessionUntil: s.web.until, csrfToken: s.web.csrf } } : {}),
     };
   }
 
-  private async unpairSelf(s: Session): Promise<Response> {
+  private async unpairSelf(request: Request, s: Session): Promise<Response> {
     if (!(await this.repo.revokeDevice(s.deviceId, nowMs()))) {
-      throw new ApiError(409, 'last_admin', '最後一位管理員不能解除配對');
+      throw new ApiError(409, 'last_admin', '最後一位可以使用的管理員不能解除配對');
     }
-    return noContent();
+    // 網頁管理登出：同時刪除登入 Cookie
+    return noContent(s.web ? { 'Set-Cookie': clearSessionCookie(request) } : {});
   }
 
   // ───────── 讀取 ─────────
@@ -655,8 +806,8 @@ export class Api {
     }
     if (role !== 'driver') binding = null;
     // 最後一位管理員的檢查在同一句 SQL（兩位管理員同時互相降級時不會一個都不剩）
-    if (!(await this.repo.updateDevice(id, role, binding))) {
-      throw new ApiError(409, 'last_admin', '最後一位管理員不能降級');
+    if (!(await this.repo.updateDevice(id, role, binding, nowMs()))) {
+      throw new ApiError(409, 'last_admin', '最後一位可以使用的管理員不能降級');
     }
     return deviceJson((await this.repo.deviceById(id))!);
   }
@@ -667,7 +818,7 @@ export class Api {
     const d = await this.repo.deviceById(id);
     if (!d) throw new ApiError(404, 'not_found', '找不到這台裝置');
     if (d.revoked_at === null && !(await this.repo.revokeDevice(id, nowMs()))) {
-      throw new ApiError(409, 'last_admin', '最後一位管理員不能解除配對');
+      throw new ApiError(409, 'last_admin', '最後一位可以使用的管理員不能解除配對');
     }
     return noContent();
   }

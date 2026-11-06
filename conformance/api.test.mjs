@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { adminSuite, reportSuite } from './admin-suite.mjs';
+import { webSessionSuite } from './web-session-suite.mjs';
 
 const BASE = (process.env.FD_BASE ?? 'http://127.0.0.1:8080').replace(/\/+$/, '');
 const SETUP = process.env.FD_SETUP_TOKEN ?? '';
@@ -558,10 +559,10 @@ test('FleetDispatch Server API v1', async (t) => {
 
   // ───────── 1.2.0：冪等、revision 與衝突、修改前後歷史、並行一致性 ─────────
 
-  await t.test('1.2.0 /info：宣告冪等、revision、歷史能力與資料表版本', async () => {
+  await t.test('1.2.0 /info：宣告冪等、revision、歷史、網頁登入能力與資料表版本', async () => {
     const info = (await api('GET', 'info')).json;
-    for (const f of ['idempotency', 'revision', 'history']) assert.ok(info.features.includes(f), f);
-    assert.equal(info.schemaVersion, 2);
+    for (const f of ['idempotency', 'revision', 'history', 'webSession']) assert.ok(info.features.includes(f), f);
+    assert.equal(info.schemaVersion, 3);
   });
 
   await t.test('1.2.0 冪等：同一個事件重送回傳第一次的結果，不重複寫入、不重複稽核與歷史', async () => {
@@ -683,6 +684,8 @@ test('FleetDispatch Server API v1', async (t) => {
   // 網頁管理的資料 API（1.2.0）：在解除配對與嘗試次數限制之前（需要管理員與駕駛的權杖）
   await adminSuite(t, { api, expectError, ev, send, uuid, nowApple, tokens, ids, allChanges });
   await reportSuite(t, { api, expectError, ev, send, uuid, tokens, base: BASE });
+  // 網頁管理以 HttpOnly Cookie 登入（1.2.0）
+  await webSessionSuite(t, { api, expectError, tokens, uuid, base: BASE });
 
   await t.test('限制：事件太多、裝置自行解除配對', async () => {
     const many = Array.from({ length: 501 }, () => ev('part', 'create', uuid(), null));

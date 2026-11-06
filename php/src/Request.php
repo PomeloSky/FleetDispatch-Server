@@ -74,7 +74,6 @@ final class Request
         return null;
     }
 
-    /** Authorization 標頭（Apache 的 CGI／FastCGI 模式由 .htaccess 轉成 HTTP_AUTHORIZATION 環境變數）。 */
     /** 進入點（index.php）所在的網址路徑，例如 /fleet；在網站根目錄時是空字串。首頁判斷用。 */
     public function scriptDir(): string
     {
@@ -83,7 +82,10 @@ final class Request
         return $dir === '.' ? '' : $dir;
     }
 
-    /** 這個請求是不是 HTTPS（包含前面的反向代理以 X-Forwarded-Proto 告知的；只用於安裝精靈的提醒）。 */
+    /**
+     * 這個請求是不是 HTTPS（包含前面的反向代理以 X-Forwarded-Proto 告知的）。只用於安裝精靈的提醒與登入 Cookie 的 Secure 屬性
+     * （偽造只影響偽造的人自己）。
+     */
     public function isHttps(): bool
     {
         $https = strtolower(self::serverString($this->server, 'HTTPS') ?? '');
@@ -93,7 +95,20 @@ final class Request
         if ((self::serverString($this->server, 'SERVER_PORT') ?? '') === '443') {
             return true;
         }
-        return strtolower(self::serverString($this->server, 'HTTP_X_FORWARDED_PROTO') ?? '') === 'https';
+        $proto = explode(',', self::serverString($this->server, 'HTTP_X_FORWARDED_PROTO') ?? '')[0];
+        return strtolower(trim($proto)) === 'https';
+    }
+
+    /** 一般的請求標頭（例如 Cookie、Sec-Fetch-Site、X-FleetDispatch-CSRF）；沒有時回傳 null。 */
+    public function header(string $name): ?string
+    {
+        return self::serverString($this->server, 'HTTP_' . strtoupper(str_replace('-', '_', $name)));
+    }
+
+    /** Content-Type（CGI 的 CONTENT_TYPE；有些伺服器另外放在 HTTP_CONTENT_TYPE）。 */
+    public function contentType(): ?string
+    {
+        return self::serverString($this->server, 'CONTENT_TYPE') ?? self::serverString($this->server, 'HTTP_CONTENT_TYPE');
     }
 
     /** 瀏覽器開啟的請求（Accept 有 text/html）。 */
@@ -102,6 +117,7 @@ final class Request
         return str_contains(strtolower(self::serverString($this->server, 'HTTP_ACCEPT') ?? ''), 'text/html');
     }
 
+    /** Authorization 標頭（Apache 的 CGI／FastCGI 模式由 .htaccess 轉成 HTTP_AUTHORIZATION 環境變數）。 */
     public function authorization(): string
     {
         foreach (['HTTP_AUTHORIZATION', 'REDIRECT_HTTP_AUTHORIZATION'] as $key) {

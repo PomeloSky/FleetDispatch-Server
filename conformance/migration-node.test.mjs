@@ -1,4 +1,4 @@
-// 資料表遷移（1.1.0 → 1.2.0）的測試：Docker／Node 版。以 1.1.0 的結構建立資料庫、寫入資料，再啟動目前版本的主機：
+// 資料表遷移（1.1.0 → 1.2.0，資料表版本 1 → 3）的測試：Docker／Node 版。以 1.1.0 的結構建立資料庫、寫入資料，再啟動目前版本的主機：
 // - 升級前自動備份（VACUUM INTO）、升級後資料不變、既有資料的版本是 1、新的寫入留下修改前後歷史；
 // - 再次啟動不重複遷移、不重複備份。
 // 只在本機的暫存資料夾執行（不連任何正式主機）：node --test conformance/migration-node.test.mjs
@@ -97,6 +97,13 @@ test('1.1.0 的資料庫升級到 1.2.0：先備份、資料不變、版本從 1
     for (const [k, v] of [['schema', '1'], ['seq', '2'], ['serverId', uuid()], ['name', '舊主機'], ['createdAt', String(now)]]) meta.run(k, v);
     old.prepare(`INSERT INTO fd_devices (device_id, name, platform, role, token_hash, token_expires_at, paired_at, last_seen_at, identity)
                  VALUES (?, '管理員的 iPad', 'ipados', 'admin', ?, ?, ?, ?, ?)`).run(admin, tokenHash, now + 86400000, now, now, uuid());
+    // 1.1 的網頁管理（權杖存在瀏覽器）與一般的 App：升級後網頁權杖最多再用 30 天，App 不變
+    const legacyWeb = uuid(), phone = uuid();
+    const far = now + 80 * 86400000;
+    const device = old.prepare(`INSERT INTO fd_devices (device_id, name, platform, role, token_hash, token_expires_at, paired_at, last_seen_at, identity)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    device.run(legacyWeb, '網頁管理（Chrome）', 'web', 'admin', 'a'.repeat(64), far, now, now, uuid());
+    device.run(phone, '駕駛的手機', 'ios', 'driver', 'b'.repeat(64), far, now, now, uuid());
     const rec = old.prepare(`INSERT INTO fd_records (entity, id, seq, modified_at, deleted, payload, vehicle_plate, driver_name, created_by, updated_by, updated_at)
                              VALUES (?, ?, ?, ?, 0, ?, 'MIG-0001', ?, 'X', ?, ?)`);
     rec.run('vehicle', vehicleId, 1, t, JSON.stringify(vehicle), null, admin, now);
@@ -113,14 +120,21 @@ test('1.1.0 的資料庫升級到 1.2.0：先備份、資料不變、版本從 1
 
     let srv = startServer(dir, port);
     const info = await waitReady(base);
-    assert.equal(info.schemaVersion, 2);
+    assert.equal(info.schemaVersion, 3);
     assert.equal(info.name, '舊主機');
     assert.match(srv.log(), /升級前的備份/);
-    const backups = readdirSync(dir).filter((f) => f.startsWith('fleetdispatch.sqlite.before-v2-') && f.endsWith('.bak'));
+    const backups = readdirSync(dir).filter((f) => f.startsWith('fleetdispatch.sqlite.before-v3-') && f.endsWith('.bak'));
     assert.equal(backups.length, 1, '升級前自動備份');
     const copy = new DatabaseSync(join(dir, backups[0]), { readOnly: true });
     assert.equal(copy.prepare(`SELECT v FROM fd_meta WHERE k = 'schema'`).get().v, '1', '備份是升級前的內容');
     copy.close();
+    const after = new DatabaseSync(join(dir, 'fleetdispatch.sqlite'), { readOnly: true });
+    const web = after.prepare(`SELECT token_expires_at, web_session, session_until FROM fd_devices WHERE device_id = ?`).get(legacyWeb);
+    assert.ok(Number(web.token_expires_at) <= Date.now() + 30 * 86400000 && Number(web.token_expires_at) > now + 29 * 86400000, '1.1 的網頁權杖最多再用 30 天');
+    assert.equal(web.web_session, null);
+    assert.equal(web.session_until, null);
+    assert.equal(Number(after.prepare(`SELECT token_expires_at FROM fd_devices WHERE device_id = ?`).get(phone).token_expires_at), far, 'App 的權杖不變');
+    after.close();
 
     const snap = await (await fetch(`${base}/api/v1/snapshot`, { headers: auth })).json();
     assert.deepEqual(snap.snapshot.vehicles, [vehicle]);
@@ -145,7 +159,7 @@ test('1.1.0 的資料庫升級到 1.2.0：先備份、資料不變、版本從 1
 
     // 再次啟動：不重複遷移、不重複備份
     srv = startServer(dir, port);
-    assert.equal((await waitReady(base)).schemaVersion, 2);
+    assert.equal((await waitReady(base)).schemaVersion, 3);
     assert.doesNotMatch(srv.log(), /升級前的備份/);
     assert.equal(readdirSync(dir).filter((f) => f.endsWith('.bak')).length, 1);
     const again = await (await fetch(`${base}/api/v1/snapshot`, { headers: auth })).json();

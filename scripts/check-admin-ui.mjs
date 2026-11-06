@@ -1,5 +1,6 @@
-// 網頁管理（1.2.0）的瀏覽器實測（選用）：登入、13 個區塊、清單的篩選與排序、詳情與關聯、受控修改（預覽差異 → 原因 → 儲存）、
-// 欄位錯誤、回車、用車申請的核准、刪除的影響預覽、駕駛人個資的遮蔽、報表與 CSV、手機寬度、主控台沒有錯誤。
+// 網頁管理（1.2.0）的瀏覽器實測（選用）：登入（HttpOnly Cookie）、13 個區塊、清單的篩選與排序、詳情與關聯、
+// 受控修改（預覽差異 → 原因 → 儲存）、欄位錯誤、回車、用車申請的核准、刪除的影響預覽、駕駛人個資的遮蔽、報表與 CSV、
+// 1.1 的登入（存在瀏覽器的權杖）自動換成 Cookie、登出、手機寬度、主控台沒有錯誤。
 //
 // 只對本機新建、空的主機執行（會建立第一位管理員並寫入資料；不要對正式主機執行）。Playwright 不在 package.json 中（維持低依賴），
 // 需要時另外安裝：
@@ -48,15 +49,37 @@ page.on('response', async (r) => {
   }
 });
 
-// 登入（第一位管理員，用設定碼）
+const API_PATH = new URL(BASE).pathname.replace(/\/+$/, '') + '/api/v1/';
+const STORE_KEY = 'fd.admin.session';
+const loginCookie = async (context) => (await context.cookies()).find((c) => /^(__Secure-)?fd_admin$/.test(c.name) && c.value !== '');
+
+// 登入（第一位管理員，用設定碼）：權杖由主機以 HttpOnly Cookie 保存，頁面的程式讀不到
 await page.goto(`${BASE}/admin`);
 await page.getByLabel('設定碼').fill(SETUP);
-await page.getByRole('button', { name: '建立第一位管理員' }).click();
+await page.getByRole('button', { name: '建立管理員' }).click();
 await page.waitForSelector('nav.side');
 check(await page.locator('nav.side a').count() === 13, '側欄有 13 個管理區塊');
-const token = await page.evaluate(() => JSON.parse(localStorage.getItem('fd.admin.session')).token);
+const sc = await loginCookie(ctx);
+check(!!sc && sc.httpOnly && sc.sameSite === 'Strict' && sc.path === API_PATH.replace(/\/$/, ''),
+  `登入 Cookie：HttpOnly、SameSite=Strict、只送到 API（${sc ? `${sc.name}；path ${sc.path}；secure ${sc.secure}` : '沒有'}）`);
+check(await page.evaluate((k) => localStorage.getItem(k) === null && sessionStorage.getItem(k) === null, STORE_KEY), '瀏覽器沒有保存權杖');
+check(await page.evaluate(() => !document.cookie.includes('fd_admin')), '頁面的程式讀不到登入 Cookie');
 
-// 以 API 建立資料（同一個管理員）
+// 以這個瀏覽器的登入建立管理員配對碼（Cookie＋CSRF 權杖），再以 App 的方式配對一位管理員（建立測試資料用）
+const adminCode = await page.evaluate(async (apiPath) => {
+  const s = await (await fetch(apiPath + 'session')).json();
+  const r = await fetch(apiPath + 'admin/pairing-codes', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-FleetDispatch-CSRF': s.web.csrfToken }, body: JSON.stringify({ role: 'admin', label: '測試用 App' }),
+  });
+  return (await r.json()).code;
+}, API_PATH);
+const pairWith = async (code, platform, deviceName) => (await fetch(`${BASE}/api/v1/pair`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code, deviceId: uuid(), deviceName, platform }),
+})).json();
+const token = (await pairWith(adminCode, 'macos', '測試用 App')).token;
+check(typeof token === 'string', '以網頁建立的配對碼配對 App 管理員');
+
+// 以 API 建立資料（App 管理員）
 const api = async (method, path, body) => {
   const r = await fetch(`${BASE}/api/v1/${path}`, { method, headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
   return r.status === 204 ? null : r.json();
@@ -78,6 +101,9 @@ check(res.results.every((r) => r.status === 'applied'), '建立測試資料');
 
 async function shot(name) {
   await page.screenshot({ path: `${SHOTS}/${name}.png`, fullPage: true });
+}
+async function shot2(p, name) {
+  await p.screenshot({ path: `${SHOTS}/${name}.png`, fullPage: true });
 }
 async function go(hash) {
   // 每次重新載入頁面（同一個網址只換 # 時瀏覽器不會重新載入）
@@ -220,6 +246,49 @@ check(overflow <= 1, `手機寬度沒有橫向捲動（${overflow}px）`);
 await shot('09-phone-trips');
 await go(`#r/trip/${ids.t1}`);
 await shot('10-phone-detail');
+
+log('1.1 的登入（存在瀏覽器的權杖）自動換成 Cookie；登出');
+{
+  const legacy = await pairWith((await api('POST', 'admin/pairing-codes', { role: 'admin' })).code, 'web', '1.1 的網頁管理');
+  const ctx2 = await browser.newContext({ viewport: { width: 1280, height: 900 }, locale: 'zh-TW', timezoneId: 'Asia/Taipei' });
+  const page2 = await ctx2.newPage();
+  page2.on('dialog', (d) => d.accept());
+  page2.on('pageerror', (e) => consoleErrors.push('pageerror: ' + e.message));
+  await page2.goto(`${BASE}/admin`);
+  await page2.waitForSelector('#login-code');
+  await page2.evaluate(([k, v]) => localStorage.setItem(k, v), [STORE_KEY, JSON.stringify({ token: legacy.token, deviceId: legacy.deviceId, deviceName: '1.1 的網頁管理' })]);
+  await page2.reload();
+  await page2.waitForSelector('nav.side');
+  check(await page2.getByText('登入方式已更新').isVisible(), '提示登入方式已更新');
+  check(await page2.evaluate((k) => localStorage.getItem(k) === null, STORE_KEY), '舊的權杖已從瀏覽器刪除');
+  const c2 = await loginCookie(ctx2);
+  check(!!c2 && c2.httpOnly && c2.expires > Date.now() / 1000 + 80 * 86400, '換成「記住這個瀏覽器」的 HttpOnly Cookie');
+  check((await fetch(`${BASE}/api/v1/session`, { headers: { Authorization: `Bearer ${legacy.token}` } })).status === 401, '舊的權杖已失效');
+  // 瀏覽器又出現無效的舊權杖、但 Cookie 有效：刪除舊權杖，照常進入
+  await page2.evaluate((k) => localStorage.setItem(k, JSON.stringify({ token: 'x'.repeat(43) })), STORE_KEY);
+  await page2.reload();
+  await page2.waitForSelector('nav.side');
+  check(await page2.evaluate((k) => localStorage.getItem(k) === null, STORE_KEY), '無效的舊權杖被刪除，以 Cookie 照常進入');
+  await shot2(page2, '11-legacy-upgraded');
+  // 登出：解除配對並刪除 Cookie
+  await page2.goto(`${BASE}/admin#settings`);
+  await page2.getByRole('button', { name: '登出並解除配對' }).click();
+  await page2.waitForSelector('#login-code');
+  check(!(await loginCookie(ctx2)), '登出後沒有登入 Cookie');
+  await ctx2.close();
+
+  // 只有無效的舊權杖：提示重新登入
+  const ctx3 = await browser.newContext({ locale: 'zh-TW' });
+  const page3 = await ctx3.newPage();
+  await page3.goto(`${BASE}/admin`);
+  await page3.waitForSelector('#login-code');
+  await page3.evaluate((k) => sessionStorage.setItem(k, JSON.stringify({ token: 'y'.repeat(43) })), STORE_KEY);
+  await page3.reload();
+  await page3.waitForSelector('#login-code');
+  check(await page3.getByText('登入方式已更新為更安全的方式').isVisible(), '舊的登入失效時提示重新登入');
+  check(await page3.evaluate((k) => sessionStorage.getItem(k) === null, STORE_KEY), '失效的舊權杖被刪除');
+  await ctx3.close();
+}
 
 check(consoleErrors.length === 0, `主控台沒有錯誤${consoleErrors.length ? '：' + consoleErrors.join(' | ') : ''}`);
 await browser.close();
