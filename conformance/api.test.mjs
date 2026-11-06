@@ -548,13 +548,48 @@ test('FleetDispatch Server API v1', async (t) => {
     assert.deepEqual(ids_, [...ids_].sort((a, b) => b - a));
     assert.equal(typeof r.json.next, 'number');
     const e = r.json.entries[0];
-    assert.ok(['create', 'update', 'delete'].includes(e.operation));
+    // 1.2.0：上一個測試的主機改名也是稽核紀錄
+    assert.equal(e.entity, 'server');
+    assert.equal(e.operation, 'rename');
+    assert.equal(JSON.parse(e.summary).to, '優良運輸');
     assert.equal(typeof e.deviceName, 'string');
     const next = await api('GET', `admin/audit?limit=3&before=${r.json.next}`, { token: tokens.admin });
     assert.ok(next.json.entries.every((x) => x.id < r.json.next));
     const vehicleDelete = (await api('GET', 'admin/audit?limit=500', { token: tokens.admin })).json.entries.find((x) => x.entity === 'vehicle' && x.operation === 'delete');
     assert.equal(vehicleDelete.entityId, ids.v2);
     assert.equal(vehicleDelete.summary, '');
+  });
+
+  await t.test('1.2.0 管理操作的稽核：配對、角色與綁定、解除配對、配對碼、主機名稱；摘要不含權杖與配對碼', async () => {
+    const all = (await api('GET', 'admin/audit?limit=500', { token: tokens.admin })).json.entries;
+    const find = (entity, operation, pred = () => true) => all.filter((a) => a.entity === entity && a.operation === operation && pred(a, JSON.parse(a.summary || 'null')));
+    // 第一位管理員以設定碼配對；其他裝置以配對碼配對（記下用的是哪一組配對碼）
+    const [setup] = find('device', 'pair', (a) => a.entityId === ids.admin);
+    assert.deepEqual(JSON.parse(setup.summary), { role: 'admin', platform: 'macos', via: 'setup', codeId: null, driverBinding: null });
+    assert.equal(setup.deviceId, ids.admin);
+    const driverPair = JSON.parse(find('device', 'pair', (a) => a.entityId === ids.driver)[0].summary);
+    assert.equal(driverPair.via, 'code');
+    assert.match(driverPair.codeId, /^[0-9A-F-]{36}$/);
+    assert.deepEqual(driverPair.driverBinding, { driverUuid: ids.d1, driverName: '王小明' });
+    // 管理員改了檢視者的角色與綁定、解除了未綁定駕駛的配對
+    const changes = find('device', 'update', (a) => a.entityId === ids.viewer).map((a) => JSON.parse(a.summary));
+    assert.ok(changes.some((c) => c.from.role === 'viewer' && c.to.role === 'driver' && c.to.driverBinding.driverUuid === ids.d2), JSON.stringify(changes));
+    assert.ok(changes.some((c) => c.from.role === 'driver' && c.to.role === 'viewer' && c.to.driverBinding === null));
+    // driver2 被解除配對兩次（「重新配對」的測試以同一個裝置 ID 再配對一次後又解除），新的在前
+    const revoke = find('device', 'revoke', (a) => a.entityId === ids.driver2);
+    assert.deepEqual(revoke.map((a) => JSON.parse(a.summary).name), ['冒用的裝置', '未綁定的駕駛']);
+    assert.ok(revoke.every((a) => a.deviceId === ids.admin), '記錄做這個操作的管理員');
+    // 配對碼：建立（含角色、標籤、期限）、撤銷
+    const created = find('pairingCode', 'create');
+    assert.ok(created.length >= 4);
+    assert.ok(created.some((a) => JSON.parse(a.summary).label === '王小明的手機'));
+    assert.equal(find('pairingCode', 'delete', (a) => a.entityId === codeIds.spare).length, 1);
+    // 管理操作的摘要不含權杖、配對碼本身；所有稽核紀錄都不含任何權杖
+    for (const a of all.filter((x) => ['device', 'pairingCode', 'server'].includes(x.entity) && x.summary !== '')) {
+      const keys = Object.keys(JSON.parse(a.summary));
+      assert.ok(!keys.includes('token') && !keys.includes('code') && !keys.includes('codeHash'), a.summary);
+    }
+    for (const token of Object.values(tokens)) assert.ok(!JSON.stringify(all).includes(token));
   });
 
   // ───────── 1.2.0：冪等、revision 與衝突、修改前後歷史、並行一致性 ─────────

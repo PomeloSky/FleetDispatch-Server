@@ -261,12 +261,12 @@ export class Api {
     if (seg[0] === 'admin') {
       if (session.role !== 'admin') throw new ApiError(403, 'forbidden', '只有管理員可以使用');
       if (is('GET', 'admin/devices')) return json({ devices: (await this.repo.listDevices()).map(deviceJson) });
-      if (is('PATCH', 'admin/devices/*')) return json(await this.patchDevice(seg[2], await readJson(request)));
-      if (is('DELETE', 'admin/devices/*')) return this.deleteDevice(seg[2]);
+      if (is('PATCH', 'admin/devices/*')) return json(await this.patchDevice(session, seg[2], await readJson(request)));
+      if (is('DELETE', 'admin/devices/*')) return this.deleteDevice(session, seg[2]);
       if (is('POST', 'admin/pairing-codes')) return json(await this.createCode(session, await readJson(request)));
       if (is('GET', 'admin/pairing-codes')) return json(await this.listCodes());
-      if (is('DELETE', 'admin/pairing-codes/*')) return this.deleteCode(seg[2]);
-      if (is('PATCH', 'admin/server')) return json(await this.rename(await readJson(request)));
+      if (is('DELETE', 'admin/pairing-codes/*')) return this.deleteCode(session, seg[2]);
+      if (is('PATCH', 'admin/server')) return json(await this.rename(session, await readJson(request)));
       if (is('GET', 'admin/audit')) return json(await this.audit(url));
       if (is('GET', 'admin/history')) return json(await this.history(session, url));
       const admin = new AdminApi(this.repo, session);
@@ -333,14 +333,33 @@ export class Api {
       grant.codeHash,
     );
     if (!ok) return this.failCode(now);
+    await this.auditOp({ deviceId, deviceName }, 'device', deviceId, 'pair', {
+      role: grant.role, platform, via: grant.codeHash ? 'code' : 'setup', codeId: grant.codeId, driverBinding: grant.binding,
+    });
     return { token, deviceId, role: grant.role, driverBinding: grant.binding, server: await this.serverJson(), tokenExpiresAt: expiresAt };
+  }
+
+  /**
+   * 管理操作的稽核紀錄（1.2.0，docs/audit-history.md §3）：配對、網頁登入、解除配對、裝置的角色與綁定、配對碼、主機名稱。
+   * 摘要是 JSON，不含權杖、配對碼本身與駕駛人的個資。
+   */
+  private async auditOp(
+    actor: { deviceId: string; deviceName: string }, entity: 'device' | 'pairingCode' | 'server', entityId: string, operation: string,
+    summary: Record<string, unknown> | null,
+  ): Promise<void> {
+    await this.repo.addAudit({
+      at: nowMs(), device_id: actor.deviceId, device_name: actor.deviceName, entity, entity_id: entityId, operation,
+      summary: summary === null ? '' : JSON.stringify(summary),
+    });
   }
 
   /**
    * 檢查配對碼或設定碼（配對與網頁登入共用）：嘗試次數限制、沒有可以使用的管理員時比對設定碼、否則找可以使用的配對碼。
    * 錯誤時記一次失敗並回 401（還沒有用掉配對碼）。
    */
-  private async checkCode(code: string, now: number): Promise<{ role: Role; binding: DriverBinding | null; codeHash: string | null }> {
+  private async checkCode(
+    code: string, now: number,
+  ): Promise<{ role: Role; binding: DriverBinding | null; codeHash: string | null; codeId: string | null }> {
     const f = await this.repo.failures(this.ip, now - ATTEMPT_WINDOW_MS);
     if (f.count >= MAX_FAILURES) {
       const retry = Math.max(1, Math.ceil(((f.oldest ?? now) + ATTEMPT_WINDOW_MS - now) / 1000));
@@ -349,12 +368,12 @@ export class Api {
     if ((await this.repo.countActiveAdmins(now)) === 0) {
       if (this.config.setupToken === null) throw new ApiError(409, 'setup_not_configured', '主機尚未設定設定碼（請依部署文件設定 FD_SETUP_TOKEN）');
       if (!constantTimeEqual(code.trim(), this.config.setupToken)) return this.failCode(now);
-      return { role: 'admin', binding: null, codeHash: null };
+      return { role: 'admin', binding: null, codeHash: null, codeId: null };
     }
     const codeHash = await sha256Hex(normalizePairingCode(code));
     const row = await this.repo.findUsableCode(codeHash, now);
     if (!row) return this.failCode(now);
-    return { role: row.role, binding: row.role === 'driver' ? bindingOf(row) : null, codeHash };
+    return { role: row.role, binding: row.role === 'driver' ? bindingOf(row) : null, codeHash, codeId: row.id };
   }
 
   private async failCode(now: number): Promise<never> {
@@ -388,6 +407,9 @@ export class Api {
       grant.codeHash,
     );
     if (!ok) return this.failCode(now);
+    await this.auditOp({ deviceId, deviceName }, 'device', deviceId, 'web-login', {
+      via: grant.codeHash ? 'code' : 'setup', codeId: grant.codeId, remember: kind === 'remember',
+    });
     return this.webSessionResponse(request, token, deviceId, kind, until, now);
   }
 
@@ -414,6 +436,7 @@ export class Api {
     if (!(await this.repo.upgradeWebSession(device.device_id, oldHash, { tokenHash: await sha256Hex(token), kind, until, expiresAt }, now))) {
       throw new ApiError(401, 'unauthorized', '權杖無效或已過期，請重新登入');
     }
+    await this.auditOp({ deviceId: device.device_id, deviceName: device.name }, 'device', device.device_id, 'web-upgrade', { remember: kind === 'remember' });
     return this.webSessionResponse(request, token, device.device_id, kind, until, now);
   }
 
@@ -526,6 +549,7 @@ export class Api {
     if (!(await this.repo.revokeDevice(s.deviceId, nowMs()))) {
       throw new ApiError(409, 'last_admin', '最後一位可以使用的管理員不能解除配對');
     }
+    await this.auditOp(s, 'device', s.deviceId, 'unpair', { role: s.role, web: s.web !== null });
     // 網頁管理登出：同時刪除登入 Cookie
     return noContent(s.web ? { 'Set-Cookie': clearSessionCookie(request) } : {});
   }
@@ -580,12 +604,13 @@ export class Api {
     return { results, cursor: await this.repo.currentSeq() };
   }
 
-  /** 已處理事件保留 30 天；每個執行環境最多每小時清一次。 */
+  /** 已處理事件保留 30 天；有設定保留天數時刪除較舊的修改前後歷史。每個執行環境最多每小時清一次。 */
   private async purgeProcessedOccasionally(): Promise<void> {
     const now = nowMs();
     if (now - (lastPurge.get(this.repo.db) ?? 0) < 3600 * 1000) return;
     lastPurge.set(this.repo.db, now);
     await this.repo.purgeProcessed(now - PROCESSED_TTL_MS);
+    if (this.config.historyRetentionDays > 0) await this.repo.purgeHistory(now - this.config.historyRetentionDays * 24 * 3600 * 1000);
   }
 
   /**
@@ -793,7 +818,7 @@ export class Api {
 
   // ───────── 管理 ─────────
 
-  private async patchDevice(rawId: string, body: Record<string, unknown>) {
+  private async patchDevice(s: Session, rawId: string, body: Record<string, unknown>) {
     const id = normalizeUuid(rawId);
     if (!id) throw badRequest('裝置 ID 必須是 UUID');
     const d = await this.repo.deviceById(id);
@@ -814,16 +839,23 @@ export class Api {
     if (!(await this.repo.updateDevice(id, role, binding, nowMs()))) {
       throw new ApiError(409, 'last_admin', '最後一位可以使用的管理員不能降級');
     }
+    const before = bindingOf(d);
+    if (role !== d.role || JSON.stringify(binding) !== JSON.stringify(before)) {
+      await this.auditOp(s, 'device', id, 'update', {
+        name: d.name, from: { role: d.role, driverBinding: before }, to: { role, driverBinding: binding },
+      });
+    }
     return deviceJson((await this.repo.deviceById(id))!);
   }
 
-  private async deleteDevice(rawId: string): Promise<Response> {
+  private async deleteDevice(s: Session, rawId: string): Promise<Response> {
     const id = normalizeUuid(rawId);
     if (!id) throw badRequest('裝置 ID 必須是 UUID');
     const d = await this.repo.deviceById(id);
     if (!d) throw new ApiError(404, 'not_found', '找不到這台裝置');
-    if (d.revoked_at === null && !(await this.repo.revokeDevice(id, nowMs()))) {
-      throw new ApiError(409, 'last_admin', '最後一位可以使用的管理員不能解除配對');
+    if (d.revoked_at === null) {
+      if (!(await this.repo.revokeDevice(id, nowMs()))) throw new ApiError(409, 'last_admin', '最後一位可以使用的管理員不能解除配對');
+      await this.auditOp(s, 'device', id, 'revoke', { name: d.name, role: d.role, platform: d.platform });
     }
     return noContent();
   }
@@ -855,6 +887,7 @@ export class Api {
       created_at: now,
       expires_at: expiresAt,
     });
+    await this.auditOp(s, 'pairingCode', id, 'create', { role, driverBinding: binding, label, expiresAt });
     return { id, code, role, driverBinding: binding, label, expiresAt };
   }
 
@@ -872,16 +905,19 @@ export class Api {
     };
   }
 
-  private async deleteCode(rawId: string): Promise<Response> {
+  private async deleteCode(s: Session, rawId: string): Promise<Response> {
     const id = normalizeUuid(rawId);
     if (!id || (await this.repo.deleteCode(id)) === 0) throw new ApiError(404, 'not_found', '找不到這個配對碼');
+    await this.auditOp(s, 'pairingCode', id, 'delete', null);
     return noContent();
   }
 
-  private async rename(body: Record<string, unknown>) {
+  private async rename(s: Session, body: Record<string, unknown>) {
     const name = cleanName(body.name, 100);
     if (!name) throw badRequest('name 必須是 1–100 個字元');
+    const meta = await this.repo.meta();
     await this.repo.setName(name);
+    if (meta.name !== name) await this.auditOp(s, 'server', meta.serverId, 'rename', { from: meta.name, to: name });
     return this.info();
   }
 
@@ -914,7 +950,12 @@ export class Api {
         operation: 'view-pii', summary: '',
       });
     }
-    return { entries: rows.map((r) => historyJson(r, pii)), next: rows.length === limit ? Number(rows[rows.length - 1].id) : null };
+    return {
+      entries: rows.map((r) => historyJson(r, pii)),
+      next: rows.length === limit ? Number(rows[rows.length - 1].id) : null,
+      // 1.2.0：保留天數（0 是不自動刪除）
+      retentionDays: this.config.historyRetentionDays,
+    };
   }
 
   private async audit(url: URL) {

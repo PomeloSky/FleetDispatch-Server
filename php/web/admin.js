@@ -185,7 +185,18 @@
     }
     if (!p || typeof p !== 'object') return summary.length > 80 ? summary.slice(0, 80) + '…' : summary;
     const pick = (...keys) => keys.map((k) => p[k]).filter((v) => typeof v === 'string' && v.trim() !== '').join('・');
+    const roleText = (x) => (x && typeof x === 'object' ? [ROLE[x.role] || x.role, x.driverBinding && x.driverBinding.driverName].filter(Boolean).join('：') : '');
     const out = {
+      // 管理操作（1.2.0）
+      device: () => [p.name, ROLE[p.role] || p.role, PLATFORM[p.platform] || p.platform,
+        p.via === 'setup' ? '以設定碼' : p.via === 'code' ? '以配對碼' : null,
+        p.remember === true ? '記住瀏覽器' : p.remember === false ? '不記住瀏覽器' : null,
+        p.from && p.to ? `${roleText(p.from)} → ${roleText(p.to)}` : null,
+        p.driverBinding && p.driverBinding.driverName ? `綁定 ${p.driverBinding.driverName}` : null]
+        .filter((v) => typeof v === 'string' && v !== '').join('・'),
+      pairingCode: () => [ROLE[p.role] || p.role, p.label, p.driverBinding && p.driverBinding.driverName ? `綁定 ${p.driverBinding.driverName}` : null,
+        typeof p.expiresAt === 'number' ? `到 ${fmtTime(p.expiresAt)}` : null].filter((v) => typeof v === 'string' && v !== '').join('・'),
+      server: () => (typeof p.from === 'string' && typeof p.to === 'string' ? `${p.from} → ${p.to}` : ''),
       vehicle: () => pick('plateNumber', 'brand'),
       driver: () => pick('name'),
       trip: () => pick('vehiclePlateNumber', 'driver', 'origin'),
@@ -1274,6 +1285,7 @@
     const list = h('ul', { class: 'timeline' });
     const more = h('button', { class: 'btn ghost small', type: 'button', text: '載入更多', hidden: true });
     const compareHost = h('div');
+    const retention = h('p', { class: 'muted small', hidden: true });
     const load = async (reset) => {
       const q = new URLSearchParams({ limit: single ? '100' : '50' });
       for (const k of ['entity', 'id', 'outcome', 'source']) if (filter[k]) q.set(k, filter[k]);
@@ -1285,6 +1297,12 @@
         clear(list);
       }
       entries.push(...r.entries);
+      if (!single && typeof r.retentionDays === 'number') {
+        retention.textContent = r.retentionDays > 0
+          ? `主機設定只保留最近 ${r.retentionDays} 天的修改前後歷史，較舊的會自動刪除（稽核紀錄不受影響）。`
+          : '修改前後歷史不會自動刪除（主機可以設定保留天數，見架設說明）。';
+        retention.hidden = false;
+      }
       for (const e of r.entries) list.append(historyItem(e, single));
       next = r.next;
       more.hidden = !next;
@@ -1315,7 +1333,7 @@
       });
       tools.push(h('span', { class: 'muted small', text: '駕駛人的電話、證號、備註預設遮蔽。' }), btn);
     }
-    clear(host).append(...[tools.length ? h('div', { class: 'row' }, tools) : null, compareHost, list, h('div', { class: 'row' }, more)].filter(Boolean));
+    clear(host).append(...[tools.length ? h('div', { class: 'row' }, tools) : null, retention, compareHost, list, h('div', { class: 'row' }, more)].filter(Boolean));
     await load(true);
   }
 
@@ -2203,16 +2221,23 @@
       more.disabled = false;
     });
     await append();
-    clear(panel).append(card('稽核紀錄', '誰在什麼時候新增、修改或刪除了哪一筆資料，以及查看個資等管理操作（最新的在最上面）。稽核紀錄不含駕駛人的個資。',
+    clear(panel).append(card('稽核紀錄', '誰在什麼時候新增、修改或刪除了哪一筆資料，以及配對、登入、角色、配對碼、主機名稱、查看個資等管理操作（最新的在最上面）。稽核紀錄不含駕駛人的個資、權杖與配對碼。',
       subtabs('audit'),
       h('div', { class: 'tablewrap' }, h('table', null,
         h('thead', null, h('tr', null, ['時間', '裝置', '動作', '資料', '摘要'].map((t) => h('th', { scope: 'col', text: t })))), tbody)),
       h('div', { class: 'row' }, more)));
   }
 
+  /** 管理操作（1.2.0）的動作名稱。 */
+  const ADMIN_ACTION = {
+    'device:pair': '配對裝置', 'device:web-login': '登入網頁管理', 'device:web-upgrade': '網頁登入改用 Cookie', 'device:unpair': '自行解除配對（登出）',
+    'device:update': '變更裝置的角色或綁定', 'device:revoke': '解除裝置的配對', 'pairingCode:create': '建立配對碼', 'pairingCode:delete': '撤銷配對碼',
+    'server:rename': '變更主機名稱',
+  };
+
   function auditAction(a) {
     if (a.operation === 'view-pii') return '查看個資';
-    return `${OPERATION[a.operation] || a.operation}${ENTITY[a.entity] || AUDIT_ENTITY[a.entity] || a.entity}`;
+    return ADMIN_ACTION[`${a.entity}:${a.operation}`] || `${OPERATION[a.operation] || a.operation}${ENTITY[a.entity] || AUDIT_ENTITY[a.entity] || a.entity}`;
   }
 
   // ───────── 主機設定 ─────────

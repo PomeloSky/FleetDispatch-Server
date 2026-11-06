@@ -175,10 +175,10 @@ final class Api
             }
             if ($is('PATCH', 'admin/devices/*')) {
                 $body = $this->readJson();
-                return Response::json($this->patchDevice($seg[2], $body));
+                return Response::json($this->patchDevice($s, $seg[2], $body));
             }
             if ($is('DELETE', 'admin/devices/*')) {
-                return $this->deleteDevice($seg[2]);
+                return $this->deleteDevice($s, $seg[2]);
             }
             if ($is('POST', 'admin/pairing-codes')) {
                 return Response::json($this->createCode($s, $this->readJson()));
@@ -187,10 +187,10 @@ final class Api
                 return Response::json($this->listCodes());
             }
             if ($is('DELETE', 'admin/pairing-codes/*')) {
-                return $this->deleteCode($seg[2]);
+                return $this->deleteCode($s, $seg[2]);
             }
             if ($is('PATCH', 'admin/server')) {
-                return Response::json($this->rename($this->readJson()));
+                return Response::json($this->rename($s, $this->readJson()));
             }
             if ($is('GET', 'admin/audit')) {
                 return Response::json($this->audit());
@@ -366,6 +366,10 @@ final class Api
         if ($outcome !== 'ok') {
             $this->failCode($now);
         }
+        $this->auditOp($deviceId, $deviceName, 'device', $deviceId, 'pair', [
+            'role' => $grant['role'], 'platform' => $platform, 'via' => $grant['codeHash'] !== null ? 'code' : 'setup',
+            'codeId' => $grant['codeId'], 'driverBinding' => $grant['binding'],
+        ]);
         return [
             'token' => $token,
             'deviceId' => $deviceId,
@@ -380,7 +384,7 @@ final class Api
      * 檢查配對碼或設定碼（配對與網頁登入共用）：嘗試次數限制、沒有可以使用的管理員時比對設定碼、否則找可以使用的配對碼。
      * 錯誤時記一次失敗並回 401（還沒有用掉配對碼）。
      *
-     * @return array{role: string, binding: array{driverUuid: string, driverName: string}|null, codeHash: string|null}
+     * @return array{role: string, binding: array{driverUuid: string, driverName: string}|null, codeHash: string|null, codeId: string|null}
      */
     private function checkCode(string $code, int $now): array
     {
@@ -396,7 +400,7 @@ final class Api
             if (!Crypto::constantTimeEqual(Util::jsTrim($code), $this->config->setupToken)) {
                 $this->failCode($now);
             }
-            return ['role' => 'admin', 'binding' => null, 'codeHash' => null];
+            return ['role' => 'admin', 'binding' => null, 'codeHash' => null, 'codeId' => null];
         }
         $codeHash = Crypto::sha256Hex(Crypto::normalizePairingCode($code));
         $row = $this->repo->findUsableCode($codeHash, $now);
@@ -404,7 +408,18 @@ final class Api
             $this->failCode($now);
         }
         $role = $row['role'];
-        return ['role' => $role, 'binding' => $role === 'driver' ? self::bindingOf($row) : null, 'codeHash' => $codeHash];
+        return ['role' => $role, 'binding' => $role === 'driver' ? self::bindingOf($row) : null, 'codeHash' => $codeHash, 'codeId' => (string) $row['id']];
+    }
+
+    /**
+     * 管理操作的稽核紀錄（1.2.0，docs/audit-history.md §3；與 core/src/handler.ts 的 auditOp 相同）：配對、網頁登入、解除配對、
+     * 裝置的角色與綁定、配對碼、主機名稱。摘要是 JSON，不含權杖、配對碼本身與駕駛人的個資。
+     *
+     * @param array<string, mixed>|null $summary
+     */
+    private function auditOp(string $deviceId, string $deviceName, string $entity, string $entityId, string $operation, ?array $summary): void
+    {
+        $this->repo->addAudit(Util::nowMs(), $deviceId, $deviceName, $entity, $entityId, $operation, $summary === null ? '' : Json::encode($summary));
     }
 
     private function failCode(int $now): never
@@ -471,6 +486,9 @@ final class Api
         if ($this->savePairing($grant['codeHash'], $device, $now) !== 'ok') {
             $this->failCode($now);
         }
+        $this->auditOp($deviceId, $deviceName, 'device', $deviceId, 'web-login', [
+            'via' => $grant['codeHash'] !== null ? 'code' : 'setup', 'codeId' => $grant['codeId'], 'remember' => $kind === 'remember',
+        ]);
         return $this->webSessionResponse($token, $deviceId, $kind, $until, $now);
     }
 
@@ -506,6 +524,7 @@ final class Api
         if (!$ok) {
             throw new ApiError(401, 'unauthorized', '權杖無效或已過期，請重新登入');
         }
+        $this->auditOp($device['device_id'], $device['name'], 'device', $device['device_id'], 'web-upgrade', ['remember' => $kind === 'remember']);
         return $this->webSessionResponse($token, $device['device_id'], $kind, $until, $now);
     }
 
@@ -626,6 +645,7 @@ final class Api
             }
             $this->repo->revokeDevice($s->deviceId, $now);
         });
+        $this->auditOp($s->deviceId, $s->deviceName, 'device', $s->deviceId, 'unpair', ['role' => $s->role, 'web' => $s->web !== null]);
         // 網頁管理登出：同時刪除登入 Cookie
         return $s->web !== null ? new Response(204, null, ['Set-Cookie' => WebSession::clearCookie($this->req)]) : Response::noContent();
     }
@@ -720,8 +740,13 @@ final class Api
         if (count($list) > self::MAX_EVENTS_PER_REQUEST) {
             throw ApiError::badRequest('每次最多 ' . self::MAX_EVENTS_PER_REQUEST . ' 筆事件');
         }
-        if (random_int(1, 50) === 1) {
-            $this->repo->purgeProcessed(Util::nowMs() - self::PROCESSED_TTL_MS);
+        // 已處理事件保留 30 天；有設定保留天數時刪除較舊的修改前後歷史。最多每小時清一次（與 TypeScript 版相同）。
+        $now = Util::nowMs();
+        if ($this->repo->claimPurge($now, 3600 * 1000)) {
+            $this->repo->purgeProcessed($now - self::PROCESSED_TTL_MS);
+            if ($this->config->historyRetentionDays > 0) {
+                $this->repo->purgeHistory($now - $this->config->historyRetentionDays * 24 * 3600 * 1000);
+            }
         }
         $results = [];
         foreach ($list as $raw) {
@@ -1006,13 +1031,13 @@ final class Api
     // ───────── 管理 ─────────
 
     /** @return array<string, mixed> */
-    private function patchDevice(string $rawId, \stdClass $body): array
+    private function patchDevice(Session $s, string $rawId, \stdClass $body): array
     {
         $id = Util::normalizeUuid($rawId);
         if ($id === null) {
             throw ApiError::badRequest('裝置 ID 必須是 UUID');
         }
-        return $this->db->transaction(function () use ($id, $body): array {
+        return $this->db->transaction(function () use ($s, $id, $body): array {
             $d = $this->repo->deviceById($id);
             if ($d === null) {
                 throw new ApiError(404, 'not_found', '找不到這台裝置');
@@ -1039,6 +1064,12 @@ final class Api
                 throw new ApiError(409, 'last_admin', '最後一位可以使用的管理員不能降級');
             }
             $this->repo->updateDevice($id, $role, $binding);
+            $before = self::bindingOf($d);
+            if ($role !== $d['role'] || Json::encode($binding) !== Json::encode($before)) {
+                $this->auditOp($s->deviceId, $s->deviceName, 'device', $id, 'update', [
+                    'name' => $d['name'], 'from' => ['role' => $d['role'], 'driverBinding' => $before], 'to' => ['role' => $role, 'driverBinding' => $binding],
+                ]);
+            }
             $updated = $this->repo->deviceById($id);
             if ($updated === null) {
                 throw new \RuntimeException('更新後找不到裝置');
@@ -1047,13 +1078,13 @@ final class Api
         });
     }
 
-    private function deleteDevice(string $rawId): Response
+    private function deleteDevice(Session $s, string $rawId): Response
     {
         $id = Util::normalizeUuid($rawId);
         if ($id === null) {
             throw ApiError::badRequest('裝置 ID 必須是 UUID');
         }
-        $this->db->transaction(function () use ($id): void {
+        $this->db->transaction(function () use ($s, $id): void {
             $d = $this->repo->deviceById($id);
             if ($d === null) {
                 throw new ApiError(404, 'not_found', '找不到這台裝置');
@@ -1061,7 +1092,10 @@ final class Api
             if ($d['role'] === 'admin' && $d['revoked_at'] === null && $this->repo->countOtherAdmins($id, Util::nowMs()) === 0) {
                 throw new ApiError(409, 'last_admin', '最後一位可以使用的管理員不能解除配對');
             }
-            $this->repo->revokeDevice($id, Util::nowMs());
+            if ($d['revoked_at'] === null) {
+                $this->repo->revokeDevice($id, Util::nowMs());
+                $this->auditOp($s->deviceId, $s->deviceName, 'device', $id, 'revoke', ['name' => $d['name'], 'role' => $d['role'], 'platform' => $d['platform']]);
+            }
         });
         return Response::noContent();
     }
@@ -1116,6 +1150,9 @@ final class Api
                 }
             }
         }
+        $this->auditOp($s->deviceId, $s->deviceName, 'pairingCode', $id, 'create', [
+            'role' => $role, 'driverBinding' => $binding, 'label' => $label, 'expiresAt' => $expiresAt,
+        ]);
         return ['id' => $id, 'code' => $code, 'role' => $role, 'driverBinding' => $binding, 'label' => $label, 'expiresAt' => $expiresAt];
     }
 
@@ -1136,23 +1173,28 @@ final class Api
         return ['codes' => $codes];
     }
 
-    private function deleteCode(string $rawId): Response
+    private function deleteCode(Session $s, string $rawId): Response
     {
         $id = Util::normalizeUuid($rawId);
         if ($id === null || $this->repo->deleteCode($id) === 0) {
             throw new ApiError(404, 'not_found', '找不到這個配對碼');
         }
+        $this->auditOp($s->deviceId, $s->deviceName, 'pairingCode', $id, 'delete', null);
         return Response::noContent();
     }
 
     /** @return array<string, mixed> */
-    private function rename(\stdClass $body): array
+    private function rename(Session $s, \stdClass $body): array
     {
         $name = Util::cleanName($body->name ?? null, 100);
         if ($name === null) {
             throw ApiError::badRequest('name 必須是 1–100 個字元');
         }
+        $meta = $this->repo->meta();
         $this->repo->setName($name);
+        if ($meta['name'] !== $name) {
+            $this->auditOp($s->deviceId, $s->deviceName, 'server', $meta['serverId'], 'rename', ['from' => $meta['name'], 'to' => $name]);
+        }
         return $this->info();
     }
 
@@ -1226,7 +1268,12 @@ final class Api
         foreach ($rows as $r) {
             $entries[] = Admin::historyJson($r, $pii);
         }
-        return ['entries' => $entries, 'next' => count($rows) === $limit ? (int) $rows[count($rows) - 1]['id'] : null];
+        return [
+            'entries' => $entries,
+            'next' => count($rows) === $limit ? (int) $rows[count($rows) - 1]['id'] : null,
+            // 1.2.0：保留天數（0 是不自動刪除）
+            'retentionDays' => $this->config->historyRetentionDays,
+        ];
     }
 
     /** @return array<string, mixed> */

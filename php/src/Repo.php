@@ -546,6 +546,28 @@ final class Repo
         $this->db->run('DELETE FROM fd_processed_events WHERE at < ?', [$before]);
     }
 
+    /** 刪除較舊的修改前後歷史（有設定保留天數時，docs/audit-history.md §4）。 */
+    public function purgeHistory(int $before): void
+    {
+        $this->db->run('DELETE FROM fd_record_history WHERE at < ?', [$before]);
+    }
+
+    /**
+     * 每小時一次的清理（PHP 每個請求是獨立的程序，所以把上次清理的時間記在 fd_meta）。回傳這次是否要清理。
+     */
+    public function claimPurge(int $now, int $interval): bool
+    {
+        $last = (int) ($this->db->value("SELECT v FROM fd_meta WHERE k = 'purgedAt'") ?? 0);
+        if ($now - $last < $interval) {
+            return false;
+        }
+        $sql = $this->db->driver === 'sqlite'
+            ? "INSERT OR REPLACE INTO fd_meta (k, v) VALUES ('purgedAt', ?)"
+            : "INSERT INTO fd_meta (k, v) VALUES ('purgedAt', ?) ON DUPLICATE KEY UPDATE v = VALUES(v)";
+        $this->db->run($sql, [(string) $now]);
+        return true;
+    }
+
     /**
      * 所有未刪除的資料（快照用），依種類、UUID 排序；payload 不解碼（payloadText 是原始 JSON）。
      *

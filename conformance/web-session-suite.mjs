@@ -158,6 +158,13 @@ export async function webSessionSuite(t, h) {
     const s = await web('GET', 'session', { cookie: uj });
     assert.equal(s.json.deviceId, legacyId);
     assert.equal((await web('POST', 'unpair', { cookie: uj, csrf: u.json.web.csrfToken })).status, 204);
+
+    // 稽核：網頁登入、轉換、登出（1.2.0）
+    const audit = (await api('GET', 'admin/audit?limit=100', { token: tokens.admin })).json.entries;
+    const mine = (id, op) => audit.filter((a) => a.entity === 'device' && a.entityId === id && a.operation === op).map((a) => JSON.parse(a.summary));
+    assert.deepEqual(mine(webId, 'web-login').map((x) => [x.via, x.remember]), [['code', false]]);
+    assert.deepEqual(mine(legacyId, 'web-upgrade'), [{ remember: true }]);
+    assert.deepEqual(mine(legacyId, 'unpair'), [{ role: 'admin', web: true }]);
   });
 
   await t.test('1.2.0 網頁登入：管理員解除配對後 Cookie 立即失效', async () => {

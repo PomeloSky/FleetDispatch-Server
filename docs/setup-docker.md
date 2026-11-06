@@ -26,6 +26,7 @@ cd FleetDispatch-Server
 | `FD_SETUP_TOKEN` | **設定碼**：第一次連線用，輸入它的裝置成為管理員。至少 16 個字元的隨機字串（產生方式見下方）。留空時主機會自動產生一組，存在資料卷的 `setup-token.txt` |
 | `FD_SERVER_NAME` | 主機第一次啟動時的名稱（之後可以在 App 或網頁管理修改） |
 | `FD_ADMIN_PATH` | 網頁管理的網址（第 11 節），預設 `/admin`；建議改成不容易猜到的路徑，例如 `/manage-7k2q9`；設為 `off` 關閉 |
+| `FD_HISTORY_RETENTION_DAYS` | 修改前後歷史保留的天數（選填）：預設不自動刪除；設定時至少 30 天，較舊的歷史自動刪除（[audit-history.md](audit-history.md) §4） |
 | `FD_TRUST_PROXY` | 前面有幾層反向代理：直接對外時保持 `0`；放在一層反向代理（Caddy、nginx、Synology 反向代理、Cloudflare Tunnel）後面時設為 `1`。主機只採用信任的代理在 `X-Forwarded-For` 右邊附加的 IP（最左邊的值可以被偽造），配對嘗試次數限制才會用到真實 IP |
 | `FD_PORT` | 容器內的連接埠，預設 8080 |
 

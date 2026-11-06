@@ -836,6 +836,11 @@ export class Repo {
     await this.db.run(`DELETE FROM fd_processed_events WHERE at < ?`, [before]);
   }
 
+  /** 刪除較舊的修改前後歷史（有設定保留天數時，docs/audit-history.md §4）。 */
+  async purgeHistory(before: number): Promise<void> {
+    await this.db.run(`DELETE FROM fd_record_history WHERE at < ?`, [before]);
+  }
+
   // ───────── 修改前後歷史 ─────────
 
   async listHistory(filter: {

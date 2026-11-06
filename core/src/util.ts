@@ -116,3 +116,17 @@ export function rateLimitKey(ip: string): string {
   if (g.slice(0, 5).every((x) => x === 0) && g[5] === 0xffff) return `${g[6] >> 8}.${g[6] & 255}.${g[7] >> 8}.${g[7] & 255}`;
   return `${g.slice(0, 4).map((x) => x.toString(16)).join(':')}::/64`;
 }
+
+/**
+ * 修改前後歷史保留天數的設定（Docker、Cloudflare：`FD_HISTORY_RETENTION_DAYS`；PHP：`history_retention_days`）：
+ * 沒有設定、空字串或 0 是不自動刪除；1–29 視為 30（避免誤設而刪掉大量歷史）；不是非負整數時不自動刪除並回報錯誤。
+ */
+export function parseRetentionDays(raw: string | number | undefined | null): { days: number; error?: string } {
+  if (raw === undefined || raw === null) return { days: 0 };
+  const text = String(raw).trim();
+  if (text === '' || text === '0') return { days: 0 };
+  if (!/^\d{1,6}$/.test(text)) return { days: 0, error: `修改前後歷史的保留天數 ${JSON.stringify(text)} 不是整數，不會自動刪除歷史` };
+  const n = Number(text);
+  if (n < 30) return { days: 30, error: `修改前後歷史的保留天數最少 30 天，已改用 30 天` };
+  return { days: n };
+}

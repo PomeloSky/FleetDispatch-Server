@@ -275,7 +275,7 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 | `GET /admin/pairing-codes` | 尚未使用、未過期的配對碼 `{ "codes": [ { "id", "label", "role", "driverBinding", "createdAt", "expiresAt" } ] }` |
 | `DELETE /admin/pairing-codes/{id}` | 刪除 → `204` |
 | `PATCH /admin/server` | `{ "name" }`（1–100 字元）→ `Info`（§9） |
-| `GET /admin/audit?before=<id>&limit=<筆數>` | 稽核紀錄，新的在前：`{ "entries": [ { "id", "at", "deviceId", "deviceName", "entity", "entityId", "operation", "summary" } ], "next": <id 或 null> }`；`limit` 預設 100、最多 500 |
+| `GET /admin/audit?before=<id>&limit=<筆數>` | 稽核紀錄，新的在前：`{ "entries": [ { "id", "at", "deviceId", "deviceName", "entity", "entityId", "operation", "summary" } ], "next": <id 或 null> }`；`limit` 預設 100、最多 500。1.2.0 起也記錄配對、網頁登入、角色與綁定、解除配對、配對碼、主機名稱（`entity` 是 `device`、`pairingCode`、`server`；[`audit-history.md`](audit-history.md) §3） |
 | `GET /admin/history` | 修改前後歷史（§7.1，1.2.0） |
 | `GET /admin/schema` | 網頁管理的資料規格（§7.2，1.2.0） |
 | `GET /admin/records`、`GET /admin/records/{entity}/{id}` | 資料清單與詳情（§7.3、§7.4，1.2.0） |
@@ -307,10 +307,12 @@ App 與 1.1 的網頁權杖是 `null`；`sessionUntil`：網頁登入的期限�
       "reason": null, "seq": 1234, "revision": 3
     }
   ],
-  "next": 811
+  "next": 811,
+  "retentionDays": 0
 }
 ```
 
+- `retentionDays`（1.2.0）：主機設定的保留天數，`0` 是不自動刪除（[`audit-history.md`](audit-history.md) §4）。
 - `operation`：`create`、`update`、`delete`；刪除時 `after` 是 `null`，新增時 `before` 是 `null`。
 - `source`：`app`（App 的事件）、`web`（網頁管理的修改、核准、刪除，`reason` 是管理員填的原因）、`cascade`（刪除車輛的連鎖刪除，`reason: "vehicle-deleted"`）；`api` 保留。
 - `outcome`：`applied`（寫入）；App 的事件沒有套用時也留下一筆摘要：`rejected`（`reason` 是拒絕的原因碼）、`conflict`（`revision-mismatch`）、

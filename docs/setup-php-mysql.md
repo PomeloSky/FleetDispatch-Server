@@ -131,6 +131,7 @@ chmod 600 config.php
 | `db.user`、`db.password` | 第 4 節建立的使用者與密碼 |
 | `server_name` | 第一次初始化時的主機名稱（之後管理員可以在 App 或網頁管理修改） |
 | `admin_path` | 網頁管理的網址（第 14 節），預設 `/admin`；建議改成不容易猜到的路徑，例如 `'/manage-7k2q9'`；設為 `'off'` 關閉 |
+| `history_retention_days` | 修改前後歷史保留的天數（選填）：預設不自動刪除；設定時至少 30 天，較舊的歷史自動刪除（[audit-history.md](audit-history.md) §4） |
 | `trust_proxy` | 前面有幾層**你自己控制的**反向代理：PHP 直接面對網際網路時（一般虛擬主機、Apache 或 nginx 直接執行 PHP）保持 `0`；前面剛好有一層反向代理（例如開啟代理的 Cloudflare、另一台 nginx）時設為 `1`。設為 N 時，主機取 `X-Forwarded-For` 從右邊數來第 N 個位址作為來源 IP（最左邊的值可以被用戶端偽造，不會採用）；配對嘗試次數限制會用到真實的 IP。不確定時保持 `0` |
 
 產生設定碼（有 SSH 時）：

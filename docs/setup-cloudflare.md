@@ -58,7 +58,8 @@ npx wrangler secret put FD_SETUP_TOKEN --config cloudflare/wrangler.toml
 ## 5. 部署
 
 部署前可以先在 `cloudflare/wrangler.toml` 的 `[vars]` 把網頁管理的網址 `FD_ADMIN_PATH` 改成不容易猜到的路徑（例如 `"/manage-7k2q9"`；
-預設 `/admin`，設為 `"off"` 關閉；見第 13 節）。
+預設 `/admin`，設為 `"off"` 關閉；見第 13 節）。需要修改前後歷史的保留期限時，在 `[vars]` 加上 `FD_HISTORY_RETENTION_DAYS`（至少 30；
+預設不自動刪除，見 [audit-history.md](audit-history.md) §4）。
 
 ```sh
 npm run cf:deploy

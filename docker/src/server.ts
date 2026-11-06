@@ -12,6 +12,7 @@ import { SCHEMA_VERSION } from '../../core/src/db.ts';
 import { handleRequest, LIMITS } from '../../core/src/handler.ts';
 import type { ServerConfig } from '../../core/src/types.ts';
 import { SERVER_VERSION } from '../../core/src/version.ts';
+import { parseRetentionDays } from '../../core/src/util.ts';
 import { parseAdminPath } from '../../core/src/web.ts';
 
 class NodeSqliteDb implements SqlDb {
@@ -90,12 +91,15 @@ function setupToken(): string {
 
 const admin = parseAdminPath(process.env.FD_ADMIN_PATH);
 if (admin.error) console.error(admin.error);
+const retention = parseRetentionDays(process.env.FD_HISTORY_RETENTION_DAYS);
+if (retention.error) console.error(retention.error);
 
 const config: ServerConfig = {
   variant: 'docker',
   setupToken: setupToken(),
   defaultName: process.env.FD_SERVER_NAME?.trim() || 'FleetDispatch Server',
   adminPath: admin.path,
+  historyRetentionDays: retention.days,
 };
 const dbFile = join(dataDir, 'fleetdispatch.sqlite');
 const db = new NodeSqliteDb(dbFile);

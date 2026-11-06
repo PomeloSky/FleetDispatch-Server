@@ -132,6 +132,8 @@ export interface ServerConfig {
   defaultName: string;
   /** 網頁管理的網址路徑（例如 `/admin`）；`null` 表示關閉。 */
   adminPath: string | null;
+  /** 修改前後歷史保留的天數（1.2.0）：0 是不自動刪除（預設）；否則至少 30 天（docs/audit-history.md §4）。 */
+  historyRetentionDays: number;
 }
 
 export class ApiError extends Error {
