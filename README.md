@@ -21,6 +21,8 @@
 ## 功能
 
 - 與 App 的區網主機相同的同步規則：最後寫入者勝、主機校正用戶端偏快的時間、刪除車輛時一併刪除它的車趟與保養紀錄。
+- 1.2.0：事件冪等（回應遺失後重送不會重複套用）、每筆資料的版本（`expectedRevision` 與衝突）、修改前後歷史（管理員查詢）、
+  授權與寫入看到同一個版本、有進行中車趟的車輛不能刪除、資料表版本與自動遷移（升級前自動備份 SQLite）。
 - 角色與資料範圍：管理員可讀寫全部；駕駛只收到自己的車趟、巡檢與用車申請，其他駕駛人的個資被遮蔽；檢視者唯讀、個資被遮蔽。
   駕駛不能核准自己的申請、不能修改或改派別人的車趟。
 - 用車申請與核准、巡檢、工單、零件、保養等 10 種資料；即時位置（出車中的車輛位置）；稽核紀錄（誰在什麼時候改了什麼）。
@@ -41,11 +43,14 @@ conformance/   相容性測試：對任何一台主機執行，三種實作都�
 docs/          協定規格與各部署方式的架設說明
 ```
 
-- 協定規格：[docs/protocol.md](docs/protocol.md)（HTTP JSON API v1）。
-- 相容性測試（對一台全新、空的主機執行）：
+- 協定規格：[docs/protocol.md](docs/protocol.md)（HTTP JSON API v1）；同步一致性 [docs/sync-consistency.md](docs/sync-consistency.md)、
+  稽核與修改歷史 [docs/audit-history.md](docs/audit-history.md)、資料表升級 [docs/migration.md](docs/migration.md)、
+  發布檢查與提交身分 [docs/release-checklist.md](docs/release-checklist.md)。
+- 相容性測試：**只對本機新建、空的主機執行**（測試會建立管理員並寫入資料；不要對正式主機執行）：
 
   ```sh
-  FD_BASE=https://你的主機網址 FD_SETUP_TOKEN=你的設定碼 FD_ADMIN_PATH=/admin node --test conformance/api.test.mjs conformance/web.test.mjs
+  FD_BASE=http://127.0.0.1:8080 FD_SETUP_TOKEN=你的設定碼 FD_ADMIN_PATH=/admin node --test conformance/api.test.mjs conformance/web.test.mjs
+  node --test conformance/migration-node.test.mjs conformance/migration-php.test.mjs   # 1.1 → 1.2 遷移（本機暫存資料夾）
   ```
 
   PHP 版的安裝精靈另有 `conformance/php-install.test.mjs`（對還沒有 `config.php` 的主機執行，見檔案開頭的說明）。

@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS fd_records (
     created_by VARCHAR(36) NULL,
     updated_by VARCHAR(36) NULL,
     updated_at BIGINT NOT NULL,
+    revision BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (entity, id),
     UNIQUE KEY fd_records_seq (seq),
     KEY fd_records_plate (vehicle_plate(191))
@@ -100,4 +101,40 @@ CREATE TABLE IF NOT EXISTS fd_attempts (
     PRIMARY KEY (id),
     KEY fd_attempts_ip (ip, at),
     KEY fd_attempts_at (at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+-- 1.2.0（資料表版本 2）：修改前後歷史、已處理事件（冪等）。既有的主機由程式自動遷移（Db::ensureSchema），
+-- 升級前請先備份（mysqldump，見 docs/migration.md）。
+
+CREATE TABLE IF NOT EXISTS fd_record_history (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    at BIGINT NOT NULL,
+    entity VARCHAR(32) NOT NULL,
+    entity_id VARCHAR(36) NOT NULL,
+    event_id VARCHAR(100) NULL,
+    operation VARCHAR(16) NOT NULL,
+    source VARCHAR(16) NOT NULL,
+    actor_device VARCHAR(36) NULL,
+    actor_identity VARCHAR(36) NULL,
+    actor_name VARCHAR(255) NULL,
+    before_json LONGTEXT NULL,
+    after_json LONGTEXT NULL,
+    changed_fields TEXT NULL,
+    reason VARCHAR(500) NULL,
+    seq BIGINT NOT NULL,
+    revision BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    KEY fd_history_entity (entity, entity_id, id),
+    KEY fd_history_seq (seq)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE TABLE IF NOT EXISTS fd_processed_events (
+    device_id VARCHAR(36) NOT NULL,
+    event_id VARCHAR(100) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    reason VARCHAR(100) NULL,
+    result_json MEDIUMTEXT NULL,
+    at BIGINT NOT NULL,
+    PRIMARY KEY (device_id, event_id),
+    KEY fd_processed_at (at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;

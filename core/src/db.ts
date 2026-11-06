@@ -1,7 +1,7 @@
 // 儲存層：Cloudflare D1 與 Node 內建 SQLite 共用同一套 SQL（SQLite 方言），經由 SqlDb 介面存取。
 // 寫入資料一律「序號 +1」與「條件式寫入」放在同一個 batch（交易）中，最後寫入者勝由 SQL 保證，不怕並行請求交錯。
 
-import type { DriverBinding, Entity, Role, ScopeFields, StoredRecord } from './types.ts';
+import type { DriverBinding, Entity, Role, ScopeFields, StoredRecord, WriteSource } from './types.ts';
 import { ENTITIES } from './types.ts';
 
 export interface SqlStatement {
@@ -17,7 +17,26 @@ export interface SqlDb {
   batch(statements: SqlStatement[]): Promise<{ changes: number }[]>;
 }
 
-export const SCHEMA_VERSION = 1;
+/** 資料表版本：1（1.0–1.1）、2（1.2.0：每筆資料的 revision、修改前後歷史、已處理事件）。 */
+export const SCHEMA_VERSION = 2;
+
+/** 1.2.0 新增的資料表（新安裝與從版本 1 遷移共用；都可重複執行）。 */
+export const SCHEMA_V2_TABLES: string[] = [
+  // 修改前後歷史：App、網頁管理、API、連鎖刪除的每一次寫入（新增、修改、刪除）。舊紀錄不覆寫。
+  `CREATE TABLE IF NOT EXISTS fd_record_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, entity TEXT NOT NULL, entity_id TEXT NOT NULL,
+    event_id TEXT, operation TEXT NOT NULL, source TEXT NOT NULL,
+    actor_device TEXT, actor_identity TEXT, actor_name TEXT,
+    before_json TEXT, after_json TEXT, changed_fields TEXT, reason TEXT,
+    seq INTEGER NOT NULL, revision INTEGER NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS fd_history_entity ON fd_record_history (entity, entity_id, id)`,
+  `CREATE INDEX IF NOT EXISTS fd_history_seq ON fd_record_history (seq)`,
+  // 已處理的事件：同一台裝置重送同一個事件時回傳第一次的結果，不重複套用（回應遺失後重送）。
+  `CREATE TABLE IF NOT EXISTS fd_processed_events (
+    device_id TEXT NOT NULL, event_id TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, result_json TEXT, at INTEGER NOT NULL,
+    PRIMARY KEY (device_id, event_id))`,
+  `CREATE INDEX IF NOT EXISTS fd_processed_at ON fd_processed_events (at)`,
+];
 
 export const SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS fd_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)`,
@@ -25,7 +44,7 @@ export const SCHEMA: string[] = [
     entity TEXT NOT NULL, id TEXT NOT NULL, seq INTEGER NOT NULL, modified_at REAL NOT NULL,
     deleted INTEGER NOT NULL DEFAULT 0, payload TEXT,
     driver_uuid TEXT, driver_name TEXT, requester_device TEXT, vehicle_plate TEXT,
-    created_by TEXT, updated_by TEXT, updated_at INTEGER NOT NULL,
+    created_by TEXT, updated_by TEXT, updated_at INTEGER NOT NULL, revision INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (entity, id))`,
   `CREATE INDEX IF NOT EXISTS fd_records_seq ON fd_records (seq)`,
   `CREATE INDEX IF NOT EXISTS fd_records_plate ON fd_records (vehicle_plate)`,
@@ -46,6 +65,7 @@ export const SCHEMA: string[] = [
     latitude REAL NOT NULL, longitude REAL NOT NULL, speed REAL, course REAL, ts REAL NOT NULL, updated_at INTEGER NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS fd_attempts (ip TEXT NOT NULL, at INTEGER NOT NULL)`,
   `CREATE INDEX IF NOT EXISTS fd_attempts_ip ON fd_attempts (ip, at)`,
+  ...SCHEMA_V2_TABLES,
 ];
 
 const BUMP_SEQ: SqlStatement = { sql: `UPDATE fd_meta SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT) WHERE k = 'seq'` };
@@ -115,9 +135,55 @@ interface RecordRow {
   requester_device: string | null;
   vehicle_plate: string | null;
   created_by: string | null;
+  revision: number;
 }
 
-const RECORD_COLUMNS = 'entity, id, seq, modified_at, deleted, payload, driver_uuid, driver_name, requester_device, vehicle_plate, created_by';
+const RECORD_COLUMNS = 'entity, id, seq, modified_at, deleted, payload, driver_uuid, driver_name, requester_device, vehicle_plate, created_by, revision';
+
+export interface HistoryRow {
+  id: number;
+  at: number;
+  entity: string;
+  entity_id: string;
+  event_id: string | null;
+  operation: string;
+  source: string;
+  actor_device: string | null;
+  actor_identity: string | null;
+  actor_name: string | null;
+  before_json: string | null;
+  after_json: string | null;
+  changed_fields: string | null;
+  reason: string | null;
+  seq: number;
+  revision: number;
+}
+
+/** 一次寫入（新增、修改或刪除）的內容與條件。 */
+export interface WriteRequest {
+  entity: Entity;
+  id: string;
+  operation: 'create' | 'update' | 'delete';
+  /** 新的內容；刪除時為 null（改為墓碑）。 */
+  payloadText: string | null;
+  /** 資料的修改時間（2001 起算秒數）；刪除時是刪除的時間。 */
+  modifiedAt: number;
+  /** 最後寫入者勝比較用的事件時間（刪除不比較）。 */
+  eventTime: number;
+  fields: ScopeFields;
+  actor: { identity: string; deviceId: string; name: string };
+  source: WriteSource;
+  eventId: string | null;
+  reason: string | null;
+  /** 讀取時的序號（樂觀並行控制：讀取後被別的請求改過就不寫入，呼叫端重讀、重新授權後重試）；主機上沒有這筆時為 null。 */
+  expectedSeq: number | null;
+  /** 寫入後的版本（讀取時的版本＋1）。 */
+  nextRevision: number;
+  changedFields: string[] | null;
+  /** 冪等：寫入成功時，同一個交易記下這個事件的處理結果。 */
+  processed: { deviceId: string; eventId: string; resultJson: string } | null;
+  now: number;
+}
 
 function toRecord(r: RecordRow): StoredRecord {
   let payload: Record<string, unknown> | null = null;
@@ -140,6 +206,7 @@ function toRecord(r: RecordRow): StoredRecord {
     requesterDevice: r.requester_device,
     vehiclePlate: r.vehicle_plate,
     createdBy: r.created_by,
+    revision: Number(r.revision ?? 0),
   };
 }
 
@@ -152,16 +219,46 @@ export class Repo {
 
   // ───────── 初始化與伺服器資訊 ─────────
 
-  /** 建立資料表（已存在就略過）與伺服器 ID、名稱、序號。 */
+  /** 建立資料表（已存在就略過）與伺服器 ID、名稱、序號，再把舊版本的資料表遷移到目前版本。可以重複執行。 */
   async init(defaultName: string, now: number): Promise<void> {
+    // 已存在的資料庫：fd_records 沒有 revision 欄位時，CREATE INDEX 等敘述仍可執行（遷移再補欄位）
     await this.db.batch(SCHEMA.map((sql) => ({ sql })));
     await this.db.batch([
+      // 新的資料庫直接是最新結構；已有的資料庫保留原本的版本，由 migrate() 逐步升級
       { sql: `INSERT OR IGNORE INTO fd_meta (k, v) VALUES ('schema', ?)`, params: [String(SCHEMA_VERSION)] },
       { sql: `INSERT OR IGNORE INTO fd_meta (k, v) VALUES ('seq', '0')` },
       { sql: `INSERT OR IGNORE INTO fd_meta (k, v) VALUES ('serverId', ?)`, params: [crypto.randomUUID().toUpperCase()] },
       { sql: `INSERT OR IGNORE INTO fd_meta (k, v) VALUES ('name', ?)`, params: [defaultName] },
       { sql: `INSERT OR IGNORE INTO fd_meta (k, v) VALUES ('createdAt', ?)`, params: [String(now)] },
     ]);
+    await this.migrate();
+  }
+
+  /** 目前資料庫的結構版本。 */
+  async schemaVersion(): Promise<number> {
+    const row = await this.db.first<{ v: string }>(`SELECT v FROM fd_meta WHERE k = 'schema'`);
+    return row ? Number(row.v) : 0;
+  }
+
+  /**
+   * 結構遷移（1.2.0 起）：依 fd_meta 的 schema 逐步升級。每一步都可以重複執行（中途失敗後重新啟動會再試），
+   * 同一步的敘述在同一個交易內；完成後才更新版本。升級前請先備份（docs/migration.md）。
+   */
+  async migrate(): Promise<{ from: number; to: number }> {
+    const from = await this.schemaVersion();
+    let v = from;
+    if (v < 2) {
+      const columns = new Set((await this.db.all<{ name: string }>(`PRAGMA table_info(fd_records)`)).map((c) => String(c.name)));
+      const steps: SqlStatement[] = [];
+      if (!columns.has('revision')) steps.push({ sql: `ALTER TABLE fd_records ADD COLUMN revision INTEGER NOT NULL DEFAULT 0` });
+      for (const sql of SCHEMA_V2_TABLES) steps.push({ sql });
+      // 既有資料的版本從 1 開始（之後的寫入再加 1）
+      steps.push({ sql: `UPDATE fd_records SET revision = 1 WHERE revision = 0` });
+      steps.push({ sql: `UPDATE fd_meta SET v = '2' WHERE k = 'schema'` });
+      await this.db.batch(steps);
+      v = 2;
+    }
+    return { from, to: v };
   }
 
   async meta(): Promise<{ serverId: string; name: string }> {
@@ -234,14 +331,26 @@ export class Repo {
     return true;
   }
 
-  async revokeDevice(id: string, now: number): Promise<void> {
-    await this.db.run(`UPDATE fd_devices SET revoked_at = ?, token_hash = NULL WHERE device_id = ? AND revoked_at IS NULL`, [now, id]);
+  /** 其他仍有效的管理員（不含 [id]）存在。寫在同一句 SQL 的條件中，兩位管理員同時互相降級或解除配對時不會一個都不剩。 */
+  private static readonly OTHER_ADMIN = `(SELECT COUNT(*) FROM fd_devices WHERE role = 'admin' AND revoked_at IS NULL AND device_id != ?) > 0`;
+
+  /** 解除配對；最後一位管理員不解除（回傳 false）。 */
+  async revokeDevice(id: string, now: number): Promise<boolean> {
+    const r = await this.db.run(
+      `UPDATE fd_devices SET revoked_at = ?, token_hash = NULL WHERE device_id = ? AND revoked_at IS NULL AND (role != 'admin' OR ${Repo.OTHER_ADMIN})`,
+      [now, id, id],
+    );
+    return r.changes > 0;
   }
 
-  async updateDevice(id: string, role: Role, binding: DriverBinding | null): Promise<void> {
-    await this.db.run(`UPDATE fd_devices SET role = ?, driver_uuid = ?, driver_name = ? WHERE device_id = ?`, [
-      role, binding?.driverUuid ?? null, binding?.driverName ?? null, id,
-    ]);
+  /** 改角色或綁定；把最後一位管理員改成非管理員時不寫入（回傳 false）。 */
+  async updateDevice(id: string, role: Role, binding: DriverBinding | null): Promise<boolean> {
+    const r = await this.db.run(
+      `UPDATE fd_devices SET role = ?, driver_uuid = ?, driver_name = ? WHERE device_id = ?
+         AND (? = 'admin' OR role != 'admin' OR revoked_at IS NOT NULL OR ${Repo.OTHER_ADMIN})`,
+      [role, binding?.driverUuid ?? null, binding?.driverName ?? null, id, role, id],
+    );
+    return r.changes > 0;
   }
 
   // ───────── 配對嘗試次數 ─────────
@@ -290,48 +399,123 @@ export class Repo {
     return row ? toRecord(row) : null;
   }
 
-  /** 建立或修改：主機上沒有，或事件時間嚴格大於現存的修改時間（墓碑是刪除的時間）才寫入。回傳是否寫入。 */
-  async upsertRecord(
-    entity: Entity,
-    id: string,
-    payloadText: string,
-    modifiedAt: number,
-    eventTime: number,
-    fields: ScopeFields,
-    actor: { identity: string; deviceId: string },
-    now: number,
-  ): Promise<boolean> {
-    const results = await this.db.batch([
+  /**
+   * 寫入一筆資料（新增、修改或刪除），與修改前後歷史、已處理事件放在同一個交易（batch）：
+   * - 新增／修改：主機上沒有，或事件時間嚴格大於現存的修改時間（墓碑是刪除的時間）才寫入；
+   * - 刪除：主機上是有效資料時改為墓碑；
+   * - 樂觀並行控制：讀取之後被別的請求改過（序號不同）就不寫入，呼叫端重讀、重新授權後重試——授權與寫入看到同一個版本；
+   * - 每次寫入版本（revision）加 1；歷史記下修改前（交易內讀取）與修改後的內容、來源、身分與原因。
+   * 回傳是否寫入。
+   */
+  async writeRecord(w: WriteRequest): Promise<boolean> {
+    const changed = w.changedFields === null ? null : JSON.stringify(w.changedFields);
+    const history: SqlStatement = {
+      sql: `INSERT INTO fd_record_history (at, entity, entity_id, event_id, operation, source, actor_device, actor_identity, actor_name,
+              before_json, after_json, changed_fields, reason, seq, revision)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT payload FROM fd_records WHERE entity = ? AND id = ? AND deleted = 0), ?, ?, ?, ${CURRENT_SEQ}, ?)`,
+      params: [
+        w.now, w.entity, w.id, w.eventId, w.operation, w.source, w.actor.deviceId, w.actor.identity, w.actor.name,
+        w.entity, w.id, w.payloadText, changed, w.reason, w.nextRevision,
+      ],
+    };
+    const write: SqlStatement =
+      w.payloadText === null
+        ? {
+            sql: `UPDATE fd_records SET deleted = 1, payload = NULL, seq = ${CURRENT_SEQ}, modified_at = ?, updated_by = ?, updated_at = ?,
+                    revision = revision + 1
+                  WHERE entity = ? AND id = ? AND deleted = 0 AND seq = ?`,
+            params: [w.modifiedAt, w.actor.deviceId, w.now, w.entity, w.id, w.expectedSeq ?? -1],
+          }
+        : {
+            sql: `INSERT INTO fd_records (entity, id, seq, modified_at, deleted, payload, driver_uuid, driver_name, requester_device, vehicle_plate,
+                    created_by, updated_by, updated_at, revision)
+                  VALUES (?, ?, ${CURRENT_SEQ}, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                  ON CONFLICT (entity, id) DO UPDATE SET seq = excluded.seq, modified_at = excluded.modified_at,
+                    payload = excluded.payload, driver_uuid = excluded.driver_uuid, driver_name = excluded.driver_name,
+                    requester_device = excluded.requester_device, vehicle_plate = excluded.vehicle_plate,
+                    created_by = CASE WHEN fd_records.deleted = 1 THEN excluded.created_by ELSE fd_records.created_by END,
+                    deleted = 0, updated_by = excluded.updated_by, updated_at = excluded.updated_at, revision = fd_records.revision + 1
+                  WHERE ? > fd_records.modified_at AND fd_records.seq = ?`,
+            params: [
+              w.entity, w.id, w.modifiedAt, w.payloadText, w.fields.driverUuid, w.fields.driverName, w.fields.requesterDevice, w.fields.vehiclePlate,
+              w.actor.identity, w.actor.deviceId, w.now, w.eventTime, w.expectedSeq ?? -1,
+            ],
+          };
+    const written = `EXISTS (SELECT 1 FROM fd_records WHERE entity = ? AND id = ? AND seq = ${CURRENT_SEQ})`;
+    const statements: SqlStatement[] = [
       BUMP_SEQ,
-      {
-        sql: `INSERT INTO fd_records (entity, id, seq, modified_at, deleted, payload, driver_uuid, driver_name, requester_device, vehicle_plate, created_by, updated_by, updated_at)
-              VALUES (?, ?, ${CURRENT_SEQ}, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
-              ON CONFLICT (entity, id) DO UPDATE SET seq = excluded.seq, modified_at = excluded.modified_at,
-                payload = excluded.payload, driver_uuid = excluded.driver_uuid, driver_name = excluded.driver_name,
-                requester_device = excluded.requester_device, vehicle_plate = excluded.vehicle_plate,
-                created_by = CASE WHEN fd_records.deleted = 1 THEN excluded.created_by ELSE fd_records.created_by END,
-                deleted = 0, updated_by = excluded.updated_by, updated_at = excluded.updated_at
-              WHERE ? > fd_records.modified_at`,
-        params: [
-          entity, id, modifiedAt, payloadText, fields.driverUuid, fields.driverName, fields.requesterDevice, fields.vehiclePlate,
-          actor.identity, actor.deviceId, now, eventTime,
-        ],
-      },
-    ]);
-    return results[1].changes > 0;
+      history,
+      write,
+      // 沒有寫入時不留歷史
+      { sql: `DELETE FROM fd_record_history WHERE seq = ${CURRENT_SEQ} AND NOT ${written}`, params: [w.entity, w.id] },
+    ];
+    if (w.processed) {
+      statements.push({
+        sql: `INSERT OR IGNORE INTO fd_processed_events (device_id, event_id, status, reason, result_json, at)
+              SELECT ?, ?, 'applied', NULL, ?, ? WHERE ${written}`,
+        params: [w.processed.deviceId, w.processed.eventId, w.processed.resultJson, w.now, w.entity, w.id],
+      });
+    }
+    const results = await this.db.batch(statements);
+    return results[2].changes > 0;
   }
 
-  /** 改為墓碑（保留查詢欄位）。回傳是否刪除（原本就不存在或已是墓碑時為 false）。 */
-  async tombstone(entity: Entity, id: string, at: number, deviceId: string, now: number): Promise<boolean> {
-    const results = await this.db.batch([
-      BUMP_SEQ,
-      {
-        sql: `UPDATE fd_records SET deleted = 1, payload = NULL, seq = ${CURRENT_SEQ}, modified_at = ?, updated_by = ?, updated_at = ?
-              WHERE entity = ? AND id = ? AND deleted = 0`,
-        params: [at, deviceId, now, entity, id],
-      },
-    ]);
-    return results[1].changes > 0;
+  // ───────── 已處理的事件（冪等） ─────────
+
+  async processedResult(deviceId: string, eventId: string): Promise<string | null> {
+    const row = await this.db.first<{ result_json: string | null }>(
+      `SELECT result_json FROM fd_processed_events WHERE device_id = ? AND event_id = ?`,
+      [deviceId, eventId],
+    );
+    return row?.result_json ?? null;
+  }
+
+  /** 記下沒有寫入資料的結果（拒絕、略過、衝突）；同一個事件已有結果時保留第一次的。 */
+  async recordProcessed(deviceId: string, eventId: string, status: string, reason: string | null, resultJson: string, now: number): Promise<void> {
+    await this.db.run(
+      `INSERT OR IGNORE INTO fd_processed_events (device_id, event_id, status, reason, result_json, at) VALUES (?, ?, ?, ?, ?, ?)`,
+      [deviceId, eventId, status, reason, resultJson, now],
+    );
+  }
+
+  /** 清除過舊的已處理事件（重送通常在幾分鐘內；保留 30 天）。 */
+  async purgeProcessed(before: number): Promise<void> {
+    await this.db.run(`DELETE FROM fd_processed_events WHERE at < ?`, [before]);
+  }
+
+  // ───────── 修改前後歷史 ─────────
+
+  async listHistory(filter: { entity: Entity | null; id: string | null; before: number | null; limit: number }): Promise<HistoryRow[]> {
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (filter.entity) {
+      where.push('entity = ?');
+      params.push(filter.entity);
+    }
+    if (filter.id) {
+      where.push('entity_id = ?');
+      params.push(filter.id);
+    }
+    if (filter.before !== null) {
+      where.push('id < ?');
+      params.push(filter.before);
+    }
+    params.push(filter.limit);
+    return this.db.all<HistoryRow>(
+      `SELECT * FROM fd_record_history ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY id DESC LIMIT ?`,
+      params,
+    );
+  }
+
+  // ───────── 業務規則 ─────────
+
+  /** 這個車牌還沒回車的車趟數（有進行中車趟的車輛不能刪除）。 */
+  async activeTripsOfPlate(plate: string): Promise<number> {
+    const row = await this.db.first<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM fd_records WHERE entity = 'trip' AND deleted = 0 AND vehicle_plate = ? AND json_extract(payload, '$.isCompleted') = 0`,
+      [plate],
+    );
+    return row ? Number(row.n) : 0;
   }
 
   /** 車牌相同的子資料（刪除車輛時連鎖刪除）。 */

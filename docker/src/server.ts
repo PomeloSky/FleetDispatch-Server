@@ -8,6 +8,7 @@ import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import { randomBytes } from 'node:crypto';
 
 import type { SqlDb, SqlStatement } from '../../core/src/db.ts';
+import { SCHEMA_VERSION } from '../../core/src/db.ts';
 import { handleRequest, LIMITS } from '../../core/src/handler.ts';
 import type { ServerConfig } from '../../core/src/types.ts';
 import { SERVER_VERSION } from '../../core/src/version.ts';
@@ -96,7 +97,29 @@ const config: ServerConfig = {
   defaultName: process.env.FD_SERVER_NAME?.trim() || 'FleetDispatch Server',
   adminPath: admin.path,
 };
-const db = new NodeSqliteDb(join(dataDir, 'fleetdispatch.sqlite'));
+const dbFile = join(dataDir, 'fleetdispatch.sqlite');
+const db = new NodeSqliteDb(dbFile);
+
+/**
+ * 升級資料表前自動備份（1.2.0）：資料庫是舊版本時，先以 VACUUM INTO 複製一份一致的快照
+ * `fleetdispatch.sqlite.before-v<新版本>-<時間>.bak`，再由第一個請求執行遷移（可重複執行）。
+ */
+function backupBeforeMigration(): void {
+  let version: number;
+  try {
+    const row = db.db.prepare(`SELECT v FROM fd_meta WHERE k = 'schema'`).get() as { v: string } | undefined;
+    if (!row) return;
+    version = Number(row.v);
+  } catch {
+    return; // 新的資料庫：沒有東西要備份
+  }
+  if (!(version < SCHEMA_VERSION)) return;
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const target = `${dbFile}.before-v${SCHEMA_VERSION}-${stamp}.bak`;
+  db.db.exec(`VACUUM INTO '${target.replace(/'/g, "''")}'`);
+  console.log(`資料表將由版本 ${version} 升級到 ${SCHEMA_VERSION}；升級前的備份：${target}`);
+}
+backupBeforeMigration();
 
 /** 來源 IP：X-Forwarded-For 最左邊的值由用戶端自己填、可以偽造，只採用信任的代理在右邊附加的值。 */
 function clientIp(req: IncomingMessage): string {

@@ -5,6 +5,7 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 - 傳輸：HTTPS，JSON（UTF-8）。所有端點在 `<基底網址>/api/v1/` 之下；基底網址可以含路徑（例如 `https://example.com/fleet`）。
   PHP 主機無法設定網址改寫時，也接受 `<基底網址>/index.php/api/v1/…`。
 - 版本：`/api/v1` 與 `GET /info` 的 `apiVersion: 1`。不相容的變更才會出 v2；新增欄位一律選填，用戶端必須忽略不認得的欄位。
+  1.2.0 新增的能力（冪等、revision 與衝突、修改前後歷史）以 `GET /info` 的 `features` 宣告；舊版 App 不使用，照舊運作（§14）。
 - 時間：API 外層的時間（`time`、`expiresAt`…）是 **1970 起算的毫秒整數**。資料內容（車趟、車輛…）沿用 App 的資料格式：
   **2001-01-01 UTC 起算的秒數（浮點數）**，下文稱「Apple 秒」。
 - UUID：8-4-4-4-12 的十六進位，主機一律轉成大寫儲存與比對。
@@ -119,21 +120,27 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 
 | 欄位 | 型別 | 說明 |
 | --- | --- | --- |
-| `id` | 字串 | 事件 UUID（只用於回應中對應結果） |
+| `id` | 字串 | 事件 UUID：回應中對應結果；1.2.0 起也是冪等的鍵（同一台裝置重送同一個 `id` 回傳第一次的結果，見下方） |
 | `timestamp` | 數字 | 事件時間（Apple 秒）；最後寫入者勝的比較依據 |
 | `actor` | 字串 | 送出者名稱（顯示用，主機不採信，以權杖的裝置為準） |
 | `entity` | 字串 | §1 的種類 |
 | `operation` | 字串 | `create`、`update`、`delete` |
 | `entityID` | 字串 | 資料的 UUID |
 | `payloadJSON` | 字串 | 資料內容的 **JSON 字串**；刪除時可以是空字串 |
+| `expectedRevision` | 整數（選填，1.2.0） | 送出者看到的版本（§6 的 `revision`）。與主機上的版本不同時不寫入、回傳 `conflict`；沒有這筆資料時版本是 0。不帶時依最後寫入者勝 |
 
 限制：每次最多 500 筆、請求本體最多 5 MB、單筆內容最多 1 MB；超過回 `413 payload_too_large` 或 `400 invalid_request`。
 
 處理順序（逐筆、依陣列順序，每一筆自成一個交易）：
 
 1. **格式**：種類、操作、UUID 不合法，或建立／修改的內容不是 JSON 物件、`entityUUID` 與 `entityID` 不同（不分大小寫）、`lastModifiedAt` 不是數字 →
-   `rejected`（`invalid-payload`）。
-2. **授權**：§2.1。不允許 → `rejected`（原因碼）。
+   `rejected`（`invalid-payload`）。`expectedRevision` 不是非負整數 → `rejected`（`invalid-expected-revision`）。
+   **冪等（1.2.0）**：同一台裝置（權杖）已處理過同一個事件 `id`（1–100 字元）時，直接回傳第一次的結果並加上 `"duplicate": true`，
+   不重複寫入、不重複稽核與歷史（回應遺失後重送是安全的）。已處理的事件保留 30 天。
+2. **授權**：§2.1。不允許 → `rejected`（原因碼）。授權與寫入看到同一個版本（PHP 在寫入鎖內讀取；TypeScript 版以讀取時的序號作為寫入條件，
+   期間被改過就重讀、重新授權後重試，連續失敗回 `503 busy`，整批可安全重送）。
+   **版本（1.2.0）**：帶了 `expectedRevision` 且與主機上的版本不同 → `conflict`（`revision-mismatch`），結果附 `revision`（目前的版本）與
+   `current: { revision, modifiedAt, deleted }`。
 3. **時間校正**：建立／修改時，`timestamp` 或內容的 `lastModifiedAt` 晚於主機現在時間，兩者都改成主機現在時間（Apple 秒），
    並在結果附上校正後的事件（`event`），送出者必須套用它。
 4. **最後寫入者勝**：
@@ -141,9 +148,13 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
      比刪除更舊的修改不會讓資料復活。
      寫入時保存內容、`lastModifiedAt`（取自內容）、查詢欄位，取得新的序號。
    - 刪除：主機上有這筆（不是墓碑）就改為墓碑並取得新的序號；沒有就 `ignored`。
+   - **伺服器端的業務規則（1.2.0）**：還有未回車車趟（同車牌、`isCompleted: false`）的車輛不能刪除 → `rejected`（`vehicle-has-active-trips`）。
+   - 每次寫入（含刪除）該筆資料的 `revision` 加 1（新資料是 1；1.1.0 升級上來的既有資料是 1）。
 5. **連鎖刪除**：刪除車輛時，車牌（`vehiclePlateNumber`）等於該車輛 `plateNumber` 的 `trip`、`maintenance`、`maintenanceItem`、`workOrder`、`inspection`
    一併改為墓碑（各自取得新的序號）。刪除車趟或車趟改為已完成（`isCompleted: true`）時，移除它的即時位置。
 6. **稽核紀錄**：寫入或刪除成功時記一筆（§7）。
+7. **修改前後歷史（1.2.0）**：每次寫入（App、網頁管理、連鎖刪除）在同一個交易記下修改前與修改後的內容、變更的欄位、來源、身分、原因、
+   序號與版本（§7.1）。沒有寫入時不留紀錄；舊紀錄不覆寫。
 
 回應 `200`：
 
@@ -153,11 +164,16 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
     { "id": "事件 UUID", "status": "applied" },
     { "id": "…", "status": "applied", "event": { 校正後的 SyncEvent } },
     { "id": "…", "status": "ignored" },
-    { "id": "…", "status": "rejected", "reason": "not-own-trip" }
+    { "id": "…", "status": "rejected", "reason": "not-own-trip" },
+    { "id": "…", "status": "applied", "revision": 3 },
+    { "id": "…", "status": "applied", "revision": 3, "duplicate": true },
+    { "id": "…", "status": "conflict", "reason": "revision-mismatch", "revision": 4, "current": { "revision": 4, "modifiedAt": 815000000.5, "deleted": false } }
   ],
   "cursor": 1234
 }
 ```
+
+1.2.0 起 `applied` 的結果附 `revision`（寫入後的版本）。`conflict` 只會回給帶了 `expectedRevision` 的事件。
 
 - `cursor` 是處理完後主機目前的最大序號。
 - 用戶端收到 `rejected` 時，應提示使用者並以全量同步（§6）回復成主機的狀態。
@@ -197,6 +213,8 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 - 十個陣列一定都要有（可以是空陣列），內容是資料物件（不是字串），不含墓碑。
 - `cursor` 必須在讀取資料**之前**取得：快照之後的變更一定會出現在 `GET /changes?since=cursor`（可能重複，用戶端以最後寫入者勝處理）。
 - `authoritative: true`：用戶端依自己的規則移除主機沒有的資料（App 已有的規則：待送的、剛送出的、5 分鐘內修改的不移除；異常的大量移除不執行）。
+
+1.2.0 起回應另有 `revisions`：`{ "<種類>:<UUID>": 版本, … }`（看得到的每一筆資料目前的版本），用戶端修改時可帶 `expectedRevision`。
 
 ### 6.2 增量 `GET /api/v1/changes?since=<序號>&limit=<筆數>`
 
@@ -250,7 +268,32 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 
 `Device`：`{ "deviceId", "name", "platform", "role", "driverBinding", "pairedAt", "lastSeenAt", "tokenExpiresAt", "revokedAt" }`（時間為毫秒，沒有時 `null`）。
 
-限制：最後一位有效的管理員不能被降級或解除配對（`409 last_admin`）。
+限制：最後一位有效的管理員不能被降級或解除配對（`409 last_admin`）。1.2.0 起這個檢查與更新是同一個不可分割的操作：兩位管理員同時互相降級或解除配對時，
+至少留下一位。
+
+### 7.1 修改前後歷史 `GET /admin/history?entity=<種類>&id=<UUID>&before=<id>&limit=<筆數>`（1.2.0）
+
+只有管理員。新的在前；`limit` 預設 50、最多 200；`entity`、`id` 可省略。
+
+```json
+{
+  "entries": [
+    {
+      "id": 812, "at": 1793616000000, "entity": "vehicle", "entityId": "UUID", "eventId": "事件 UUID 或 null",
+      "operation": "update", "source": "app",
+      "actor": { "deviceId": "UUID", "identity": "配對身分", "name": "裝置名稱" },
+      "before": { 修改前的內容 }, "after": { 修改後的內容 }, "changedFields": ["custodian"],
+      "reason": null, "seq": 1234, "revision": 3
+    }
+  ],
+  "next": 811
+}
+```
+
+- `operation`：`create`、`update`、`delete`；刪除時 `after` 是 `null`，新增時 `before` 是 `null`。
+- `source`：`app`（App 的事件）、`cascade`（刪除車輛的連鎖刪除，`reason: "vehicle-deleted"`）；之後的網頁管理修改為 `web`。
+- `changedFields`：第一層的鍵，不含 `lastModifiedAt`；新增時是所有欄位。
+- 歷史只給管理員：內容包含駕駛人的個資（證號、電話）。保留期限與遮蔽設定見 `docs/audit-history.md`。
 
 稽核紀錄的 `summary`：資料內容 JSON 的前 2,000 個字元（刪除時是空字串）；`operation` 是 `create`、`update`、`delete`；連鎖刪除也各記一筆。
 
@@ -271,10 +314,12 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
   "product": "FleetDispatch Server", "apiVersion": 1, "serverVersion": "1.0.0", "variant": "docker",
   "serverId": "UUID", "name": "優良運輸", "time": 1793616000000,
   "setupRequired": false, "setupConfigured": true,
-  "features": ["liveLocations", "audit"],
+  "features": ["liveLocations", "audit", "idempotency", "revision", "history"], "schemaVersion": 2,
   "limits": { "maxEventsPerRequest": 500, "maxBodyBytes": 5242880 }
 }
 ```
+
+- `features`（1.2.0 新增 `idempotency`、`revision`、`history`）：用戶端只在主機宣告時使用對應的能力。`schemaVersion`：資料表版本（1.2.0 是 2）。
 
 - `variant`：`cloudflare`、`php`、`docker`。
 - `setupRequired`：沒有任何有效的管理員（下一次配對要用設定碼）。`setupConfigured`：部署時有設定設定碼。
@@ -319,6 +364,7 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 | 409 | `device_conflict`、`last_admin`、`setup_not_configured` | 見上 |
 | 413 | `payload_too_large` | 請求本體超過限制 |
 | 429 | `rate_limited` | 配對嘗試太多次（附 `Retry-After`） |
+| 503 | `busy` | 同一筆資料被連續修改，這批事件稍後重送（附 `Retry-After`；1.2.0 起事件冪等，重送安全） |
 | 500 | `server_error` | 主機內部錯誤（不得洩漏堆疊或 SQL） |
 
 ## 11. 安全要求（三種實作都必須遵守）
@@ -373,3 +419,12 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
   錯誤時 `403 invalid_install_key`，並計入嘗試次數限制）。程式資料夾不能寫入時不提供安裝（`409 not_writable`）。
   安裝完成後刪除金鑰檔，這些路徑照一般 API 回 `404`。測試：`conformance/php-install.test.mjs`。
 
+## 14. 版本與相容性（1.2.0）
+
+| 主機 | App 8.0（build 19） | App 8.1 |
+| --- | --- | --- |
+| 1.0.x、1.1.x | 支援 | 支援（不使用 1.2.0 的能力） |
+| 1.2.0 | 支援：不帶 `expectedRevision`、不讀 `revision`／`revisions`／`duplicate`，行為與 1.1 相同；刪除有進行中車趟的車輛會被拒絕（App 本身也不允許） | 支援 |
+
+- 資料表版本 2：第一次請求時自動遷移，可重複執行；升級前的備份與降版限制見 `docs/migration.md`。
+- 新的結果狀態 `conflict` 只會回給帶了 `expectedRevision` 的用戶端。

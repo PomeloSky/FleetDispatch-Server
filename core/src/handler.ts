@@ -2,7 +2,7 @@
 // Cloudflare Workers 直接使用；Docker 版由 node:http 轉接。
 
 import { constantTimeEqual, newPairingCode, newToken, normalizePairingCode, sha256Hex } from './crypto.ts';
-import type { DeviceRow, SqlDb } from './db.ts';
+import type { DeviceRow, HistoryRow, SqlDb } from './db.ts';
 import { Repo } from './db.ts';
 import { authorize, outgoingPayload, parseBinding, scopeFields, validateEvent, visible } from './rules.ts';
 import type { DriverBinding, Entity, EventResult, Role, ServerConfig, Session, SyncEvent } from './types.ts';
@@ -27,6 +27,54 @@ export interface RequestContext {
 }
 
 const initialized = new WeakMap<SqlDb, Promise<void>>();
+const lastPurge = new WeakMap<SqlDb, number>();
+/** 已處理事件的保留期間。 */
+const PROCESSED_TTL_MS = 30 * 24 * 3600 * 1000;
+
+type ValidEvent = Extract<ReturnType<typeof validateEvent>, { ok: true }>;
+
+/** 事件的 `expectedRevision`（1.2.0，選填）：沒有時 null；不是非負整數時 undefined（拒絕）。 */
+function optionalRevision(raw: unknown): number | null | undefined {
+  if (!isObject(raw) || raw.expectedRevision === undefined || raw.expectedRevision === null) return null;
+  const n = raw.expectedRevision;
+  return typeof n === 'number' && Number.isInteger(n) && n >= 0 ? n : undefined;
+}
+
+/** 修改的欄位（第一層的鍵；不含每次都會變的 lastModifiedAt）。新增時是所有欄位。 */
+function changedFields(before: Record<string, unknown> | null, after: Record<string, unknown>): string[] {
+  const keys = new Set([...Object.keys(before ?? {}), ...Object.keys(after)]);
+  keys.delete('lastModifiedAt');
+  return [...keys].filter((k) => JSON.stringify(before?.[k]) !== JSON.stringify(after[k])).sort();
+}
+
+function parseJson(text: string | null): unknown {
+  if (text === null) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+/** 修改前後歷史的一筆（API 回傳）。 */
+export function historyJson(r: HistoryRow) {
+  return {
+    id: Number(r.id),
+    at: Number(r.at),
+    entity: r.entity,
+    entityId: r.entity_id,
+    eventId: r.event_id,
+    operation: r.operation,
+    source: r.source,
+    actor: { deviceId: r.actor_device, identity: r.actor_identity, name: r.actor_name },
+    before: parseJson(r.before_json),
+    after: parseJson(r.after_json),
+    changedFields: (parseJson(r.changed_fields) as string[] | null) ?? null,
+    reason: r.reason,
+    seq: Number(r.seq),
+    revision: Number(r.revision),
+  };
+}
 
 /** 每個資料庫連線（Worker isolate、Node 程序）只建立一次資料表（CREATE TABLE IF NOT EXISTS）。 */
 function ensureInit(repo: Repo, config: ServerConfig): Promise<void> {
@@ -55,6 +103,7 @@ const ROUTES: [string, string[]][] = [
   ['admin/pairing-codes/*', ['DELETE']],
   ['admin/server', ['PATCH']],
   ['admin/audit', ['GET']],
+  ['admin/history', ['GET']],
 ];
 
 function matchRoute(seg: string[]): [string, string[]] | null {
@@ -195,6 +244,7 @@ export class Api {
       if (is('DELETE', 'admin/pairing-codes/*')) return this.deleteCode(seg[2]);
       if (is('PATCH', 'admin/server')) return json(await this.rename(await readJson(request)));
       if (is('GET', 'admin/audit')) return json(await this.audit(url));
+      if (is('GET', 'admin/history')) return json(await this.history(url));
     }
     throw new ApiError(404, 'not_found', '找不到這個端點');
   }
@@ -213,7 +263,10 @@ export class Api {
       time: nowMs(),
       setupRequired: (await this.repo.countActiveAdmins()) === 0,
       setupConfigured: this.config.setupToken !== null,
-      features: ['liveLocations', 'audit'],
+      // 1.2.0：idempotency（重送同一個事件回傳第一次的結果）、revision（每筆資料的版本、expectedRevision 與 conflict）、
+      // history（修改前後歷史）。舊版 App 不使用這些能力，照舊運作。
+      features: ['liveLocations', 'audit', 'idempotency', 'revision', 'history'],
+      schemaVersion: await this.repo.schemaVersion(),
       limits: { maxEventsPerRequest: LIMITS.maxEventsPerRequest, maxBodyBytes: LIMITS.maxBodyBytes },
     };
   }
@@ -312,10 +365,9 @@ export class Api {
   }
 
   private async unpairSelf(s: Session): Promise<Response> {
-    if (s.role === 'admin' && (await this.repo.countActiveAdmins()) <= 1) {
+    if (!(await this.repo.revokeDevice(s.deviceId, nowMs()))) {
       throw new ApiError(409, 'last_admin', '最後一位管理員不能解除配對');
     }
-    await this.repo.revokeDevice(s.deviceId, nowMs());
     return noContent();
   }
 
@@ -325,12 +377,15 @@ export class Api {
     const cursor = await this.repo.currentSeq();
     const out: Record<string, unknown> = {};
     for (const e of ENTITIES) out[SNAPSHOT_KEYS[e]] = [];
+    const revisions: Record<string, number> = {};
     for (const r of await this.repo.allLive()) {
       if (!r.payload || !visible(s, r)) continue;
       (out[SNAPSHOT_KEYS[r.entity]] as unknown[]).push(outgoingPayload(s, r.entity, r.id, r.payload));
+      revisions[`${r.entity}:${r.id}`] = r.revision;
     }
     out.authoritative = true;
-    return { cursor, snapshot: out, session: await this.sessionJson(s) };
+    // revisions（1.2.0）：每筆資料目前的版本（`<種類>:<UUID>`），用戶端修改時可帶 expectedRevision
+    return { cursor, snapshot: out, revisions, session: await this.sessionJson(s) };
   }
 
   async changes(s: Session, url: URL) {
@@ -346,6 +401,7 @@ export class Api {
         id: r.id,
         deleted: r.deleted,
         modifiedAt: r.modifiedAt,
+        revision: r.revision,
         payload: r.deleted || !r.payload ? null : outgoingPayload(s, r.entity, r.id, r.payload),
       });
     }
@@ -359,72 +415,138 @@ export class Api {
     const list = body.events;
     if (!Array.isArray(list)) throw badRequest('需要 events 陣列');
     if (list.length > LIMITS.maxEventsPerRequest) throw badRequest(`每次最多 ${LIMITS.maxEventsPerRequest} 筆事件`);
+    await this.purgeProcessedOccasionally();
     const results: EventResult[] = [];
     for (const raw of list) results.push(await this.applyEvent(s, raw));
     return { results, cursor: await this.repo.currentSeq() };
   }
 
+  /** 已處理事件保留 30 天；每個執行環境最多每小時清一次。 */
+  private async purgeProcessedOccasionally(): Promise<void> {
+    const now = nowMs();
+    if (now - (lastPurge.get(this.repo.db) ?? 0) < 3600 * 1000) return;
+    lastPurge.set(this.repo.db, now);
+    await this.repo.purgeProcessed(now - PROCESSED_TTL_MS);
+  }
+
+  /**
+   * 套用一筆事件。冪等（1.2.0）：同一台裝置重送同一個事件 ID 時回傳第一次的結果，不重複寫入、不重複稽核。
+   */
   private async applyEvent(s: Session, raw: unknown): Promise<EventResult> {
     const v = validateEvent(raw);
     if (!v.ok) return { id: v.id, status: 'rejected', reason: v.reason };
-    if (v.payloadText.length > LIMITS.maxPayloadBytes) return { id: v.id, status: 'rejected', reason: 'payload-too-large' };
-    const existing = await this.repo.getRecord(v.entity, v.entityId);
-    const decision = authorize(s, v.entity, v.op, v.payload, existing);
-    if (!decision.allow) return { id: v.id, status: 'rejected', reason: decision.reason };
-
-    const now = nowMs();
-    const nowApple = msToApple(now);
-
-    if (v.op === 'delete') {
-      const at = Math.min(v.timestamp, nowApple);
-      if (!(await this.repo.tombstone(v.entity, v.entityId, at, s.deviceId, now))) return { id: v.id, status: 'ignored' };
-      await this.logAudit(s, v.entity, v.entityId, 'delete', '', now);
-      if (v.entity === 'trip') await this.repo.deleteLocation(v.entityId);
-      if (v.entity === 'vehicle' && existing?.vehiclePlate) await this.cascadeVehicle(s, existing.vehiclePlate, at, now);
-      return { id: v.id, status: 'applied' };
+    const eventId = v.id.trim().length > 0 && v.id.length <= 100 ? v.id : null;
+    if (eventId) {
+      const prior = await this.repo.processedResult(s.deviceId, eventId);
+      if (prior) {
+        try {
+          return { ...(JSON.parse(prior) as EventResult), duplicate: true };
+        } catch {
+          // 紀錄壞掉時重新處理（寫入本身仍受最後寫入者勝保護）
+        }
+      }
     }
-
-    // 建立／修改：時間校正 → 最後寫入者勝（SQL 中的條件式寫入）。
-    const payload = v.payload!;
-    let timestamp = v.timestamp;
-    let payloadText = v.payloadText;
-    let restamped = false;
-    const modified = num(payload.lastModifiedAt)!;
-    if (timestamp > nowApple || modified > nowApple) {
-      timestamp = Math.min(timestamp, nowApple);
-      payload.lastModifiedAt = Math.min(modified, nowApple);
-      payloadText = JSON.stringify(payload);
-      restamped = true;
-    }
-    // 最後寫入者勝：墓碑的修改時間是刪除的時間，比刪除舊的修改不會讓資料復活。
-    if (existing && !(timestamp > existing.modifiedAt)) return { id: v.id, status: 'ignored' };
-    const live = existing && !existing.deleted ? existing : null;
-    const applied = await this.repo.upsertRecord(
-      v.entity,
-      v.entityId,
-      payloadText,
-      num(payload.lastModifiedAt)!,
-      timestamp,
-      scopeFields(v.entity, payload),
-      { identity: s.identity, deviceId: s.deviceId },
-      now,
-    );
-    if (!applied) return { id: v.id, status: 'ignored' };
-    await this.logAudit(s, v.entity, v.entityId, live ? 'update' : 'create', payloadText, now);
-    if (v.entity === 'trip' && payload.isCompleted === true) await this.repo.deleteLocation(v.entityId);
-    const result: EventResult = { id: v.id, status: 'applied' };
-    if (restamped) {
-      const ev = raw as SyncEvent;
-      result.event = { ...ev, timestamp, payloadJSON: payloadText };
+    const result = await this.applyValidated(s, v, raw, eventId);
+    if (eventId && result.status !== 'applied') {
+      await this.repo.recordProcessed(s.deviceId, eventId, result.status, result.reason ?? null, JSON.stringify(result), nowMs());
     }
     return result;
   }
 
+  private async applyValidated(s: Session, v: ValidEvent, raw: unknown, eventId: string | null): Promise<EventResult> {
+    if (v.payloadText.length > LIMITS.maxPayloadBytes) return { id: v.id, status: 'rejected', reason: 'payload-too-large' };
+    const expectedRevision = optionalRevision(raw);
+    if (expectedRevision === undefined) return { id: v.id, status: 'rejected', reason: 'invalid-expected-revision' };
+    const actor = { identity: s.identity, deviceId: s.deviceId, name: s.deviceName };
+
+    // 樂觀並行控制：讀取 → 授權 → 以讀到的序號為條件寫入；期間被別的請求改過就重讀、重新授權（授權與寫入看到同一個版本）。
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const existing = await this.repo.getRecord(v.entity, v.entityId);
+      const decision = authorize(s, v.entity, v.op, v.payload, existing);
+      if (!decision.allow) return { id: v.id, status: 'rejected', reason: decision.reason };
+      const live = existing && !existing.deleted ? existing : null;
+      const currentRevision = existing?.revision ?? 0;
+      if (expectedRevision !== null && expectedRevision !== currentRevision) {
+        return {
+          id: v.id,
+          status: 'conflict',
+          reason: 'revision-mismatch',
+          revision: currentRevision,
+          current: existing ? { revision: existing.revision, modifiedAt: existing.modifiedAt, deleted: existing.deleted } : undefined,
+        };
+      }
+      const now = nowMs();
+      const nowApple = msToApple(now);
+      const nextRevision = currentRevision + 1;
+      const processed = (result: EventResult) => (eventId ? { deviceId: s.deviceId, eventId, resultJson: JSON.stringify(result) } : null);
+
+      if (v.op === 'delete') {
+        if (!live) return { id: v.id, status: 'ignored' };
+        // 伺服器端的業務規則（1.2.0）：還有進行中車趟的車輛不能刪除（App 也有相同規則）。
+        if (v.entity === 'vehicle' && live.vehiclePlate && (await this.repo.activeTripsOfPlate(live.vehiclePlate)) > 0) {
+          return { id: v.id, status: 'rejected', reason: 'vehicle-has-active-trips' };
+        }
+        const at = Math.min(v.timestamp, nowApple);
+        const result: EventResult = { id: v.id, status: 'applied', revision: nextRevision };
+        const ok = await this.repo.writeRecord({
+          entity: v.entity, id: v.entityId, operation: 'delete', payloadText: null, modifiedAt: at, eventTime: at,
+          fields: live, actor, source: 'app', eventId, reason: null, expectedSeq: live.seq, nextRevision,
+          changedFields: null, processed: processed(result), now,
+        });
+        if (!ok) continue;
+        await this.logAudit(s, v.entity, v.entityId, 'delete', '', now);
+        if (v.entity === 'trip') await this.repo.deleteLocation(v.entityId);
+        if (v.entity === 'vehicle' && live.vehiclePlate) await this.cascadeVehicle(s, live.vehiclePlate, at, now);
+        return result;
+      }
+
+      // 建立／修改：時間校正 → 最後寫入者勝（SQL 中的條件式寫入）。
+      const payload = { ...v.payload! };
+      let timestamp = v.timestamp;
+      let payloadText = v.payloadText;
+      let restamped = false;
+      const modified = num(payload.lastModifiedAt)!;
+      if (timestamp > nowApple || modified > nowApple) {
+        timestamp = Math.min(timestamp, nowApple);
+        payload.lastModifiedAt = Math.min(modified, nowApple);
+        payloadText = JSON.stringify(payload);
+        restamped = true;
+      }
+      // 最後寫入者勝：墓碑的修改時間是刪除的時間，比刪除舊的修改不會讓資料復活。
+      if (existing && !(timestamp > existing.modifiedAt)) return { id: v.id, status: 'ignored' };
+      const result: EventResult = { id: v.id, status: 'applied', revision: nextRevision };
+      if (restamped) result.event = { ...(raw as SyncEvent), timestamp, payloadJSON: payloadText };
+      const ok = await this.repo.writeRecord({
+        entity: v.entity, id: v.entityId, operation: live ? 'update' : 'create', payloadText,
+        modifiedAt: num(payload.lastModifiedAt)!, eventTime: timestamp, fields: scopeFields(v.entity, payload), actor, source: 'app',
+        eventId, reason: null, expectedSeq: existing?.seq ?? null, nextRevision, changedFields: changedFields(live?.payload ?? null, payload),
+        processed: processed(result), now,
+      });
+      if (!ok) continue;
+      await this.logAudit(s, v.entity, v.entityId, live ? 'update' : 'create', payloadText, now);
+      if (v.entity === 'trip' && payload.isCompleted === true) await this.repo.deleteLocation(v.entityId);
+      return result;
+    }
+    // 同一筆資料被連續改動：整批請求稍後重送（事件冪等，重送安全）
+    throw new ApiError(503, 'busy', '主機忙碌，請稍後再試', 1);
+  }
+
+  /** 刪除車輛時連鎖刪除同車牌的車趟、保養、工單、巡檢（來源 cascade，留下歷史）。 */
   private async cascadeVehicle(s: Session, plate: string, at: number, now: number): Promise<void> {
+    const actor = { identity: s.identity, deviceId: s.deviceId, name: s.deviceName };
     for (const child of await this.repo.liveChildrenOfPlate(plate, VEHICLE_CHILDREN)) {
-      if (await this.repo.tombstone(child.entity, child.id, at, s.deviceId, now)) {
-        await this.logAudit(s, child.entity, child.id, 'delete', '', now);
-        if (child.entity === 'trip') await this.repo.deleteLocation(child.id);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const rec = await this.repo.getRecord(child.entity, child.id);
+        if (!rec || rec.deleted) break;
+        const ok = await this.repo.writeRecord({
+          entity: rec.entity, id: rec.id, operation: 'delete', payloadText: null, modifiedAt: at, eventTime: at, fields: rec, actor,
+          source: 'cascade', eventId: null, reason: 'vehicle-deleted', expectedSeq: rec.seq, nextRevision: rec.revision + 1,
+          changedFields: null, processed: null, now,
+        });
+        if (!ok) continue;
+        await this.logAudit(s, rec.entity, rec.id, 'delete', '', now);
+        if (rec.entity === 'trip') await this.repo.deleteLocation(rec.id);
+        break;
       }
     }
   }
@@ -517,10 +639,10 @@ export class Api {
       binding = b;
     }
     if (role !== 'driver') binding = null;
-    if (d.role === 'admin' && role !== 'admin' && d.revoked_at === null && (await this.repo.countActiveAdmins()) <= 1) {
+    // 最後一位管理員的檢查在同一句 SQL（兩位管理員同時互相降級時不會一個都不剩）
+    if (!(await this.repo.updateDevice(id, role, binding))) {
       throw new ApiError(409, 'last_admin', '最後一位管理員不能降級');
     }
-    await this.repo.updateDevice(id, role, binding);
     return deviceJson((await this.repo.deviceById(id))!);
   }
 
@@ -529,10 +651,9 @@ export class Api {
     if (!id) throw badRequest('裝置 ID 必須是 UUID');
     const d = await this.repo.deviceById(id);
     if (!d) throw new ApiError(404, 'not_found', '找不到這台裝置');
-    if (d.role === 'admin' && d.revoked_at === null && (await this.repo.countActiveAdmins()) <= 1) {
+    if (d.revoked_at === null && !(await this.repo.revokeDevice(id, nowMs()))) {
       throw new ApiError(409, 'last_admin', '最後一位管理員不能解除配對');
     }
-    await this.repo.revokeDevice(id, nowMs());
     return noContent();
   }
 
@@ -591,6 +712,20 @@ export class Api {
     if (!name) throw badRequest('name 必須是 1–100 個字元');
     await this.repo.setName(name);
     return this.info();
+  }
+
+  /** 修改前後歷史（1.2.0；只有管理員）：依種類、資料 ID 篩選，新到舊分頁。 */
+  private async history(url: URL) {
+    const limit = intParam(url, 'limit', 50, 1, 200);
+    const beforeRaw = url.searchParams.get('before');
+    const before = beforeRaw === null || beforeRaw === '' ? null : intParam(url, 'before', 0, 0, Number.MAX_SAFE_INTEGER);
+    const entityRaw = url.searchParams.get('entity');
+    if (entityRaw !== null && !(ENTITIES as readonly string[]).includes(entityRaw)) throw badRequest('entity 不正確');
+    const idRaw = url.searchParams.get('id');
+    const id = idRaw === null ? null : normalizeUuid(idRaw);
+    if (idRaw !== null && id === null) throw badRequest('id 必須是 UUID');
+    const rows = await this.repo.listHistory({ entity: entityRaw as Entity | null, id, before, limit });
+    return { entries: rows.map(historyJson), next: rows.length === limit ? Number(rows[rows.length - 1].id) : null };
   }
 
   private async audit(url: URL) {

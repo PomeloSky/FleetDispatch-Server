@@ -80,6 +80,8 @@ export interface StoredRecord {
   vehiclePlate: string | null;
   /** 建立這筆資料的配對身分（Session.identity）：未綁定駕駛人的駕駛只能修改自己建立的車趟與巡檢，駕駛只看得到自己建立的用車申請。 */
   createdBy: string | null;
+  /** 這筆資料的版本（1.2.0 起）：每次寫入（含刪除）加 1。用戶端可以在事件帶 `expectedRevision`，不一致時回傳 conflict。 */
+  revision: number;
 }
 
 /** 從資料內容取出的查詢欄位。 */
@@ -90,14 +92,24 @@ export interface ScopeFields {
   vehiclePlate: string | null;
 }
 
-export type EventStatus = 'applied' | 'ignored' | 'rejected';
+/** `conflict`（1.2.0 起）只會回給帶了 `expectedRevision` 的事件；舊版 App 不帶，不會收到。 */
+export type EventStatus = 'applied' | 'ignored' | 'rejected' | 'conflict';
 
 export interface EventResult {
   id: string;
   status: EventStatus;
   reason?: string;
   event?: SyncEvent;
+  /** 寫入後（applied）或目前（conflict）的版本（1.2.0 起）。 */
+  revision?: number;
+  /** conflict 時主機上目前的版本摘要。 */
+  current?: { revision: number; modifiedAt: number; deleted: boolean };
+  /** 這個事件之前已處理過，回傳的是第一次的結果（1.2.0 起）。 */
+  duplicate?: boolean;
 }
+
+/** 寫入的來源（修改前後歷史）。 */
+export type WriteSource = 'app' | 'web' | 'api' | 'cascade';
 
 /** 部署環境提供的設定。 */
 export interface ServerConfig {

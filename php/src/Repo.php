@@ -10,7 +10,7 @@ namespace FleetDispatch;
  */
 final class Repo
 {
-    private const RECORD_COLUMNS = 'entity, id, seq, modified_at, deleted, payload, driver_uuid, driver_name, requester_device, vehicle_plate, created_by';
+    private const RECORD_COLUMNS = 'entity, id, seq, modified_at, deleted, payload, driver_uuid, driver_name, requester_device, vehicle_plate, created_by, revision';
     private const DEVICE_COLUMNS = 'device_id, name, platform, role, driver_uuid, driver_name, token_hash, token_expires_at, paired_at, last_seen_at, revoked_at, identity';
     private const CODE_COLUMNS = 'id, code_hash, role, driver_uuid, driver_name, label, created_by, created_at, expires_at, used_at';
 
@@ -244,6 +244,7 @@ final class Repo
             'requesterDevice' => self::nstr($r['requester_device']),
             'vehiclePlate' => self::nstr($r['vehicle_plate']),
             'createdBy' => self::nstr($r['created_by']),
+            'revision' => (int) ($r['revision'] ?? 0),
         ];
     }
 
@@ -283,8 +284,8 @@ final class Repo
         if ($existing === null) {
             $this->db->run(
                 'INSERT INTO fd_records (entity, id, seq, modified_at, deleted, payload, driver_uuid, driver_name, requester_device, vehicle_plate,
-                   created_by, updated_by, updated_at)
-                 VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)',
+                   created_by, updated_by, updated_at, revision)
+                 VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, 1)',
                 [$entity, $id, $seq, $modifiedAt, $payloadText, $f['driverUuid'], $f['driverName'], $f['requesterDevice'], $f['vehiclePlate'], $identity, $deviceId, $now],
             );
             return;
@@ -293,7 +294,7 @@ final class Repo
         $createdBy = $existing['deleted'] ? $identity : $existing['createdBy'];
         $this->db->run(
             'UPDATE fd_records SET seq = ?, modified_at = ?, deleted = 0, payload = ?, driver_uuid = ?, driver_name = ?, requester_device = ?,
-               vehicle_plate = ?, created_by = ?, updated_by = ?, updated_at = ? WHERE entity = ? AND id = ?',
+               vehicle_plate = ?, created_by = ?, updated_by = ?, updated_at = ?, revision = revision + 1 WHERE entity = ? AND id = ?',
             [$seq, $modifiedAt, $payloadText, $f['driverUuid'], $f['driverName'], $f['requesterDevice'], $f['vehiclePlate'], $createdBy, $deviceId, $now, $entity, $id],
         );
     }
@@ -302,7 +303,7 @@ final class Repo
     public function tombstone(string $entity, string $id, int $seq, int|float $at, string $deviceId, int $now): bool
     {
         return $this->db->run(
-            'UPDATE fd_records SET deleted = 1, payload = NULL, seq = ?, modified_at = ?, updated_by = ?, updated_at = ?
+            'UPDATE fd_records SET deleted = 1, payload = NULL, seq = ?, modified_at = ?, updated_by = ?, updated_at = ?, revision = revision + 1
              WHERE entity = ? AND id = ? AND deleted = 0',
             [$seq, $at, $deviceId, $now, $entity, $id],
         ) > 0;
@@ -329,6 +330,88 @@ final class Repo
             }
         }
         return $out;
+    }
+
+    /** 這個車牌還沒回車的車趟數（1.2.0：有進行中車趟的車輛不能刪除）。逐位元組比對車牌（與 TypeScript 版一致）。 */
+    public function activeTripsOfPlate(string $plate): int
+    {
+        $n = 0;
+        foreach ($this->db->all("SELECT payload, vehicle_plate FROM fd_records WHERE entity = 'trip' AND deleted = 0 AND vehicle_plate = ?", [$plate]) as $r) {
+            if ((string) $r['vehicle_plate'] !== $plate || $r['payload'] === null) {
+                continue;
+            }
+            $p = Json::decodeObject((string) $r['payload']);
+            if ($p !== null && ($p->isCompleted ?? null) === false) {
+                $n++;
+            }
+        }
+        return $n;
+    }
+
+    // ───────── 修改前後歷史（1.2.0） ─────────
+
+    /**
+     * 記下一次寫入（在寫入交易中呼叫，與資料一起提交）。
+     *
+     * @param list<string>|null $changedFields
+     */
+    public function addHistory(
+        int $at, string $entity, string $entityId, ?string $eventId, string $operation, string $source,
+        ?string $actorDevice, ?string $actorIdentity, ?string $actorName, ?string $before, ?string $after,
+        ?array $changedFields, ?string $reason, int $seq, int $revision,
+    ): void {
+        $this->db->run(
+            'INSERT INTO fd_record_history (at, entity, entity_id, event_id, operation, source, actor_device, actor_identity, actor_name,
+               before_json, after_json, changed_fields, reason, seq, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [$at, $entity, $entityId, $eventId, $operation, $source, $actorDevice, $actorIdentity, $actorName, $before, $after,
+             $changedFields === null ? null : Json::encode($changedFields), $reason, $seq, $revision],
+        );
+    }
+
+    /** @return list<array<string, mixed>> 新到舊 */
+    public function listHistory(?string $entity, ?string $id, ?int $before, int $limit): array
+    {
+        $where = [];
+        $params = [];
+        if ($entity !== null) {
+            $where[] = 'entity = ?';
+            $params[] = $entity;
+        }
+        if ($id !== null) {
+            $where[] = 'entity_id = ?';
+            $params[] = $id;
+        }
+        if ($before !== null) {
+            $where[] = 'id < ?';
+            $params[] = $before;
+        }
+        $params[] = $limit;
+        return $this->db->all(
+            'SELECT * FROM fd_record_history ' . ($where !== [] ? 'WHERE ' . implode(' AND ', $where) : '') . ' ORDER BY id DESC LIMIT ?',
+            $params,
+        );
+    }
+
+    // ───────── 已處理的事件（1.2.0，冪等） ─────────
+
+    public function processedResult(string $deviceId, string $eventId): ?string
+    {
+        $v = $this->db->value('SELECT result_json FROM fd_processed_events WHERE device_id = ? AND event_id = ?', [$deviceId, $eventId]);
+        return $v === null ? null : (string) $v;
+    }
+
+    /** 記下處理結果；同一個事件已有結果時保留第一次的。 */
+    public function recordProcessed(string $deviceId, string $eventId, string $status, ?string $reason, string $resultJson, int $now): void
+    {
+        $sql = $this->db->driver === 'sqlite'
+            ? 'INSERT OR IGNORE INTO fd_processed_events (device_id, event_id, status, reason, result_json, at) VALUES (?, ?, ?, ?, ?, ?)'
+            : 'INSERT IGNORE INTO fd_processed_events (device_id, event_id, status, reason, result_json, at) VALUES (?, ?, ?, ?, ?, ?)';
+        $this->db->run($sql, [$deviceId, $eventId, $status, $reason, $resultJson, $now]);
+    }
+
+    public function purgeProcessed(int $before): void
+    {
+        $this->db->run('DELETE FROM fd_processed_events WHERE at < ?', [$before]);
     }
 
     /**

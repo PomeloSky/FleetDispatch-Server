@@ -15,7 +15,11 @@ namespace FleetDispatch;
  */
 final class Db
 {
-    public const SCHEMA_VERSION = 1;
+    /** 資料表版本：1（1.0–1.1）、2（1.2.0：每筆資料的 revision、修改前後歷史、已處理事件）。 */
+    public const SCHEMA_VERSION = 2;
+
+    /** 1.2.0 新增的資料表（從版本 1 遷移時，從結構檔取出這些敘述執行）。 */
+    private const V2_TABLES = ['fd_record_history', 'fd_processed_events'];
 
     private const TABLES = ['fd_meta', 'fd_records', 'fd_devices', 'fd_pairing_codes', 'fd_audit', 'fd_locations', 'fd_attempts'];
 
@@ -29,6 +33,8 @@ final class Db
         /** mysql 或 sqlite */
         public readonly string $driver,
         private readonly \PDO $pdo,
+        /** SQLite 檔案路徑（升級前備份用）；MySQL 為 null。 */
+        private readonly ?string $sqlitePath = null,
     ) {
     }
 
@@ -57,7 +63,7 @@ final class Db
                 } catch (\PDOException) {
                 }
                 $pdo->exec('PRAGMA synchronous = NORMAL');
-                return new self('sqlite', $pdo);
+                return new self('sqlite', $pdo, substr($dsn, strlen('sqlite:')));
             }
             // 一律用 utf8mb4（中文以外也能存表情符號等 4 位元組字元）。
             if (preg_match('/(^|;)\s*charset\s*=/i', substr($dsn, strlen('mysql:'))) === 1) {
@@ -300,18 +306,24 @@ final class Db
     // ───────── 資料表 ─────────
 
     /**
-     * 建立資料表（第一次請求時）與伺服器 ID、名稱、序號。已初始化時只多一個查詢。
-     * 資料表已經手動匯入（帳號沒有建表權限）時不再執行 CREATE TABLE。
+     * 建立資料表（第一次請求時）與伺服器 ID、名稱、序號；舊版本的資料表逐步遷移到目前版本（1.2.0 起）。
+     * 已是目前版本時只多一個查詢。資料表已經手動匯入（帳號沒有建表權限）時不再執行 CREATE TABLE。
      */
     public function ensureSchema(string $schemaDir, string $defaultName): void
     {
+        $current = null;
         try {
             $v = $this->value("SELECT v FROM fd_meta WHERE k = 'schema'");
-            if ($v !== null && (int) $v >= self::SCHEMA_VERSION) {
+            $current = $v === null ? null : (int) $v;
+            if ($current !== null && $current >= self::SCHEMA_VERSION) {
                 return;
             }
         } catch (\PDOException) {
             // 資料表還不存在：往下建立。
+        }
+        if ($current !== null) {
+            $this->migrate($schemaDir);
+            return;
         }
         if (!$this->tablesExist()) {
             foreach ($this->schemaStatements($schemaDir) as $sql) {
@@ -331,6 +343,104 @@ final class Db
         foreach ($rows as [$k, $v]) {
             $this->run($insert, [$k, $v]);
         }
+        // 舊版建立的資料表（手動匯入 1.1 的結構檔）：補上新版本的欄位與資料表
+        $this->migrate($schemaDir);
+    }
+
+    /** 目前資料庫的結構版本（還沒初始化時為 0）。 */
+    public function schemaVersion(): int
+    {
+        try {
+            return (int) ($this->value("SELECT v FROM fd_meta WHERE k = 'schema'") ?? 0);
+        } catch (\PDOException) {
+            return 0;
+        }
+    }
+
+    /**
+     * 結構遷移（1.2.0 起）：逐步升級，每一步都可以重複執行，完成後才更新版本。
+     * - SQLite：升級前先以 VACUUM INTO 備份資料庫檔案；整步在 BEGIN IMMEDIATE 的交易中（DDL 可回滾）。
+     * - MySQL：DDL 會自動提交，以 GET_LOCK 避免兩個請求同時遷移，並逐項檢查是否已完成；升級前請自行備份（mysqldump）。
+     */
+    private function migrate(string $schemaDir): void
+    {
+        $from = $this->schemaVersion();
+        if ($from >= self::SCHEMA_VERSION) {
+            return;
+        }
+        if ($this->driver === 'sqlite') {
+            $this->backupSqlite($from);
+            $this->pdo->exec('BEGIN IMMEDIATE');
+            try {
+                $this->migrateSteps($schemaDir);
+                $this->pdo->exec('COMMIT');
+            } catch (\Throwable $e) {
+                $this->pdo->exec('ROLLBACK');
+                throw $e;
+            }
+            return;
+        }
+        if ((int) $this->value("SELECT GET_LOCK('fleetdispatch_migrate', 30)") !== 1) {
+            throw new SetupError('資料庫正在升級，請稍後再試');
+        }
+        try {
+            $this->migrateSteps($schemaDir);
+        } finally {
+            $this->value("SELECT RELEASE_LOCK('fleetdispatch_migrate')");
+        }
+    }
+
+    private function migrateSteps(string $schemaDir): void
+    {
+        // 在鎖內重新讀取：另一個請求可能已經完成
+        $v = $this->schemaVersion();
+        if ($v < 2) {
+            if (!$this->hasColumn('fd_records', 'revision')) {
+                $this->pdo->exec($this->driver === 'sqlite'
+                    ? 'ALTER TABLE fd_records ADD COLUMN revision INTEGER NOT NULL DEFAULT 0'
+                    : 'ALTER TABLE fd_records ADD COLUMN revision BIGINT NOT NULL DEFAULT 0');
+            }
+            foreach ($this->schemaStatements($schemaDir) as $sql) {
+                foreach (self::V2_TABLES as $table) {
+                    if (str_contains($sql, $table)) {
+                        $this->pdo->exec($sql);
+                        break;
+                    }
+                }
+            }
+            // 既有資料的版本從 1 開始（之後的寫入再加 1）
+            $this->run('UPDATE fd_records SET revision = 1 WHERE revision = 0');
+            $this->run("UPDATE fd_meta SET v = '2' WHERE k = 'schema'");
+            error_log('[fleetdispatch-server] 資料表已由版本 ' . $v . ' 升級到 2');
+        }
+    }
+
+    private function hasColumn(string $table, string $column): bool
+    {
+        if ($this->driver === 'sqlite') {
+            foreach ($this->all("PRAGMA table_info({$table})") as $c) {
+                if ((string) $c['name'] === $column) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        return (int) $this->value(
+            'SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?',
+            [$table, $column],
+        ) > 0;
+    }
+
+    /** SQLite：升級前把資料庫複製一份（與資料庫同一個資料夾，已禁止從網站存取）。 */
+    private function backupSqlite(int $from): void
+    {
+        $path = $this->sqlitePath;
+        if ($path === null || $path === '' || $path === ':memory:' || str_starts_with($path, 'file:')) {
+            return;
+        }
+        $target = $path . '.before-v' . self::SCHEMA_VERSION . '-' . gmdate('Y-m-d\\TH-i-s\\Z') . '.bak';
+        $this->pdo->exec("VACUUM INTO " . $this->pdo->quote($target));
+        error_log("[fleetdispatch-server] 資料表將由版本 {$from} 升級到 " . self::SCHEMA_VERSION . "；升級前的備份：{$target}");
     }
 
     private function tablesExist(): bool

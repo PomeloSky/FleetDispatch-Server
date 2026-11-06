@@ -432,7 +432,7 @@ test('FleetDispatch Server API v1', async (t) => {
     assert.ok(!(await snapshot(tokens.admin)).snapshot.trips.some((x) => x.entityUUID === ids.t2));
   });
 
-  await t.test('刪除車輛：同車牌的車趟、保養一併刪除', async () => {
+  await t.test('刪除車輛：還有進行中車趟時拒絕（1.2.0）；回車後同車牌的車趟、保養一併刪除', async () => {
     assert.deepEqual(
       statuses(await send(
         tokens.admin,
@@ -441,6 +441,11 @@ test('FleetDispatch Server API v1', async (t) => {
         ev('maintenance', 'create', ids.m1, maintenance(ids.m1, 'XYZ-9876')),
       )),
       ['applied', 'applied', 'applied'],
+    );
+    assert.deepEqual(statuses(await send(tokens.admin, ev('vehicle', 'delete', ids.v2, null))), ['rejected:vehicle-has-active-trips']);
+    assert.deepEqual(
+      statuses(await send(tokens.admin, ev('trip', 'update', ids.t5, trip(ids.t5, { plate: 'XYZ-9876', driverUuid: ids.d1, driverName: '王小明', completed: true, t: nowApple() + 1 })))),
+      ['applied'],
     );
     const before = (await snapshot(tokens.admin)).cursor;
     assert.deepEqual(statuses(await send(tokens.admin, ev('vehicle', 'delete', ids.v2, null))), ['applied']);
@@ -547,6 +552,115 @@ test('FleetDispatch Server API v1', async (t) => {
     const vehicleDelete = (await api('GET', 'admin/audit?limit=500', { token: tokens.admin })).json.entries.find((x) => x.entity === 'vehicle' && x.operation === 'delete');
     assert.equal(vehicleDelete.entityId, ids.v2);
     assert.equal(vehicleDelete.summary, '');
+  });
+
+  // ───────── 1.2.0：冪等、revision 與衝突、修改前後歷史、並行一致性 ─────────
+
+  await t.test('1.2.0 /info：宣告冪等、revision、歷史能力與資料表版本', async () => {
+    const info = (await api('GET', 'info')).json;
+    for (const f of ['idempotency', 'revision', 'history']) assert.ok(info.features.includes(f), f);
+    assert.equal(info.schemaVersion, 2);
+  });
+
+  await t.test('1.2.0 冪等：同一個事件重送回傳第一次的結果，不重複寫入、不重複稽核與歷史', async () => {
+    const id = uuid();
+    const e = ev('part', 'create', id, { entityUUID: id, name: '機油濾芯', partNumber: 'OF-1', category: '', unit: '個', unitCost: 300, stockQuantity: 5, reorderThreshold: 1, supplier: '', notes: '', lastModifiedAt: nowApple() });
+    const before = (await snapshot(tokens.admin)).cursor;
+    const auditBefore = (await api('GET', 'admin/audit?limit=500', { token: tokens.admin })).json.entries.length;
+    const first = (await api('POST', 'events', { token: tokens.admin, body: { events: [e] } })).json.results[0];
+    assert.equal(first.status, 'applied');
+    assert.equal(first.revision, 1);
+    // 回應遺失後重送同一個事件（同一台裝置、同一個事件 ID）
+    const again = (await api('POST', 'events', { token: tokens.admin, body: { events: [e] } })).json.results[0];
+    assert.equal(again.status, 'applied');
+    assert.equal(again.revision, 1);
+    assert.equal(again.duplicate, true);
+    const ch = await allChanges(tokens.admin, before);
+    assert.equal(ch.changes.filter((c) => c.id === id).length, 1);
+    assert.equal(ch.changes.find((c) => c.id === id).revision, 1);
+    const auditAfter = (await api('GET', 'admin/audit?limit=500', { token: tokens.admin })).json.entries.length;
+    assert.equal(auditAfter, auditBefore + 1, '只稽核一次');
+    const h = await api('GET', `admin/history?entity=part&id=${id}`, { token: tokens.admin });
+    assert.equal(h.json.entries.length, 1, '歷史只有一筆');
+    // 被拒絕的事件重送也回傳相同結果
+    const bad = ev('part', 'create', uuid(), null);
+    bad.operation = 'update';
+    const r1 = (await api('POST', 'events', { token: tokens.viewer, body: { events: [bad] } })).json.results[0];
+    const r2 = (await api('POST', 'events', { token: tokens.viewer, body: { events: [bad] } })).json.results[0];
+    assert.equal(r1.status, 'rejected');
+    assert.deepEqual({ ...r2, duplicate: undefined }, { ...r1, duplicate: undefined });
+  });
+
+  await t.test('1.2.0 revision：每次寫入加 1；expectedRevision 一致才寫入，不一致回傳 conflict；不帶時照舊（舊版 App）', async () => {
+    const id = uuid();
+    const t0 = nowApple();
+    const v = (n, extra = {}) => ({ ...vehicle(id, 'REV-0001', t0 + n), notes: `第 ${n} 版`, ...extra });
+    const create = (await send(tokens.admin, ev('vehicle', 'create', id, v(0))))[0];
+    assert.equal(create.revision, 1);
+    const ok = { ...ev('vehicle', 'update', id, v(1)), expectedRevision: 1 };
+    const r = (await api('POST', 'events', { token: tokens.admin, body: { events: [ok] } })).json.results[0];
+    assert.equal(r.status, 'applied');
+    assert.equal(r.revision, 2);
+    const stale = { ...ev('vehicle', 'update', id, v(2)), expectedRevision: 1 };
+    const c = (await api('POST', 'events', { token: tokens.admin, body: { events: [stale] } })).json.results[0];
+    assert.equal(c.status, 'conflict');
+    assert.equal(c.reason, 'revision-mismatch');
+    assert.equal(c.current.revision, 2);
+    assert.equal(c.current.deleted, false);
+    assert.equal((await snapshot(tokens.admin)).snapshot.vehicles.find((x) => x.entityUUID === id).notes, '第 1 版', '衝突的修改沒有寫入');
+    const legacy = (await send(tokens.admin, ev('vehicle', 'update', id, v(3))))[0];
+    assert.equal(legacy.status, 'applied', '不帶 expectedRevision 時依最後寫入者勝');
+    assert.equal(legacy.revision, 3);
+    const snap = await snapshot(tokens.admin);
+    assert.equal(snap.revisions[`vehicle:${id}`], 3);
+    const badRev = { ...ev('vehicle', 'update', id, v(4)), expectedRevision: -1 };
+    assert.equal((await api('POST', 'events', { token: tokens.admin, body: { events: [badRev] } })).json.results[0].reason, 'invalid-expected-revision');
+    assert.deepEqual(statuses(await send(tokens.admin, ev('vehicle', 'delete', id, null))), ['applied']);
+  });
+
+  await t.test('1.2.0 修改前後歷史：新增、修改、刪除與連鎖刪除都有紀錄；只有管理員可以查詢', async () => {
+    const h = await api('GET', `admin/history?entity=vehicle&limit=50`, { token: tokens.admin });
+    assert.equal(h.status, 200, JSON.stringify(h.json));
+    const rev = h.json.entries.filter((e) => e.after?.plateNumber === 'REV-0001' || e.before?.plateNumber === 'REV-0001');
+    assert.deepEqual(rev.map((e) => e.operation), ['delete', 'update', 'update', 'create'], '新的在前');
+    const upd = rev[1];
+    assert.equal(upd.source, 'app');
+    assert.equal(upd.before.notes, '第 1 版');
+    assert.equal(upd.after.notes, '第 3 版');
+    assert.deepEqual(upd.changedFields, ['notes']);
+    assert.equal(typeof upd.actor.deviceId, 'string');
+    assert.equal(upd.revision, 3);
+    assert.equal(rev[0].after, null, '刪除後沒有內容');
+    const cascade = (await api('GET', `admin/history?entity=trip&id=${ids.t5}`, { token: tokens.admin })).json.entries;
+    assert.equal(cascade[0].operation, 'delete');
+    assert.equal(cascade[0].source, 'cascade');
+    assert.equal(cascade[0].reason, 'vehicle-deleted');
+    expectError(await api('GET', 'admin/history', { token: tokens.viewer }), 403, 'forbidden');
+    expectError(await api('GET', 'admin/history?entity=nope', { token: tokens.admin }), 400, 'invalid_request');
+    const page = await api('GET', 'admin/history?limit=2', { token: tokens.admin });
+    assert.equal(page.json.entries.length, 2);
+    const next = await api('GET', `admin/history?limit=2&before=${page.json.next}`, { token: tokens.admin });
+    assert.ok(next.json.entries.every((e) => e.id < page.json.next));
+  });
+
+  await t.test('1.2.0 一致性：兩位管理員同時互相降級，至少留下一位管理員', async () => {
+    const code = await api('POST', 'admin/pairing-codes', { token: tokens.admin, body: { role: 'admin' } });
+    const second = uuid();
+    const p = await api('POST', 'pair', { body: { code: code.json.code, deviceId: second, deviceName: '第二位管理員', platform: 'macos' } });
+    assert.equal(p.status, 200, JSON.stringify(p.json));
+    const [a, b] = await Promise.all([
+      api('PATCH', `admin/devices/${second}`, { token: tokens.admin, body: { role: 'viewer' } }),
+      api('PATCH', `admin/devices/${ids.admin}`, { token: p.json.token, body: { role: 'viewer' } }),
+    ]);
+    const codes = [a.status, b.status].sort();
+    assert.ok(codes.includes(200), JSON.stringify([a.json, b.json]));
+    const admins = (await api('GET', 'admin/devices', { token: a.status === 200 ? tokens.admin : p.json.token })).json.devices.filter((d) => d.role === 'admin' && d.revokedAt === null);
+    assert.ok(admins.length >= 1, '至少留下一位管理員');
+    // 復原：第一位管理員維持管理員，第二台裝置解除配對
+    if (b.status === 200) {
+      assert.equal((await api('PATCH', `admin/devices/${ids.admin}`, { token: p.json.token, body: { role: 'admin' } })).status, 200);
+    }
+    assert.equal((await api('DELETE', `admin/devices/${second}`, { token: tokens.admin })).status, 204);
   });
 
   await t.test('限制：事件太多、裝置自行解除配對', async () => {

@@ -41,7 +41,11 @@ final class Api
         ['admin/pairing-codes/*', ['DELETE']],
         ['admin/server', ['PATCH']],
         ['admin/audit', ['GET']],
+        ['admin/history', ['GET']],
     ];
+
+    /** 已處理事件的保留期間（毫秒）。 */
+    private const PROCESSED_TTL_MS = 30 * 24 * 3600 * 1000;
 
     private readonly Repo $repo;
     private readonly string $ip;
@@ -168,6 +172,9 @@ final class Api
             if ($is('GET', 'admin/audit')) {
                 return Response::json($this->audit());
             }
+            if ($is('GET', 'admin/history')) {
+                return Response::json($this->history());
+            }
         }
         throw new ApiError(404, 'not_found', '找不到這個端點');
     }
@@ -246,7 +253,9 @@ final class Api
             'time' => Util::nowMs(),
             'setupRequired' => $this->repo->countActiveAdmins() === 0,
             'setupConfigured' => $this->config->setupToken !== null,
-            'features' => ['liveLocations', 'audit'],
+            // 1.2.0：冪等、revision（expectedRevision 與 conflict）、修改前後歷史；舊版 App 不使用，照舊運作。
+            'features' => ['liveLocations', 'audit', 'idempotency', 'revision', 'history'],
+            'schemaVersion' => $this->db->schemaVersion(),
             'limits' => ['maxEventsPerRequest' => self::MAX_EVENTS_PER_REQUEST, 'maxBodyBytes' => self::MAX_BODY_BYTES],
         ];
     }
@@ -432,6 +441,7 @@ final class Api
         foreach (Rules::ENTITIES as $e) {
             $out[Rules::SNAPSHOT_KEYS[$e]] = [];
         }
+        $revisions = [];
         foreach ($this->repo->liveRecords() as $r) {
             if (!Rules::isEntity($r['entity']) || !Rules::visible($s, $r)) {
                 continue;
@@ -439,10 +449,12 @@ final class Api
             $payload = $this->outgoing($s, $r);
             if ($payload !== null) {
                 $out[Rules::SNAPSHOT_KEYS[$r['entity']]][] = $payload;
+                $revisions[$r['entity'] . ':' . $r['id']] = $r['revision'];
             }
         }
         $out['authoritative'] = true;
-        return ['cursor' => $cursor, 'snapshot' => $out, 'session' => $this->sessionJson($s)];
+        // revisions（1.2.0）：每筆資料目前的版本
+        return ['cursor' => $cursor, 'snapshot' => $out, 'revisions' => (object) $revisions, 'session' => $this->sessionJson($s)];
     }
 
     /** @return array<string, mixed> */
@@ -462,6 +474,7 @@ final class Api
                 'id' => $r['id'],
                 'deleted' => $r['deleted'],
                 'modifiedAt' => $r['modifiedAt'],
+                'revision' => $r['revision'],
                 'payload' => $r['deleted'] ? null : $this->outgoing($s, $r),
             ];
         }
@@ -481,6 +494,9 @@ final class Api
         if (count($list) > self::MAX_EVENTS_PER_REQUEST) {
             throw ApiError::badRequest('每次最多 ' . self::MAX_EVENTS_PER_REQUEST . ' 筆事件');
         }
+        if (random_int(1, 50) === 1) {
+            $this->repo->purgeProcessed(Util::nowMs() - self::PROCESSED_TTL_MS);
+        }
         $results = [];
         foreach ($list as $raw) {
             $results[] = $this->applyEvent($s, $raw);
@@ -489,7 +505,7 @@ final class Api
     }
 
     /**
-     * 處理一筆事件（自成一個交易）：格式 → 授權 → 時間校正 → 最後寫入者勝 → 連鎖刪除 → 稽核紀錄。
+     * 套用一筆事件。冪等（1.2.0）：同一台裝置重送同一個事件 ID 時回傳第一次的結果，不重複寫入、不重複稽核。
      *
      * @return array<string, mixed>
      */
@@ -499,7 +515,38 @@ final class Api
         if (!$v['ok']) {
             return ['id' => $v['id'], 'status' => 'rejected', 'reason' => $v['reason']];
         }
+        $eventId = trim($v['id']) !== '' && strlen($v['id']) <= 100 ? $v['id'] : null;
+        if ($eventId !== null) {
+            $prior = $this->repo->processedResult($s->deviceId, $eventId);
+            if ($prior !== null) {
+                $decoded = json_decode($prior, true);
+                if (is_array($decoded)) {
+                    $decoded['duplicate'] = true;
+                    return $decoded;
+                }
+            }
+        }
+        $result = $this->applyValidated($s, $raw, $v, $eventId);
+        if ($eventId !== null && $result['status'] !== 'applied') {
+            $this->repo->recordProcessed($s->deviceId, $eventId, (string) $result['status'], $result['reason'] ?? null, Json::encode($result), Util::nowMs());
+        }
+        return $result;
+    }
+
+    /**
+     * 處理一筆已驗證格式的事件（自成一個交易，取得全主機寫入鎖後讀取，授權與寫入看到同一個版本）：
+     * 授權 → expectedRevision → 時間校正 → 最後寫入者勝 → 寫入、修改前後歷史、已處理事件 → 連鎖刪除 → 稽核紀錄。
+     *
+     * @param array<string, mixed> $v
+     * @return array<string, mixed>
+     */
+    private function applyValidated(Session $s, mixed $raw, array $v, ?string $eventId): array
+    {
         $id = $v['id'];
+        $expectedRevision = self::optionalRevision($raw);
+        if ($expectedRevision === false) {
+            return ['id' => $id, 'status' => 'rejected', 'reason' => 'invalid-expected-revision'];
+        }
         $entity = $v['entity'];
         $entityId = $v['entityId'];
         $op = $v['op'];
@@ -512,25 +559,41 @@ final class Api
 
         if ($op === 'delete') {
             $at = min($v['timestamp'], $nowApple);
-            return $this->db->transaction(function () use ($s, $id, $entity, $entityId, $at, $now): array {
+            return $this->db->transaction(function () use ($s, $id, $entity, $entityId, $at, $now, $expectedRevision, $eventId): array {
                 $existing = $this->repo->getRecord($entity, $entityId);
                 $reason = Rules::authorize($s, $entity, 'delete', null, $existing);
                 if ($reason !== null) {
                     return ['id' => $id, 'status' => 'rejected', 'reason' => $reason];
                 }
+                $conflict = self::conflict($id, $existing, $expectedRevision);
+                if ($conflict !== null) {
+                    return $conflict;
+                }
                 if ($existing === null || $existing['deleted']) {
                     return ['id' => $id, 'status' => 'ignored'];
                 }
-                $this->repo->tombstone($entity, $entityId, $this->db->nextSeq(), $at, $s->deviceId, $now);
+                $plate = $existing['vehiclePlate'];
+                // 伺服器端的業務規則（1.2.0）：還有進行中車趟的車輛不能刪除（App 也有相同規則）。
+                if ($entity === 'vehicle' && $plate !== null && $plate !== '' && $this->repo->activeTripsOfPlate($plate) > 0) {
+                    return ['id' => $id, 'status' => 'rejected', 'reason' => 'vehicle-has-active-trips'];
+                }
+                $seq = $this->db->nextSeq();
+                $this->repo->tombstone($entity, $entityId, $seq, $at, $s->deviceId, $now);
+                $revision = $existing['revision'] + 1;
+                $this->repo->addHistory($now, $entity, $entityId, $eventId, 'delete', 'app', $s->deviceId, $s->identity, $s->deviceName,
+                    $existing['payloadText'], null, null, null, $seq, $revision);
+                $result = ['id' => $id, 'status' => 'applied', 'revision' => $revision];
+                if ($eventId !== null) {
+                    $this->repo->recordProcessed($s->deviceId, $eventId, 'applied', null, Json::encode($result), $now);
+                }
                 $this->logAudit($s, $entity, $entityId, 'delete', '', $now);
                 if ($entity === 'trip') {
                     $this->repo->deleteLocation($entityId);
                 }
-                $plate = $existing['vehiclePlate'];
                 if ($entity === 'vehicle' && $plate !== null && $plate !== '') {
                     $this->cascadeVehicle($s, $plate, $at, $now);
                 }
-                return ['id' => $id, 'status' => 'applied'];
+                return $result;
             });
         }
 
@@ -550,11 +613,15 @@ final class Api
         $fields = Rules::scopeFields($entity, $payload);
         $completed = ($payload->isCompleted ?? null) === true;
 
-        return $this->db->transaction(function () use ($s, $raw, $id, $entity, $entityId, $op, $payload, $timestamp, $text, $restamped, $modifiedAt, $fields, $completed, $now): array {
+        return $this->db->transaction(function () use ($s, $raw, $id, $entity, $entityId, $op, $payload, $timestamp, $text, $restamped, $modifiedAt, $fields, $completed, $now, $expectedRevision, $eventId): array {
             $existing = $this->repo->getRecord($entity, $entityId);
             $reason = Rules::authorize($s, $entity, $op, $payload, $existing);
             if ($reason !== null) {
                 return ['id' => $id, 'status' => 'rejected', 'reason' => $reason];
+            }
+            $conflict = self::conflict($id, $existing, $expectedRevision);
+            if ($conflict !== null) {
+                return $conflict;
             }
             // 最後寫入者勝：沒有這筆、或事件時間嚴格大於現存的修改時間才寫入。墓碑的修改時間是刪除的時間，
             // 比刪除舊的修改不會讓資料復活。
@@ -562,18 +629,26 @@ final class Api
                 return ['id' => $id, 'status' => 'ignored'];
             }
             $live = $existing !== null && !$existing['deleted'] ? $existing : null;
-            $this->repo->writeRecord($existing, $entity, $entityId, $this->db->nextSeq(), $modifiedAt, $text, $fields, $s->identity, $s->deviceId, $now);
-            $this->logAudit($s, $entity, $entityId, $live !== null ? 'update' : 'create', $text, $now);
+            $seq = $this->db->nextSeq();
+            $this->repo->writeRecord($existing, $entity, $entityId, $seq, $modifiedAt, $text, $fields, $s->identity, $s->deviceId, $now);
+            $revision = ($existing['revision'] ?? 0) + 1;
+            $operation = $live !== null ? 'update' : 'create';
+            $this->repo->addHistory($now, $entity, $entityId, $eventId, $operation, 'app', $s->deviceId, $s->identity, $s->deviceName,
+                $live['payloadText'] ?? null, $text, self::changedFields($live['payload'] ?? null, $payload), null, $seq, $revision);
+            $this->logAudit($s, $entity, $entityId, $operation, $text, $now);
             if ($entity === 'trip' && $completed) {
                 $this->repo->deleteLocation($entityId);
             }
-            $result = ['id' => $id, 'status' => 'applied'];
+            $result = ['id' => $id, 'status' => 'applied', 'revision' => $revision];
             if ($restamped) {
                 // 校正後的事件：其他欄位照送出者的原樣。
                 $event = clone $raw;
                 $event->timestamp = $timestamp;
                 $event->payloadJSON = $text;
                 $result['event'] = $event;
+            }
+            if ($eventId !== null) {
+                $this->repo->recordProcessed($s->deviceId, $eventId, 'applied', null, Json::encode($result), $now);
             }
             return $result;
         });
@@ -583,7 +658,11 @@ final class Api
     private function cascadeVehicle(Session $s, string $plate, int|float $at, int $now): void
     {
         foreach ($this->repo->liveChildrenOfPlate($plate, Rules::VEHICLE_CHILDREN) as $child) {
-            if ($this->repo->tombstone($child['entity'], $child['id'], $this->db->nextSeq(), $at, $s->deviceId, $now)) {
+            $before = $this->repo->getRecord($child['entity'], $child['id']);
+            $seq = $this->db->nextSeq();
+            if ($this->repo->tombstone($child['entity'], $child['id'], $seq, $at, $s->deviceId, $now)) {
+                $this->repo->addHistory($now, $child['entity'], $child['id'], null, 'delete', 'cascade', $s->deviceId, $s->identity, $s->deviceName,
+                    $before['payloadText'] ?? null, null, null, 'vehicle-deleted', $seq, ($before['revision'] ?? 0) + 1);
                 $this->logAudit($s, $child['entity'], $child['id'], 'delete', '', $now);
                 if ($child['entity'] === 'trip') {
                     $this->repo->deleteLocation($child['id']);
@@ -821,6 +900,112 @@ final class Api
         }
         $this->repo->setName($name);
         return $this->info();
+    }
+
+    /** 事件的 expectedRevision（1.2.0，選填）：沒有時 null；不是非負整數時 false（拒絕）。 */
+    private static function optionalRevision(mixed $raw): int|false|null
+    {
+        if (!$raw instanceof \stdClass || !property_exists($raw, 'expectedRevision') || $raw->expectedRevision === null) {
+            return null;
+        }
+        $n = $raw->expectedRevision;
+        return is_int($n) && $n >= 0 ? $n : false;
+    }
+
+    /**
+     * expectedRevision 與主機上的版本不一致時的結果（null 表示沒有衝突）。
+     *
+     * @param array<string, mixed>|null $existing
+     * @return array<string, mixed>|null
+     */
+    private static function conflict(string $id, ?array $existing, ?int $expectedRevision): ?array
+    {
+        if ($expectedRevision === null) {
+            return null;
+        }
+        $current = $existing === null ? 0 : (int) $existing['revision'];
+        if ($current === $expectedRevision) {
+            return null;
+        }
+        $out = ['id' => $id, 'status' => 'conflict', 'reason' => 'revision-mismatch', 'revision' => $current];
+        if ($existing !== null) {
+            $out['current'] = ['revision' => $current, 'modifiedAt' => $existing['modifiedAt'], 'deleted' => $existing['deleted']];
+        }
+        return $out;
+    }
+
+    /**
+     * 修改的欄位（第一層的鍵；不含每次都會變的 lastModifiedAt）。新增時是所有欄位。
+     *
+     * @return list<string>
+     */
+    private static function changedFields(?\stdClass $before, \stdClass $after): array
+    {
+        $b = $before === null ? [] : get_object_vars($before);
+        $a = get_object_vars($after);
+        $keys = array_unique(array_merge(array_keys($b), array_keys($a)));
+        $out = [];
+        foreach ($keys as $k) {
+            if ($k === 'lastModifiedAt') {
+                continue;
+            }
+            $x = array_key_exists($k, $b) ? Json::encode($b[$k]) : null;
+            $y = array_key_exists($k, $a) ? Json::encode($a[$k]) : null;
+            if ($x !== $y) {
+                $out[] = (string) $k;
+            }
+        }
+        sort($out, SORT_STRING);
+        return $out;
+    }
+
+    /** 修改前後歷史（1.2.0；只有管理員）。 @return array<string, mixed> */
+    private function history(): array
+    {
+        $limit = Util::intParam($this->req, 'limit', 50, 1, 200);
+        $beforeRaw = $this->req->query('before');
+        $before = $beforeRaw === null || $beforeRaw === '' ? null : Util::intParam($this->req, 'before', 0, 0, Util::MAX_SAFE_INTEGER);
+        $entity = $this->req->query('entity');
+        if ($entity !== null && !Rules::isEntity($entity)) {
+            throw ApiError::badRequest('entity 不正確');
+        }
+        $idRaw = $this->req->query('id');
+        $id = $idRaw === null ? null : Util::normalizeUuid($idRaw);
+        if ($idRaw !== null && $id === null) {
+            throw ApiError::badRequest('id 必須是 UUID');
+        }
+        $rows = $this->repo->listHistory($entity, $id, $before, $limit);
+        $decode = static function (mixed $text): mixed {
+            if ($text === null) {
+                return null;
+            }
+            $j = Json::decodeObject((string) $text);
+            return $j === null ? null : new RawJson((string) $text);
+        };
+        $entries = [];
+        foreach ($rows as $r) {
+            $entries[] = [
+                'id' => (int) $r['id'],
+                'at' => (int) $r['at'],
+                'entity' => (string) $r['entity'],
+                'entityId' => (string) $r['entity_id'],
+                'eventId' => $r['event_id'] === null ? null : (string) $r['event_id'],
+                'operation' => (string) $r['operation'],
+                'source' => (string) $r['source'],
+                'actor' => [
+                    'deviceId' => $r['actor_device'] === null ? null : (string) $r['actor_device'],
+                    'identity' => $r['actor_identity'] === null ? null : (string) $r['actor_identity'],
+                    'name' => $r['actor_name'] === null ? null : (string) $r['actor_name'],
+                ],
+                'before' => $decode($r['before_json']),
+                'after' => $decode($r['after_json']),
+                'changedFields' => $r['changed_fields'] === null ? null : json_decode((string) $r['changed_fields'], true),
+                'reason' => $r['reason'] === null ? null : (string) $r['reason'],
+                'seq' => (int) $r['seq'],
+                'revision' => (int) $r['revision'],
+            ];
+        }
+        return ['entries' => $entries, 'next' => count($rows) === $limit ? (int) $rows[count($rows) - 1]['id'] : null];
     }
 
     /** @return array<string, mixed> */
