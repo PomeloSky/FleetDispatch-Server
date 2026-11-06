@@ -310,7 +310,7 @@ final class Repo
     }
 
     /**
-     * 車牌相同、還沒刪除的子資料（刪除車輛時連鎖刪除）。與 TypeScript 版相同的查詢（不指定順序，由資料庫依索引決定）。
+     * 車牌相同、還沒刪除的子資料（刪除車輛時連鎖刪除），依種類、UUID 排序（與 TypeScript 版的集合式連鎖刪除取得序號的順序相同）。
      *
      * @param list<string> $entities
      * @return list<array{entity: string, id: string}>
@@ -319,7 +319,7 @@ final class Repo
     {
         $marks = implode(', ', array_fill(0, count($entities), '?'));
         $rows = $this->db->all(
-            "SELECT entity, id, vehicle_plate FROM fd_records WHERE vehicle_plate = ? AND deleted = 0 AND entity IN ({$marks})",
+            "SELECT entity, id, vehicle_plate FROM fd_records WHERE vehicle_plate = ? AND deleted = 0 AND entity IN ({$marks}) ORDER BY entity, id",
             array_merge([$plate], $entities),
         );
         $out = [];
@@ -358,21 +358,33 @@ final class Repo
     public function addHistory(
         int $at, string $entity, string $entityId, ?string $eventId, string $operation, string $source,
         ?string $actorDevice, ?string $actorIdentity, ?string $actorName, ?string $before, ?string $after,
-        ?array $changedFields, ?string $reason, int $seq, int $revision,
+        ?array $changedFields, ?string $reason, int $seq, int $revision, string $outcome = 'applied',
     ): void {
         $this->db->run(
             'INSERT INTO fd_record_history (at, entity, entity_id, event_id, operation, source, actor_device, actor_identity, actor_name,
-               before_json, after_json, changed_fields, reason, seq, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+               before_json, after_json, changed_fields, reason, seq, revision, outcome) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             [$at, $entity, $entityId, $eventId, $operation, $source, $actorDevice, $actorIdentity, $actorName, $before, $after,
-             $changedFields === null ? null : Json::encode($changedFields), $reason, $seq, $revision],
+             $changedFields === null ? null : Json::encode($changedFields), $reason, $seq, $revision, $outcome],
         );
     }
 
-    /** @return list<array<string, mixed>> 新到舊 */
-    public function listHistory(?string $entity, ?string $id, ?int $before, int $limit): array
+    /**
+     * @param string|null $outcome applied（只有套用的）、notApplied（拒絕、衝突、略過）或 null（全部）
+     * @return list<array<string, mixed>> 新到舊
+     */
+    public function listHistory(?string $entity, ?string $id, ?int $before, int $limit, ?string $outcome = null, ?string $source = null): array
     {
         $where = [];
         $params = [];
+        if ($outcome === 'applied') {
+            $where[] = "outcome = 'applied'";
+        } elseif ($outcome === 'notApplied') {
+            $where[] = "outcome != 'applied'";
+        }
+        if ($source !== null) {
+            $where[] = 'source = ?';
+            $params[] = $source;
+        }
         if ($entity !== null) {
             $where[] = 'entity = ?';
             $params[] = $entity;
@@ -389,6 +401,93 @@ final class Repo
         return $this->db->all(
             'SELECT * FROM fd_record_history ' . ($where !== [] ? 'WHERE ' . implode(' AND ', $where) : '') . ' ORDER BY id DESC LIMIT ?',
             $params,
+        );
+    }
+
+    // ───────── 管理查詢（1.2.0） ─────────
+
+    private const ADMIN_COLUMNS = self::RECORD_COLUMNS . ', updated_by, updated_at';
+
+    /**
+     * 某一種類的有效資料（管理查詢用；其他篩選、排序與分頁在 Admin::query）。車牌、姓名在呼叫端再逐位元組比對（MySQL 的比較忽略結尾空白）。
+     *
+     * @param array{plate?: ?string, driverOwn?: array{uuid: string, name: string}|null, driverName?: ?string, createdBy?: ?string} $f
+     * @return list<array<string, mixed>>
+     */
+    public function adminRows(string $entity, array $f): array
+    {
+        $where = ['entity = ?', 'deleted = 0'];
+        $params = [$entity];
+        if (($f['plate'] ?? null) !== null) {
+            $where[] = 'vehicle_plate = ?';
+            $params[] = $f['plate'];
+        }
+        if (($f['driverOwn'] ?? null) !== null) {
+            $where[] = "(driver_uuid = ? OR (driver_uuid IS NULL AND driver_name = ? AND driver_name != ''))";
+            $params[] = $f['driverOwn']['uuid'];
+            $params[] = $f['driverOwn']['name'];
+        }
+        if (($f['driverName'] ?? null) !== null) {
+            $where[] = 'driver_name = ?';
+            $params[] = $f['driverName'];
+        }
+        if (($f['createdBy'] ?? null) !== null) {
+            $where[] = 'created_by = ?';
+            $params[] = $f['createdBy'];
+        }
+        $rows = $this->db->all('SELECT ' . self::ADMIN_COLUMNS . ' FROM fd_records WHERE ' . implode(' AND ', $where) . ' ORDER BY id', $params);
+        $out = [];
+        foreach ($rows as $r) {
+            if (($f['plate'] ?? null) !== null && (string) $r['vehicle_plate'] !== $f['plate']) {
+                continue;
+            }
+            if (($f['driverName'] ?? null) !== null && (string) $r['driver_name'] !== $f['driverName']) {
+                continue;
+            }
+            if (($f['driverOwn'] ?? null) !== null && $r['driver_uuid'] === null && (string) $r['driver_name'] !== $f['driverOwn']['name']) {
+                continue;
+            }
+            $out[] = $r;
+        }
+        return $out;
+    }
+
+    /** @return array<string, mixed>|null 一筆資料（含墓碑） */
+    public function adminRow(string $entity, string $id): ?array
+    {
+        return $this->db->first('SELECT ' . self::ADMIN_COLUMNS . ' FROM fd_records WHERE entity = ? AND id = ?', [$entity, $id]);
+    }
+
+    /**
+     * 車牌相同的子資料數（刪除車輛的影響預覽）。
+     *
+     * @param list<string> $entities
+     * @return array<string, int>
+     */
+    public function childCounts(string $plate, array $entities): array
+    {
+        $out = array_fill_keys($entities, 0);
+        foreach ($this->liveChildrenOfPlate($plate, $entities) as $c) {
+            $out[$c['entity']]++;
+        }
+        return $out;
+    }
+
+    /** @return list<array<string, mixed>> 綁定這位駕駛人、還沒解除配對的裝置 */
+    public function devicesBoundTo(string $driverUuid): array
+    {
+        return array_map(
+            static fn (array $r): array => self::device($r),
+            $this->db->all('SELECT ' . self::DEVICE_COLUMNS . ' FROM fd_devices WHERE driver_uuid = ? AND revoked_at IS NULL ORDER BY paired_at', [$driverUuid]),
+        );
+    }
+
+    /** @return array<string, mixed>|null */
+    public function locationOf(string $tripId): ?array
+    {
+        return $this->db->first(
+            'SELECT trip_id, device_id, device_name, plate, latitude, longitude, speed, course, ts, updated_at FROM fd_locations WHERE trip_id = ?',
+            [$tripId],
         );
     }
 

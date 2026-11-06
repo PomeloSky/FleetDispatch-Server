@@ -7,6 +7,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
+import { adminSuite } from './admin-suite.mjs';
+
 const BASE = (process.env.FD_BASE ?? 'http://127.0.0.1:8080').replace(/\/+$/, '');
 const SETUP = process.env.FD_SETUP_TOKEN ?? '';
 const APPLE = 978307200;
@@ -622,8 +624,11 @@ test('FleetDispatch Server API v1', async (t) => {
     const h = await api('GET', `admin/history?entity=vehicle&limit=50`, { token: tokens.admin });
     assert.equal(h.status, 200, JSON.stringify(h.json));
     const rev = h.json.entries.filter((e) => e.after?.plateNumber === 'REV-0001' || e.before?.plateNumber === 'REV-0001');
-    assert.deepEqual(rev.map((e) => e.operation), ['delete', 'update', 'update', 'create'], '新的在前');
-    const upd = rev[1];
+    // 沒有套用的事件（衝突、拒絕）也留下摘要（outcome 不是 applied，版本不變）
+    assert.deepEqual(rev.map((e) => [e.operation, e.outcome]), [
+      ['delete', 'applied'], ['update', 'rejected'], ['update', 'applied'], ['update', 'conflict'], ['update', 'applied'], ['create', 'applied'],
+    ], '新的在前');
+    const upd = rev[2];
     assert.equal(upd.source, 'app');
     assert.equal(upd.before.notes, '第 1 版');
     assert.equal(upd.after.notes, '第 3 版');
@@ -631,6 +636,18 @@ test('FleetDispatch Server API v1', async (t) => {
     assert.equal(typeof upd.actor.deviceId, 'string');
     assert.equal(upd.revision, 3);
     assert.equal(rev[0].after, null, '刪除後沒有內容');
+    const conflict = rev[3];
+    assert.equal(conflict.reason, 'revision-mismatch');
+    assert.equal(conflict.before.notes, '第 1 版', '主機上當時的內容');
+    assert.equal(conflict.after.notes, '第 2 版', '被拒絕的內容');
+    assert.deepEqual(conflict.changedFields, ['notes']);
+    assert.equal(conflict.revision, 2, '沒有寫入，版本不變');
+    assert.equal(typeof conflict.eventId, 'string');
+    assert.equal(rev[1].reason, 'invalid-expected-revision');
+    const vid = rev[0].entityId;
+    const notApplied = (await api('GET', `admin/history?entity=vehicle&id=${vid}&outcome=notApplied`, { token: tokens.admin })).json.entries;
+    assert.deepEqual(notApplied.map((e) => e.outcome), ['rejected', 'conflict']);
+    assert.equal((await api('GET', `admin/history?entity=vehicle&id=${vid}&outcome=applied`, { token: tokens.admin })).json.entries.length, 4);
     const cascade = (await api('GET', `admin/history?entity=trip&id=${ids.t5}`, { token: tokens.admin })).json.entries;
     assert.equal(cascade[0].operation, 'delete');
     assert.equal(cascade[0].source, 'cascade');
@@ -662,6 +679,9 @@ test('FleetDispatch Server API v1', async (t) => {
     }
     assert.equal((await api('DELETE', `admin/devices/${second}`, { token: tokens.admin })).status, 204);
   });
+
+  // 網頁管理的資料 API（1.2.0）：在解除配對與嘗試次數限制之前（需要管理員與駕駛的權杖）
+  await adminSuite(t, { api, expectError, ev, send, uuid, nowApple, tokens, ids, allChanges });
 
   await t.test('限制：事件太多、裝置自行解除配對', async () => {
     const many = Array.from({ length: 501 }, () => ev('part', 'create', uuid(), null));

@@ -28,7 +28,8 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 | `inspection` | 巡檢 | `entityUUID`、`driverName`、`vehiclePlateNumber`、`lastModifiedAt` |
 
 - 資料內容（payload）是 App 送來的 JSON 物件，主機**原樣保存**，只讀上表的欄位，不得增刪其他欄位（遮蔽與時間校正除外，見 §4、§5）。
-  主機不需要知道其他欄位的意義。
+  主機不需要知道其他欄位的意義。1.2.0 起管理員以網頁管理修改資料時，主機只依 `spec/admin-entities.json` 修改允許的欄位（§7.5），
+  其他欄位（含 App 新版本才有的欄位）原樣保留。
 - 每筆資料有一個**變更序號** `seq`：全主機單調遞增的整數，資料每次被寫入或刪除就取得新的序號。用戶端以序號作為增量同步的游標。
 - 刪除保留為**墓碑**（`deleted = true`、沒有內容），讓離線的用戶端也收得到刪除。墓碑保留查詢範圍用的欄位（駕駛人、申請裝置、車牌）。
 - 主機另存：裝置（§3）、配對碼（§3）、稽核紀錄（§7）、即時位置（§8）、伺服器資訊（ID、名稱）。
@@ -265,22 +266,29 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 | `DELETE /admin/pairing-codes/{id}` | 刪除 → `204` |
 | `PATCH /admin/server` | `{ "name" }`（1–100 字元）→ `Info`（§9） |
 | `GET /admin/audit?before=<id>&limit=<筆數>` | 稽核紀錄，新的在前：`{ "entries": [ { "id", "at", "deviceId", "deviceName", "entity", "entityId", "operation", "summary" } ], "next": <id 或 null> }`；`limit` 預設 100、最多 500 |
+| `GET /admin/history` | 修改前後歷史（§7.1，1.2.0） |
+| `GET /admin/schema` | 網頁管理的資料規格（§7.2，1.2.0） |
+| `GET /admin/records`、`GET /admin/records/{entity}/{id}` | 資料清單與詳情（§7.3、§7.4，1.2.0） |
+| `PATCH /admin/records/{entity}/{id}` | 受控修改（§7.5，1.2.0） |
+| `GET …/{id}/impact`、`POST …/{id}/delete` | 刪除的影響預覽與刪除（§7.6，1.2.0） |
+| `POST /admin/requests/{id}/approve`、`…/reject` | 用車申請的核准、退回（§7.7，1.2.0） |
 
 `Device`：`{ "deviceId", "name", "platform", "role", "driverBinding", "pairedAt", "lastSeenAt", "tokenExpiresAt", "revokedAt" }`（時間為毫秒，沒有時 `null`）。
 
 限制：最後一位有效的管理員不能被降級或解除配對（`409 last_admin`）。1.2.0 起這個檢查與更新是同一個不可分割的操作：兩位管理員同時互相降級或解除配對時，
 至少留下一位。
 
-### 7.1 修改前後歷史 `GET /admin/history?entity=<種類>&id=<UUID>&before=<id>&limit=<筆數>`（1.2.0）
+### 7.1 修改前後歷史 `GET /admin/history?entity=<種類>&id=<UUID>&outcome=<applied|notApplied>&source=<來源>&pii=1&before=<id>&limit=<筆數>`（1.2.0）
 
-只有管理員。新的在前；`limit` 預設 50、最多 200；`entity`、`id` 可省略。
+只有管理員。新的在前；`limit` 預設 50、最多 200；參數都可省略。`outcome`：`applied` 只列套用的、`notApplied` 只列沒有套用的
+（拒絕、衝突、略過）；`source`：`app`、`web`、`api`、`cascade`。
 
 ```json
 {
   "entries": [
     {
       "id": 812, "at": 1793616000000, "entity": "vehicle", "entityId": "UUID", "eventId": "事件 UUID 或 null",
-      "operation": "update", "source": "app",
+      "operation": "update", "source": "app", "outcome": "applied",
       "actor": { "deviceId": "UUID", "identity": "配對身分", "name": "裝置名稱" },
       "before": { 修改前的內容 }, "after": { 修改後的內容 }, "changedFields": ["custodian"],
       "reason": null, "seq": 1234, "revision": 3
@@ -291,11 +299,111 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 ```
 
 - `operation`：`create`、`update`、`delete`；刪除時 `after` 是 `null`，新增時 `before` 是 `null`。
-- `source`：`app`（App 的事件）、`cascade`（刪除車輛的連鎖刪除，`reason: "vehicle-deleted"`）；之後的網頁管理修改為 `web`。
-- `changedFields`：第一層的鍵，不含 `lastModifiedAt`；新增時是所有欄位。
-- 歷史只給管理員：內容包含駕駛人的個資（證號、電話）。保留期限與遮蔽設定見 `docs/audit-history.md`。
+- `source`：`app`（App 的事件）、`web`（網頁管理的修改、核准、刪除，`reason` 是管理員填的原因）、`cascade`（刪除車輛的連鎖刪除，`reason: "vehicle-deleted"`）；`api` 保留。
+- `outcome`：`applied`（寫入）；App 的事件沒有套用時也留下一筆摘要：`rejected`（`reason` 是拒絕的原因碼）、`conflict`（`revision-mismatch`）、
+  `ignored`（`stale`：比主機上的版本舊，最後寫入者勝略過；`not-found`：刪除已不存在的資料）。沒有套用的紀錄 `before` 是主機上當時的內容、
+  `after` 是送來的內容（刪除、`payload-too-large` 時是 `null`）、`revision` 是主機上當時的版本（沒有改變）、`seq` 是當時的序號。
+  格式錯誤（`invalid-payload`）的事件無法對應到資料，不留紀錄。重送同一個事件（冪等）不會多一筆。
+- `changedFields`：第一層的鍵，不含 `lastModifiedAt`；新增時是所有欄位；沒有套用時是「送來的內容」與「主機上的內容」不同的欄位。
+- 個資遮蔽：駕駛人的 `phoneNumber`、`licenseNumber` 只顯示最後 3 個字（前面以 `••••` 代替；4 個字以內整個遮蔽），`notes` 顯示「［已遮蔽］」。
+  `pii=1` 顯示完整內容，並在稽核紀錄留下一筆 `operation: "view-pii"`（`entity` 是查詢的種類或 `history`，`entityId` 是查詢的 ID 或空字串）。
+- 版本比較：同一筆資料每一筆 `applied` 紀錄的 `after` 就是那個 `revision` 的完整內容（刪除時沒有內容），網頁管理以此比較任兩個版本。
 
-稽核紀錄的 `summary`：資料內容 JSON 的前 2,000 個字元（刪除時是空字串）；`operation` 是 `create`、`update`、`delete`；連鎖刪除也各記一筆。
+稽核紀錄的 `summary`：資料內容 JSON 的前 2,000 個字元（刪除時是空字串）；**駕駛人**只有 `{"entityUUID","name"}`（1.2.0 起，不把證號、電話、備註寫進稽核紀錄；
+升級時清除 1.0–1.1 留下的駕駛人摘要）。`operation` 是 `create`、`update`、`delete`（另有 `view-pii`）；連鎖刪除也各記一筆。
+
+### 7.2 網頁管理的資料規格 `GET /admin/schema`（1.2.0）
+
+只有管理員。回傳 `spec/admin-entities.json` 的內容（三種實作相同）：每種資料的名稱、欄位（標籤、型別、單位、範圍、可否在網頁修改）、搜尋的欄位、
+排序選項、狀態篩選、預設排序。網頁管理依它顯示表格與表單；**修改時以主機的檢查為準**（§7.5）。
+
+### 7.3 資料清單 `GET /admin/records?entity=<種類>&…`（1.2.0）
+
+只有管理員。參數：
+
+| 參數 | 說明 |
+| --- | --- |
+| `entity` | 必填，10 種之一 |
+| `q` | 搜尋（最多 100 個字）：以空白（含全形空白）分成最多 10 個字詞，每個字詞都要出現在規格的 `search` 欄位之一（文字或文字清單）；英文字母不分大小寫 |
+| `plate` | 車牌（逐字相同） |
+| `driverId` | 駕駛人的 UUID：車趟（駕駛人 UUID 相同，或沒有 UUID 時姓名相同）、巡檢（駕駛姓名相同）、用車申請（申請人姓名相同）；其他種類 `400` |
+| `deviceId` | 裝置 ID：這台裝置**這次配對**建立的資料 |
+| `from`、`to` | 時間範圍（1970 起算的毫秒），比較規格的 `time` 欄位：含 `from`、不含 `to`；沒有時間的資料不列出 |
+| `status` | 規格的 `statuses` 之一：車趟 `active`／`completed`、用車申請與工單依 `status`、巡檢依 `overallResult`、零件 `low`（安全庫存大於 0 且庫存不大於它） |
+| `sort`、`order` | 規格的 `sorts` 之一（預設 `defaultSort`）與 `asc`／`desc`（預設 `defaultOrder`）。數字在文字前；**沒有值的一律在最後**；相同時依 UUID |
+| `limit`、`offset` | 每頁 1–200 筆（預設 50）、略過的筆數 |
+
+```json
+{ "entity": "trip", "total": 128, "offset": 0, "limit": 50,
+  "records": [ { "entity": "trip", "id": "UUID", "revision": 3, "seq": 1234, "modifiedAt": 784000000.5, "deleted": false,
+                 "updatedAt": 1793616000000, "updatedBy": { "deviceId": "UUID", "name": "王小明的 iPhone" }, "payload": { … } } ] }
+```
+
+`updatedBy` 是最後寫入這筆的裝置（名稱取自裝置清單，裝置被刪除時 `name` 是 `null`）。字串比較以碼位（UTF-8 位元組）為準，三種實作的順序相同。
+
+### 7.4 詳情與關聯 `GET /admin/records/{entity}/{id}`（1.2.0）
+
+只有管理員。`{ "record": Record, "related": { … }, "location": 即時位置或 null }`；墓碑也回傳（`deleted: true`、`payload: null`、沒有關聯）。
+每種關聯是 `{ "entity", "total", "records": [最多 20 筆，依該種類的預設排序] }`（裝置是陣列）：
+
+| 種類 | 關聯 |
+| --- | --- |
+| `vehicle` | `trips`、`maintenance`、`maintenanceItems`、`workOrders`、`inspections`（車牌相同）、`tripRequests`（申請的車牌相同） |
+| `driver` | `trips`（同 `driverId` 的規則）、`inspections`（駕駛姓名相同）、`tripRequests`（申請人姓名相同）、`devices`（綁定這位駕駛人、還沒解除配對的裝置） |
+| `trip` | `vehicles`（車牌相同）、`drivers`（駕駛人 UUID；沒有時姓名相同）、`tripRequests`（核准後產生這趟的申請）、`inspections`（同車、出車前 1 天到回車後 1 天）、`workOrders`（同車、這段期間開著的工單） |
+| `tripRequest` | `trips`（核准後產生的車趟）、`vehicles`、`devices`（申請的裝置） |
+| `workOrder` | `vehicles`、`parts`（明細引用的零件） |
+| `part` | `workOrders`（明細引用這個零件） |
+| `inspection` | `vehicles`、`drivers`（姓名相同）、`trips`（同車、巡檢前後 1 天內出車） |
+| `maintenance`、`maintenanceItem` | `vehicles` |
+
+App 的資料格式中，巡檢、工單與車趟之間沒有直接的關聯欄位，以「車牌＋時間」對應；車趟沒有備註欄位，路線軌跡只存在出車的裝置上
+（主機只有出車中的即時位置與 8.1 起的出發定位）。
+
+### 7.5 受控修改 `PATCH /admin/records/{entity}/{id}`（1.2.0）
+
+只有管理員；用車申請用 §7.7。
+
+```json
+{ "expectedRevision": 3, "changes": { "odometerEnd": 12580 }, "reason": "依單據修正", "dryRun": false }
+```
+
+- `expectedRevision`：必填，與主機上的版本不同時 `409 revision_mismatch`，`error.current` 是目前的 Record（重新載入、比較後再修改）。
+- `changes`：只能有規格中 `edit: true` 的欄位；型別、範圍、選項（舊資料清單以外的值可以維持原值）、各種類的規則（下表）都檢查，
+  錯誤時 `400 invalid_changes`，`error.fields` 是 `{ 欄位: 說明 }`（`_` 表示整體，例如「內容沒有變更」）。文字去除前後空白；
+  選填的日期給 `null` 時移除這個鍵（App 的格式）。其他欄位（含 App 新版本才有的欄位）原樣保留。
+- `reason`：1–500 個字，`dryRun` 以外必填，寫進修改前後歷史。
+- `dryRun: true`：只檢查並回傳 `{ "dryRun": true, "revision", "before", "after", "changedFields", "warnings" }`，不寫入。
+- 寫入：`lastModifiedAt` 與主機上的修改時間改為主機的現在時間（至少比原本的大 1 毫秒），版本加 1，在同一個交易寫入資料、修改前後歷史
+  （`source: "web"`）與稽核紀錄 → `{ "record", "changedFields", "warnings" }`。其他裝置以 `GET /changes` 取得；**比這次修改舊的離線修改送來時被略過**
+  （最後寫入者勝；歷史留下 `ignored`／`stale` 的摘要），App 8.1 帶 `expectedRevision` 時回 `conflict`。
+
+| 種類 | 規則 |
+| --- | --- |
+| `trip` | 已回車不能改回出車中；出車中不能改回車時間與結束里程，要「回車」時同時給 `isCompleted: true`、`endTime`、`odometerEnd`，且至少一個目的地；回車時間不早於出車時間；結束里程大於 0 且不小於起始里程；超過 1,000 km 只提醒（`warnings`）。`vehiclePlateNumber` 必須是現有車輛的車牌；`driverEntityUUID` 必須是現有的駕駛人，`driver`（姓名）一併更新。回車時移除即時位置 |
+| `vehicle` | 車牌不能修改（車趟、保養、工單、巡檢以車牌對應車輛，請在 App 修改）；`modelYear` 是 0（未設定）或 1900–2100；改 `fuelType` 時 `isElectric` 一併更新 |
+| `driver` | 姓名不能修改（車趟、巡檢與裝置綁定以姓名對應，請在 App 修改） |
+| `workOrder` | 不能改為「已完成」（App 完工時在同一個交易扣零件庫存並寫保養紀錄）；其他狀態可以，重新開啟保留完工時間（與 App 相同，再完工不重複扣庫存）；明細只顯示 |
+| `inspection` | 結果由明細判斷，只顯示；明細只顯示 |
+
+### 7.6 刪除 `GET /admin/records/{entity}/{id}/impact`、`POST /admin/records/{entity}/{id}/delete`（1.2.0）
+
+- 影響預覽 → `{ "entity", "id", "revision", "blockers": [ { "code", "message", "count" } ], "cascade": { 種類: 筆數 }, "references": { … } }`：
+  車輛的 `cascade` 是會一併刪除的車趟、保養、保養項目、工單、巡檢（車牌相同）；還有出車中的車趟時 `blockers` 有 `vehicle-has-active-trips`。
+  駕駛人的 `references` 是車趟與綁定裝置的數量（車趟保留駕駛姓名，不會被刪除），零件是引用它的工單數。
+- 刪除 `{ "expectedRevision", "reason", "expectedCascade"? }`：`reason` 必填；車輛必須帶預覽時的 `expectedCascade`，與目前不同時 `409 impact_changed`
+  （`error.cascade` 是目前的筆數，請重新預覽）；有出車中的車趟時 `409 vehicle_has_active_trips`。車輛與連鎖刪除的資料在**同一個交易**改為墓碑、
+  各自取得新的序號（依種類、UUID 的順序）並留下歷史與稽核紀錄 → `{ "deleted": { "entity", "id", "revision" }, "cascade": { … } }`。
+- 用車申請不會被連鎖刪除；8.1 的封存（停用）見 App 的說明，網頁管理的刪除一律是永久刪除。
+
+### 7.7 用車申請的簽核 `POST /admin/requests/{id}/approve`、`POST /admin/requests/{id}/reject`（1.2.0）
+
+只有待簽核（`pending`）的申請（否則 `409 request_not_pending`）；`expectedRevision` 必填。
+
+- 核准 `{ "expectedRevision", "driverId"?, "note"? }`：與 App 的核准相同——建立一趟出車中的車趟（出車、回車時間是預計的時間；車牌是申請的車牌且車輛存在時才帶；
+  起始里程是同車最後一趟已回車的結束里程，沒有時 0；駕駛姓名是申請人；`driverId` 是指派的駕駛人），申請改為 `approved`、`approvedAt`、
+  `approvedBy`（網頁管理的裝置名稱）、`resultingTripUUID`。兩筆在同一個交易寫入 → `{ "request": Record, "trip": Record }`。
+- 退回 `{ "expectedRevision", "rejectionReason" }`（1–500 個字）：`rejected`、`approvedAt`、`approvedBy`、`rejectionReason` → `{ "request", "trip": null }`。
 
 ## 8. 即時位置
 
@@ -353,6 +461,8 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 { "error": { "code": "invalid_request", "message": "說明文字" } }
 ```
 
+1.2.0 的管理端點在 `error` 中另外帶補充資料：`fields`（`invalid_changes`）、`current`（`revision_mismatch`）、`cascade`（`impact_changed`）。
+
 | HTTP | `code` | 時機 |
 | --- | --- | --- |
 | 400 | `invalid_request` | 參數或 JSON 格式錯誤 |
@@ -361,7 +471,9 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 | 403 | `forbidden` | 角色不允許這個端點或操作 |
 | 404 | `not_found` | 端點或資源不存在 |
 | 405 | `method_not_allowed` | 方法不支援 |
+| 400 | `invalid_changes` | 網頁管理的修改內容不正確（`error.fields`） |
 | 409 | `device_conflict`、`last_admin`、`setup_not_configured` | 見上 |
+| 409 | `revision_mismatch`、`impact_changed`、`vehicle_has_active_trips`、`request_not_pending` | 網頁管理（§7.5–7.7） |
 | 413 | `payload_too_large` | 請求本體超過限制 |
 | 429 | `rate_limited` | 配對嘗試太多次（附 `Retry-After`） |
 | 503 | `busy` | 同一筆資料被連續修改，這批事件稍後重送（附 `Retry-After`；1.2.0 起事件冪等，重送安全） |

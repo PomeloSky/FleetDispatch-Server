@@ -410,6 +410,8 @@ final class Db
             }
             // 既有資料的版本從 1 開始（之後的寫入再加 1）
             $this->run('UPDATE fd_records SET revision = 1 WHERE revision = 0');
+            // 1.0–1.1 的稽核摘要含駕駛人的個資（證號、電話、備註）：清除摘要，保留誰、何時、做了什麼（docs/audit-history.md）
+            $this->run("UPDATE fd_audit SET summary = '' WHERE entity = 'driver'");
             $this->run("UPDATE fd_meta SET v = '2' WHERE k = 'schema'");
             error_log('[fleetdispatch-server] 資料表已由版本 ' . $v . ' 升級到 2');
         }

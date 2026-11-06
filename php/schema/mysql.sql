@@ -123,9 +123,11 @@ CREATE TABLE IF NOT EXISTS fd_record_history (
     reason VARCHAR(500) NULL,
     seq BIGINT NOT NULL,
     revision BIGINT NOT NULL,
+    outcome VARCHAR(16) NOT NULL DEFAULT 'applied',
     PRIMARY KEY (id),
     KEY fd_history_entity (entity, entity_id, id),
-    KEY fd_history_seq (seq)
+    KEY fd_history_seq (seq),
+    KEY fd_history_at (at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 CREATE TABLE IF NOT EXISTS fd_processed_events (

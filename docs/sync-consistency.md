@@ -36,7 +36,13 @@ FleetDispatch App 以事件（`POST /events`）寫入、以全量（`GET /snapsh
 
 `conformance/api.test.mjs` 的 1.2.0 項目在三種實作執行（Docker／Node、PHP＋SQLite、Cloudflare Workers 本機 D1）：冪等（重送不重複寫入、稽核、歷史；拒絕的結果也一致）、revision 與 conflict、修改前後歷史、兩位管理員同時互相降級、刪除有進行中車趟的車輛被拒絕。
 
-## 6. 尚未處理（下一步）
+## 6. 網頁管理的修改（1.2.0）
 
-- 網頁管理的受控編輯（差異預覽、原因、`expectedRevision`）：開發中，完成後另行說明。
-- App 8.1 使用冪等鍵與 `expectedRevision`（App 端 A-11）：能力協商，主機沒有宣告 `revision` 時照舊。
+- 受控修改、核准、退回、刪除都帶 `expectedRevision`，版本不同時 `409 revision_mismatch`；修改時間以主機時間為準，比它舊的離線修改送來時被略過（歷史留下 `ignored` 摘要）。
+- 多筆的寫入（核准：建立車趟＋更新申請；刪除車輛：車輛＋連鎖刪除）不可分割：D1／Node 在一個 batch 先檢查所有前提（`fd_meta.guard`），PHP 在寫入鎖的交易中。
+- App 的刪除事件也改為同一個方式：車輛的墓碑、連鎖刪除（集合式 SQL，依種類、UUID 取得連續序號）、歷史、稽核、即時位置、冪等紀錄在同一個交易。
+- 詳見 [`admin-management.md`](admin-management.md)。
+
+## 7. 尚未處理（下一步）
+
+- App 8.1 使用冪等鍵與 `expectedRevision`、處理 `conflict`（App 8.1）：能力協商，主機沒有宣告 `revision` 時照舊。

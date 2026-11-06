@@ -4,14 +4,18 @@ declare(strict_types=1);
 
 namespace FleetDispatch;
 
-/** API 錯誤：回應 `{ "error": { "code", "message" } }`（docs/protocol.md §10）。 */
+/** API 錯誤：回應 `{ "error": { "code", "message", …details } }`（docs/protocol.md §10）。 */
 final class ApiError extends \RuntimeException
 {
+    /**
+     * @param array<string, mixed>|null $details 錯誤的補充資料（1.2.0），併入 `error` 物件，例如欄位錯誤 `fields`、衝突時的 `current`
+     */
     public function __construct(
         public readonly int $status,
         public readonly string $errorCode,
         string $message,
         public readonly ?int $retryAfter = null,
+        public readonly ?array $details = null,
     ) {
         parent::__construct($message);
     }

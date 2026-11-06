@@ -105,6 +105,10 @@ test('1.1.0 的資料庫升級到 1.2.0：先備份、資料不變、版本從 1
                              VALUES (?, ?, ?, ?, 0, ?, 'MIG-0001', ?, 'X', ?, ?)`);
     rec.run('vehicle', vehicleId, 1, t, JSON.stringify(vehicle), null, admin, now);
     rec.run('trip', tripId, 2, t, JSON.stringify(trip), '王小明', admin, now);
+    // 1.1.0 的稽核摘要是內容的前 2,000 字：駕駛人的摘要含證號、電話（升級時清除）
+    const audit = old.prepare(`INSERT INTO fd_audit (at, device_id, device_name, entity, entity_id, operation, summary) VALUES (?, ?, '管理員的 iPad', ?, ?, ?, ?)`);
+    audit.run(now, admin, 'driver', uuid(), 'create', JSON.stringify({ name: '王小明', licenseNumber: 'A123456789', phoneNumber: '0912-345-678' }));
+    audit.run(now, admin, 'vehicle', vehicleId, 'create', JSON.stringify(vehicle));
     old.close();
 
     const port = 19300 + Math.floor(Math.random() * 400);
@@ -129,6 +133,9 @@ test('1.1.0 的資料庫升級到 1.2.0：先備份、資料不變、版本從 1
     assert.deepEqual(snap.snapshot.trips, [trip]);
     assert.equal(snap.revisions[`vehicle:${vehicleId}`], 1, '既有資料的版本是 1');
     assert.equal(snap.cursor, 2);
+    const auditRows = (await (await fetch(`${base}/api/v1/admin/audit`, { headers: auth })).json()).entries;
+    assert.equal(auditRows.find((a) => a.entity === 'driver').summary, '', '駕駛人的個資從稽核摘要清除');
+    assert.deepEqual(JSON.parse(auditRows.find((a) => a.entity === 'vehicle').summary), vehicle, '其他摘要不變');
 
     // 新的寫入：版本 2、留下修改前後歷史
     const edited = { ...vehicle, custodian: '總務', lastModifiedAt: t + 5 };

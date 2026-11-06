@@ -117,6 +117,18 @@ final class Util
         return $s;
     }
 
+    /** Unicode 字元（碼位）數，JavaScript 的 `[...s].length`。輸入必須是合法的 UTF-8。 */
+    public static function cpLength(string $s): int
+    {
+        $n = 0;
+        foreach (count_chars($s, 1) as $byte => $count) {
+            if ($byte < 0x80 || $byte >= 0xC0) {
+                $n += $count;
+            }
+        }
+        return $n;
+    }
+
     /** 前 n 個 Unicode 字元（JavaScript 的 `[...s].slice(0, n).join('')`）。 */
     public static function firstCodePoints(string $s, int $n): string
     {

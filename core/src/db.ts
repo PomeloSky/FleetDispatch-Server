@@ -28,9 +28,10 @@ export const SCHEMA_V2_TABLES: string[] = [
     event_id TEXT, operation TEXT NOT NULL, source TEXT NOT NULL,
     actor_device TEXT, actor_identity TEXT, actor_name TEXT,
     before_json TEXT, after_json TEXT, changed_fields TEXT, reason TEXT,
-    seq INTEGER NOT NULL, revision INTEGER NOT NULL)`,
+    seq INTEGER NOT NULL, revision INTEGER NOT NULL, outcome TEXT NOT NULL DEFAULT 'applied')`,
   `CREATE INDEX IF NOT EXISTS fd_history_entity ON fd_record_history (entity, entity_id, id)`,
   `CREATE INDEX IF NOT EXISTS fd_history_seq ON fd_record_history (seq)`,
+  `CREATE INDEX IF NOT EXISTS fd_history_at ON fd_record_history (at)`,
   // 已處理的事件：同一台裝置重送同一個事件時回傳第一次的結果，不重複套用（回應遺失後重送）。
   `CREATE TABLE IF NOT EXISTS fd_processed_events (
     device_id TEXT NOT NULL, event_id TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, result_json TEXT, at INTEGER NOT NULL,
@@ -70,6 +71,11 @@ export const SCHEMA: string[] = [
 
 const BUMP_SEQ: SqlStatement = { sql: `UPDATE fd_meta SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT) WHERE k = 'seq'` };
 const CURRENT_SEQ = `(SELECT CAST(v AS INTEGER) FROM fd_meta WHERE k = 'seq')`;
+/** 多筆寫入的守衛（writeAll）：同一個 batch 一開始檢查所有前提，成立時設為 1；之後每一句都以它為條件，最後改回 0。 */
+const GUARD = `(SELECT v FROM fd_meta WHERE k = 'guard') = '1'`;
+const CASCADE_BASE = `(SELECT CAST(v AS INTEGER) FROM fd_meta WHERE k = 'cascadeBase')`;
+const HISTORY_COLUMNS = `at, entity, entity_id, event_id, operation, source, actor_device, actor_identity, actor_name,
+  before_json, after_json, changed_fields, reason, seq, revision, outcome`;
 
 export interface DeviceRow {
   device_id: string;
@@ -140,6 +146,69 @@ interface RecordRow {
 
 const RECORD_COLUMNS = 'entity, id, seq, modified_at, deleted, payload, driver_uuid, driver_name, requester_device, vehicle_plate, created_by, revision';
 
+/** 管理查詢用的資料列（含最後修改的裝置與時間）。 */
+export interface AdminRow {
+  entity: string;
+  id: string;
+  seq: number;
+  modified_at: number;
+  deleted: number;
+  payload: string | null;
+  driver_uuid: string | null;
+  driver_name: string | null;
+  requester_device: string | null;
+  vehicle_plate: string | null;
+  created_by: string | null;
+  updated_by: string | null;
+  updated_at: number;
+  revision: number;
+}
+
+const ADMIN_COLUMNS = `${RECORD_COLUMNS}, updated_by, updated_at`;
+
+/** 管理查詢的範圍條件（都有索引或資料列本身的欄位；其他條件在程式中判斷）。 */
+export interface AdminFilter {
+  plate?: string | null;
+  /** 駕駛人的車趟：有駕駛人 UUID 時比對 UUID，沒有時比對姓名（與「自己的車趟」相同）。 */
+  driverOwn?: { uuid: string; name: string } | null;
+  driverName?: string | null;
+  createdBy?: string | null;
+}
+
+/** 前提：這筆資料的序號沒有變（`live` 為 true 時也必須不是墓碑）；`seq` 為 null 表示主機上必須沒有這筆（含墓碑）。 */
+export interface Expectation {
+  entity: Entity;
+  id: string;
+  seq: number | null;
+  live?: boolean;
+}
+
+/** writeAll 的一筆寫入（網頁管理與 App 的刪除）。前提由 Expectation 保證，寫入本身不再比較時間。 */
+export interface GuardedWrite {
+  entity: Entity;
+  id: string;
+  operation: 'create' | 'update' | 'delete';
+  payloadText: string | null;
+  modifiedAt: number;
+  fields: ScopeFields;
+  actor: { identity: string; deviceId: string; name: string };
+  source: WriteSource;
+  eventId: string | null;
+  reason: string | null;
+  nextRevision: number;
+  changedFields: string[] | null;
+  /** 稽核紀錄的摘要；null 表示不寫稽核紀錄。 */
+  auditSummary: string | null;
+}
+
+/** 刪除車輛時的連鎖刪除（集合式：子資料再多也是固定幾句，與車輛的墓碑在同一個交易）。 */
+export interface CascadePlan {
+  plate: string;
+  entities: Entity[];
+  at: number;
+  actor: { identity: string; deviceId: string; name: string };
+}
+
 export interface HistoryRow {
   id: number;
   at: number;
@@ -157,6 +226,7 @@ export interface HistoryRow {
   reason: string | null;
   seq: number;
   revision: number;
+  outcome: string;
 }
 
 /** 一次寫入（新增、修改或刪除）的內容與條件。 */
@@ -230,6 +300,8 @@ export class Repo {
       { sql: `INSERT OR IGNORE INTO fd_meta (k, v) VALUES ('serverId', ?)`, params: [crypto.randomUUID().toUpperCase()] },
       { sql: `INSERT OR IGNORE INTO fd_meta (k, v) VALUES ('name', ?)`, params: [defaultName] },
       { sql: `INSERT OR IGNORE INTO fd_meta (k, v) VALUES ('createdAt', ?)`, params: [String(now)] },
+      // 多筆寫入的守衛旗標（writeAll）：同一個交易內設為 1、結束前改回 0
+      { sql: `INSERT OR IGNORE INTO fd_meta (k, v) VALUES ('guard', '0')` },
     ]);
     await this.migrate();
   }
@@ -254,6 +326,8 @@ export class Repo {
       for (const sql of SCHEMA_V2_TABLES) steps.push({ sql });
       // 既有資料的版本從 1 開始（之後的寫入再加 1）
       steps.push({ sql: `UPDATE fd_records SET revision = 1 WHERE revision = 0` });
+      // 1.0–1.1 的稽核摘要含駕駛人的個資（證號、電話、備註）：清除摘要，保留誰、何時、做了什麼（docs/audit-history.md）
+      steps.push({ sql: `UPDATE fd_audit SET summary = '' WHERE entity = 'driver'` });
       steps.push({ sql: `UPDATE fd_meta SET v = '2' WHERE k = 'schema'` });
       await this.db.batch(steps);
       v = 2;
@@ -460,6 +534,224 @@ export class Repo {
     return results[2].changes > 0;
   }
 
+  /**
+   * 多筆不可分割的寫入（網頁管理的修改、核准、刪除與 App 的刪除）：同一個 batch（交易）先檢查所有前提——資料讀取後沒有被改過、
+   * 新資料不存在、額外條件（例如車輛沒有進行中的車趟）——成立時才依序寫入每一筆（序號＋1、修改前後歷史、資料、稽核紀錄），
+   * 再做連鎖刪除、冪等紀錄與其他附帶的敘述；任何前提不成立時整批都不寫。回傳是否寫入（false：呼叫端重讀後重試或回報衝突）。
+   */
+  async writeAll(plan: {
+    expect: Expectation[];
+    conditions?: SqlStatement[];
+    writes: GuardedWrite[];
+    cascade?: CascadePlan | null;
+    processed?: { deviceId: string; eventId: string; resultJson: string } | null;
+    extra?: SqlStatement[];
+    now: number;
+  }): Promise<boolean> {
+    const conds: string[] = [];
+    const condParams: unknown[] = [];
+    for (const e of plan.expect) {
+      if (e.seq === null) {
+        conds.push(`NOT EXISTS (SELECT 1 FROM fd_records WHERE entity = ? AND id = ?)`);
+        condParams.push(e.entity, e.id);
+      } else {
+        conds.push(`EXISTS (SELECT 1 FROM fd_records WHERE entity = ? AND id = ? AND seq = ?${e.live ? ' AND deleted = 0' : ''})`);
+        condParams.push(e.entity, e.id, e.seq);
+      }
+    }
+    for (const c of plan.conditions ?? []) {
+      conds.push(`(${c.sql})`);
+      condParams.push(...(c.params ?? []));
+    }
+    const statements: SqlStatement[] = [
+      { sql: `UPDATE fd_meta SET v = '0' WHERE k = 'guard'` },
+      { sql: `UPDATE fd_meta SET v = '1' WHERE k = 'guard'${conds.length ? ' AND ' + conds.join(' AND ') : ''}`, params: condParams },
+    ];
+    for (const w of plan.writes) {
+      statements.push({ sql: `${BUMP_SEQ.sql} AND ${GUARD}` });
+      statements.push({
+        sql: `INSERT INTO fd_record_history (${HISTORY_COLUMNS})
+              SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT payload FROM fd_records WHERE entity = ? AND id = ? AND deleted = 0), ?, ?, ?, ${CURRENT_SEQ}, ?, 'applied'
+              WHERE ${GUARD}`,
+        params: [
+          plan.now, w.entity, w.id, w.eventId, w.operation, w.source, w.actor.deviceId, w.actor.identity, w.actor.name,
+          w.entity, w.id, w.payloadText, w.changedFields === null ? null : JSON.stringify(w.changedFields), w.reason, w.nextRevision,
+        ],
+      });
+      if (w.payloadText === null) {
+        statements.push({
+          sql: `UPDATE fd_records SET deleted = 1, payload = NULL, seq = ${CURRENT_SEQ}, modified_at = ?, updated_by = ?, updated_at = ?,
+                  revision = revision + 1
+                WHERE entity = ? AND id = ? AND deleted = 0 AND ${GUARD}`,
+          params: [w.modifiedAt, w.actor.deviceId, plan.now, w.entity, w.id],
+        });
+      } else {
+        statements.push({
+          sql: `INSERT INTO fd_records (entity, id, seq, modified_at, deleted, payload, driver_uuid, driver_name, requester_device, vehicle_plate,
+                  created_by, updated_by, updated_at, revision)
+                SELECT ?, ?, ${CURRENT_SEQ}, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, 1 WHERE ${GUARD}
+                ON CONFLICT (entity, id) DO UPDATE SET seq = excluded.seq, modified_at = excluded.modified_at,
+                  payload = excluded.payload, driver_uuid = excluded.driver_uuid, driver_name = excluded.driver_name,
+                  requester_device = excluded.requester_device, vehicle_plate = excluded.vehicle_plate,
+                  created_by = CASE WHEN fd_records.deleted = 1 THEN excluded.created_by ELSE fd_records.created_by END,
+                  deleted = 0, updated_by = excluded.updated_by, updated_at = excluded.updated_at, revision = fd_records.revision + 1`,
+          params: [
+            w.entity, w.id, w.modifiedAt, w.payloadText, w.fields.driverUuid, w.fields.driverName, w.fields.requesterDevice, w.fields.vehiclePlate,
+            w.actor.identity, w.actor.deviceId, plan.now,
+          ],
+        });
+      }
+      if (w.auditSummary !== null) {
+        statements.push({
+          sql: `INSERT INTO fd_audit (at, device_id, device_name, entity, entity_id, operation, summary) SELECT ?, ?, ?, ?, ?, ?, ? WHERE ${GUARD}`,
+          params: [plan.now, w.actor.deviceId, w.actor.name, w.entity, w.id, w.operation, w.auditSummary],
+        });
+      }
+    }
+    if (plan.cascade) statements.push(...Repo.cascadeStatements(plan.cascade, plan.now));
+    if (plan.processed) {
+      statements.push({
+        sql: `INSERT OR IGNORE INTO fd_processed_events (device_id, event_id, status, reason, result_json, at)
+              SELECT ?, ?, 'applied', NULL, ?, ? WHERE ${GUARD}`,
+        params: [plan.processed.deviceId, plan.processed.eventId, plan.processed.resultJson, plan.now],
+      });
+    }
+    for (const x of plan.extra ?? []) statements.push({ sql: `${x.sql} AND ${GUARD}`, params: x.params });
+    statements.push({ sql: `UPDATE fd_meta SET v = '0' WHERE k = 'guard'` });
+    const results = await this.db.batch(statements);
+    return results[1].changes > 0;
+  }
+
+  /**
+   * 連鎖刪除的敘述（在 writeAll 的守衛下）：同車牌的子資料依「種類、UUID」排序，各自取得連續的新序號，
+   * 先寫修改前後歷史（修改前是現在的內容），再改為墓碑、更新序號、寫稽核紀錄、移除即時位置。
+   */
+  private static cascadeStatements(c: CascadePlan, now: number): SqlStatement[] {
+    const marks = c.entities.map(() => '?').join(', ');
+    const scope = `vehicle_plate = ? AND deleted = 0 AND entity IN (${marks})`;
+    const scopeParams = [c.plate, ...c.entities];
+    const fresh = `seq > ${CASCADE_BASE}`;
+    return [
+      { sql: `INSERT OR REPLACE INTO fd_meta (k, v) SELECT 'cascadeBase', v FROM fd_meta WHERE k = 'seq' AND ${GUARD}` },
+      {
+        sql: `INSERT INTO fd_record_history (${HISTORY_COLUMNS})
+              SELECT ?, entity, id, NULL, 'delete', 'cascade', ?, ?, ?, payload, NULL, NULL, 'vehicle-deleted',
+                ${CASCADE_BASE} + ROW_NUMBER() OVER (ORDER BY entity, id), revision + 1, 'applied'
+              FROM fd_records WHERE ${scope} AND ${GUARD}`,
+        params: [now, c.actor.deviceId, c.actor.identity, c.actor.name, ...scopeParams],
+      },
+      {
+        sql: `UPDATE fd_records SET deleted = 1, payload = NULL, modified_at = ?, updated_by = ?, updated_at = ?, revision = revision + 1,
+                seq = (SELECT h.seq FROM fd_record_history h WHERE h.entity = fd_records.entity AND h.entity_id = fd_records.id
+                       AND h.source = 'cascade' AND h.${fresh})
+              WHERE ${scope} AND ${GUARD}`,
+        params: [c.at, c.actor.deviceId, now, ...scopeParams],
+      },
+      {
+        sql: `UPDATE fd_meta SET v = CAST((SELECT MAX(seq) FROM fd_records) AS TEXT)
+              WHERE k = 'seq' AND (SELECT MAX(seq) FROM fd_records) > CAST(v AS INTEGER) AND ${GUARD}`,
+      },
+      {
+        sql: `INSERT INTO fd_audit (at, device_id, device_name, entity, entity_id, operation, summary)
+              SELECT ?, ?, ?, entity, entity_id, 'delete', '' FROM fd_record_history WHERE source = 'cascade' AND ${fresh} AND ${GUARD} ORDER BY seq`,
+        params: [now, c.actor.deviceId, c.actor.name],
+      },
+      {
+        sql: `DELETE FROM fd_locations WHERE trip_id IN (SELECT entity_id FROM fd_record_history WHERE entity = 'trip' AND source = 'cascade' AND ${fresh})
+              AND ${GUARD}`,
+      },
+    ];
+  }
+
+  /**
+   * 沒有套用的事件（拒絕、衝突、略過）留下摘要（1.2.0）：主機上目前的內容、送來的內容、差異的欄位、原因。
+   * 不改資料、不取新的序號；與冪等紀錄在同一個交易。
+   */
+  async recordOutcome(o: {
+    at: number;
+    entity: Entity;
+    id: string;
+    eventId: string | null;
+    operation: string;
+    actor: { identity: string; deviceId: string; name: string };
+    beforeText: string | null;
+    attemptedText: string | null;
+    changedFields: string[] | null;
+    reason: string | null;
+    revision: number;
+    outcome: 'rejected' | 'conflict' | 'ignored';
+    processed: { deviceId: string; eventId: string; status: string; reason: string | null; resultJson: string } | null;
+  }): Promise<void> {
+    const statements: SqlStatement[] = [
+      {
+        sql: `INSERT INTO fd_record_history (${HISTORY_COLUMNS}) VALUES (?, ?, ?, ?, ?, 'app', ?, ?, ?, ?, ?, ?, ?, ${CURRENT_SEQ}, ?, ?)`,
+        params: [
+          o.at, o.entity, o.id, o.eventId, o.operation, o.actor.deviceId, o.actor.identity, o.actor.name, o.beforeText, o.attemptedText,
+          o.changedFields === null ? null : JSON.stringify(o.changedFields), o.reason, o.revision, o.outcome,
+        ],
+      },
+    ];
+    if (o.processed) {
+      statements.push({
+        sql: `INSERT OR IGNORE INTO fd_processed_events (device_id, event_id, status, reason, result_json, at) VALUES (?, ?, ?, ?, ?, ?)`,
+        params: [o.processed.deviceId, o.processed.eventId, o.processed.status, o.processed.reason, o.processed.resultJson, o.at],
+      });
+    }
+    await this.db.batch(statements);
+  }
+
+  // ───────── 管理查詢（1.2.0） ─────────
+
+  /** 某一種類的有效資料（管理查詢用；其他篩選、排序與分頁在程式中處理，三種實作一致）。 */
+  async adminRows(entity: Entity, f: AdminFilter): Promise<AdminRow[]> {
+    const where = ['entity = ?', 'deleted = 0'];
+    const params: unknown[] = [entity];
+    if (f.plate) {
+      where.push('vehicle_plate = ?');
+      params.push(f.plate);
+    }
+    if (f.driverOwn) {
+      where.push('(driver_uuid = ? OR (driver_uuid IS NULL AND driver_name = ? AND driver_name != \'\'))');
+      params.push(f.driverOwn.uuid, f.driverOwn.name);
+    }
+    if (f.driverName) {
+      where.push('driver_name = ?');
+      params.push(f.driverName);
+    }
+    if (f.createdBy) {
+      where.push('created_by = ?');
+      params.push(f.createdBy);
+    }
+    return this.db.all<AdminRow>(`SELECT ${ADMIN_COLUMNS} FROM fd_records WHERE ${where.join(' AND ')} ORDER BY id`, params);
+  }
+
+  /** 一筆資料（含墓碑），管理查詢用。 */
+  async adminRow(entity: Entity, id: string): Promise<AdminRow | null> {
+    return this.db.first<AdminRow>(`SELECT ${ADMIN_COLUMNS} FROM fd_records WHERE entity = ? AND id = ?`, [entity, id]);
+  }
+
+  /** 車牌相同的子資料數（刪除車輛的影響預覽）。 */
+  async childCounts(plate: string, entities: Entity[]): Promise<Record<string, number>> {
+    const marks = entities.map(() => '?').join(', ');
+    const rows = await this.db.all<{ entity: string; n: number }>(
+      `SELECT entity, COUNT(*) AS n FROM fd_records WHERE vehicle_plate = ? AND deleted = 0 AND entity IN (${marks}) GROUP BY entity`,
+      [plate, ...entities],
+    );
+    const out: Record<string, number> = {};
+    for (const e of entities) out[e] = 0;
+    for (const r of rows) out[r.entity] = Number(r.n);
+    return out;
+  }
+
+  /** 綁定這位駕駛人的裝置（還沒解除配對的）。 */
+  async devicesBoundTo(driverUuid: string): Promise<DeviceRow[]> {
+    return this.db.all<DeviceRow>(`SELECT * FROM fd_devices WHERE driver_uuid = ? AND revoked_at IS NULL ORDER BY paired_at`, [driverUuid]);
+  }
+
+  async locationOf(tripId: string): Promise<LocationRow | null> {
+    return this.db.first<LocationRow>(`SELECT * FROM fd_locations WHERE trip_id = ?`, [tripId]);
+  }
+
   // ───────── 已處理的事件（冪等） ─────────
 
   async processedResult(deviceId: string, eventId: string): Promise<string | null> {
@@ -485,9 +777,22 @@ export class Repo {
 
   // ───────── 修改前後歷史 ─────────
 
-  async listHistory(filter: { entity: Entity | null; id: string | null; before: number | null; limit: number }): Promise<HistoryRow[]> {
+  async listHistory(filter: {
+    entity: Entity | null;
+    id: string | null;
+    before: number | null;
+    limit: number;
+    outcome?: 'applied' | 'notApplied' | null;
+    source?: string | null;
+  }): Promise<HistoryRow[]> {
     const where: string[] = [];
     const params: unknown[] = [];
+    if (filter.outcome === 'applied') where.push(`outcome = 'applied'`);
+    if (filter.outcome === 'notApplied') where.push(`outcome != 'applied'`);
+    if (filter.source) {
+      where.push('source = ?');
+      params.push(filter.source);
+    }
     if (filter.entity) {
       where.push('entity = ?');
       params.push(filter.entity);
@@ -518,13 +823,21 @@ export class Repo {
     return row ? Number(row.n) : 0;
   }
 
-  /** 車牌相同的子資料（刪除車輛時連鎖刪除）。 */
-  async liveChildrenOfPlate(plate: string, entities: Entity[]): Promise<{ entity: Entity; id: string; payload: string | null }[]> {
+  /** writeAll 的前提：這個車牌沒有進行中的車趟（與 activeTripsOfPlate 相同的條件，在寫入的交易中再確認一次）。 */
+  static noActiveTrips(plate: string): SqlStatement {
+    return {
+      sql: `NOT EXISTS (SELECT 1 FROM fd_records WHERE entity = 'trip' AND deleted = 0 AND vehicle_plate = ? AND json_extract(payload, '$.isCompleted') = 0)`,
+      params: [plate],
+    };
+  }
+
+  /** writeAll 的前提：連鎖刪除的筆數與預覽時相同（網頁管理的刪除：管理員看到的影響範圍就是實際刪除的範圍）。 */
+  static childCountIs(plate: string, entities: Entity[], count: number): SqlStatement {
     const marks = entities.map(() => '?').join(', ');
-    return this.db.all<{ entity: Entity; id: string; payload: string | null }>(
-      `SELECT entity, id, payload FROM fd_records WHERE vehicle_plate = ? AND deleted = 0 AND entity IN (${marks})`,
-      [plate, ...entities],
-    );
+    return {
+      sql: `(SELECT COUNT(*) FROM fd_records WHERE vehicle_plate = ? AND deleted = 0 AND entity IN (${marks})) = ?`,
+      params: [plate, ...entities, count],
+    };
   }
 
   async allLive(): Promise<StoredRecord[]> {

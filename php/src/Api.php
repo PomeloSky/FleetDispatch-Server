@@ -42,6 +42,14 @@ final class Api
         ['admin/server', ['PATCH']],
         ['admin/audit', ['GET']],
         ['admin/history', ['GET']],
+        // 1.2.0：網頁管理的資料查詢與受控修改（docs/protocol.md §7.2–7.6）
+        ['admin/schema', ['GET']],
+        ['admin/records', ['GET']],
+        ['admin/records/*/*', ['GET', 'PATCH']],
+        ['admin/records/*/*/impact', ['GET']],
+        ['admin/records/*/*/delete', ['POST']],
+        ['admin/requests/*/approve', ['POST']],
+        ['admin/requests/*/reject', ['POST']],
     ];
 
     /** 已處理事件的保留期間（毫秒）。 */
@@ -173,7 +181,32 @@ final class Api
                 return Response::json($this->audit());
             }
             if ($is('GET', 'admin/history')) {
-                return Response::json($this->history());
+                return Response::json($this->history($s));
+            }
+            $admin = new AdminApi($this->repo, $this->db, $s, $this->req);
+            if ($is('GET', 'admin/schema')) {
+                return Response::json($admin->schema());
+            }
+            if ($is('GET', 'admin/records')) {
+                return Response::json($admin->list());
+            }
+            if ($is('GET', 'admin/records/*/*')) {
+                return Response::json($admin->detail($seg[2], $seg[3]));
+            }
+            if ($is('PATCH', 'admin/records/*/*')) {
+                return Response::json($admin->edit($seg[2], $seg[3], $this->readJson()));
+            }
+            if ($is('GET', 'admin/records/*/*/impact')) {
+                return Response::json($admin->impact($seg[2], $seg[3]));
+            }
+            if ($is('POST', 'admin/records/*/*/delete')) {
+                return Response::json($admin->remove($seg[2], $seg[3], $this->readJson()));
+            }
+            if ($is('POST', 'admin/requests/*/approve')) {
+                return Response::json($admin->decide($seg[2], 'approve', $this->readJson()));
+            }
+            if ($is('POST', 'admin/requests/*/reject')) {
+                return Response::json($admin->decide($seg[2], 'reject', $this->readJson()));
             }
         }
         throw new ApiError(404, 'not_found', '找不到這個端點');
@@ -526,33 +559,58 @@ final class Api
                 }
             }
         }
-        $result = $this->applyValidated($s, $raw, $v, $eventId);
-        if ($eventId !== null && $result['status'] !== 'applied') {
-            $this->repo->recordProcessed($s->deviceId, $eventId, (string) $result['status'], $result['reason'] ?? null, Json::encode($result), Util::nowMs());
+        ['result' => $result, 'existing' => $existing] = $this->applyValidated($s, $raw, $v, $eventId);
+        if ($result['status'] !== 'applied') {
+            $this->recordOutcome($s, $v, $eventId, $result, $existing);
         }
         return $result;
     }
 
     /**
-     * 處理一筆已驗證格式的事件（自成一個交易，取得全主機寫入鎖後讀取，授權與寫入看到同一個版本）：
-     * 授權 → expectedRevision → 時間校正 → 最後寫入者勝 → 寫入、修改前後歷史、已處理事件 → 連鎖刪除 → 稽核紀錄。
+     * 沒有套用的事件（拒絕、衝突、略過）：在修改前後歷史留下摘要（主機上的內容、送來的內容、原因），與冪等紀錄在同一個交易。
      *
      * @param array<string, mixed> $v
-     * @return array<string, mixed>
+     * @param array<string, mixed> $result
+     * @param array<string, mixed>|null $existing
+     */
+    private function recordOutcome(Session $s, array $v, ?string $eventId, array $result, ?array $existing): void
+    {
+        $live = $existing !== null && !$existing['deleted'] && $existing['payload'] !== null ? $existing : null;
+        $attempted = $v['op'] === 'delete' || ($result['reason'] ?? null) === 'payload-too-large' || $v['payload'] === null ? null : $v['payloadText'];
+        $reason = $result['reason'] ?? ($v['op'] === 'delete' ? 'not-found' : 'stale');
+        $now = Util::nowMs();
+        $this->db->transaction(function () use ($s, $v, $eventId, $result, $existing, $live, $attempted, $reason, $now): void {
+            $this->repo->addHistory($now, $v['entity'], $v['entityId'], $eventId, $v['op'], 'app', $s->deviceId, $s->identity, $s->deviceName,
+                $live['payloadText'] ?? null, $attempted, $attempted === null ? null : Admin::changedFields($live['payload'] ?? null, $v['payload']),
+                $reason, $this->repo->currentSeq(), (int) ($existing['revision'] ?? 0), (string) $result['status']);
+            if ($eventId !== null) {
+                $this->repo->recordProcessed($s->deviceId, $eventId, (string) $result['status'], $result['reason'] ?? null, Json::encode($result), $now);
+            }
+        });
+    }
+
+    /**
+     * 處理一筆已驗證格式的事件（自成一個交易，取得全主機寫入鎖後讀取，授權與寫入看到同一個版本）：
+     * 授權 → expectedRevision → 時間校正 → 最後寫入者勝 → 寫入、修改前後歷史、已處理事件 → 連鎖刪除 → 稽核紀錄。
+     * 回傳結果與做決定時主機上的版本（沒有套用時留下摘要用）。
+     *
+     * @param array<string, mixed> $v
+     * @return array{result: array<string, mixed>, existing: array<string, mixed>|null}
      */
     private function applyValidated(Session $s, mixed $raw, array $v, ?string $eventId): array
     {
         $id = $v['id'];
-        $expectedRevision = self::optionalRevision($raw);
-        if ($expectedRevision === false) {
-            return ['id' => $id, 'status' => 'rejected', 'reason' => 'invalid-expected-revision'];
-        }
         $entity = $v['entity'];
         $entityId = $v['entityId'];
         $op = $v['op'];
         $text = $v['payloadText'];
+        // 檢查順序與 TypeScript 版相同：先內容大小，再 expectedRevision
         if (strlen($text) > self::MAX_PAYLOAD_LENGTH && Util::utf16Length($text) > self::MAX_PAYLOAD_LENGTH) {
-            return ['id' => $id, 'status' => 'rejected', 'reason' => 'payload-too-large'];
+            return ['result' => ['id' => $id, 'status' => 'rejected', 'reason' => 'payload-too-large'], 'existing' => null];
+        }
+        $expectedRevision = self::optionalRevision($raw);
+        if ($expectedRevision === false) {
+            return ['result' => ['id' => $id, 'status' => 'rejected', 'reason' => 'invalid-expected-revision'], 'existing' => null];
         }
         $now = Util::nowMs();
         $nowApple = Util::msToApple($now);
@@ -561,21 +619,22 @@ final class Api
             $at = min($v['timestamp'], $nowApple);
             return $this->db->transaction(function () use ($s, $id, $entity, $entityId, $at, $now, $expectedRevision, $eventId): array {
                 $existing = $this->repo->getRecord($entity, $entityId);
+                $done = static fn (array $result): array => ['result' => $result, 'existing' => $existing];
                 $reason = Rules::authorize($s, $entity, 'delete', null, $existing);
                 if ($reason !== null) {
-                    return ['id' => $id, 'status' => 'rejected', 'reason' => $reason];
+                    return $done(['id' => $id, 'status' => 'rejected', 'reason' => $reason]);
                 }
                 $conflict = self::conflict($id, $existing, $expectedRevision);
                 if ($conflict !== null) {
-                    return $conflict;
+                    return $done($conflict);
                 }
                 if ($existing === null || $existing['deleted']) {
-                    return ['id' => $id, 'status' => 'ignored'];
+                    return $done(['id' => $id, 'status' => 'ignored']);
                 }
                 $plate = $existing['vehiclePlate'];
                 // 伺服器端的業務規則（1.2.0）：還有進行中車趟的車輛不能刪除（App 也有相同規則）。
                 if ($entity === 'vehicle' && $plate !== null && $plate !== '' && $this->repo->activeTripsOfPlate($plate) > 0) {
-                    return ['id' => $id, 'status' => 'rejected', 'reason' => 'vehicle-has-active-trips'];
+                    return $done(['id' => $id, 'status' => 'rejected', 'reason' => 'vehicle-has-active-trips']);
                 }
                 $seq = $this->db->nextSeq();
                 $this->repo->tombstone($entity, $entityId, $seq, $at, $s->deviceId, $now);
@@ -593,7 +652,7 @@ final class Api
                 if ($entity === 'vehicle' && $plate !== null && $plate !== '') {
                     $this->cascadeVehicle($s, $plate, $at, $now);
                 }
-                return $result;
+                return $done($result);
             });
         }
 
@@ -615,18 +674,19 @@ final class Api
 
         return $this->db->transaction(function () use ($s, $raw, $id, $entity, $entityId, $op, $payload, $timestamp, $text, $restamped, $modifiedAt, $fields, $completed, $now, $expectedRevision, $eventId): array {
             $existing = $this->repo->getRecord($entity, $entityId);
+            $done = static fn (array $result): array => ['result' => $result, 'existing' => $existing];
             $reason = Rules::authorize($s, $entity, $op, $payload, $existing);
             if ($reason !== null) {
-                return ['id' => $id, 'status' => 'rejected', 'reason' => $reason];
+                return $done(['id' => $id, 'status' => 'rejected', 'reason' => $reason]);
             }
             $conflict = self::conflict($id, $existing, $expectedRevision);
             if ($conflict !== null) {
-                return $conflict;
+                return $done($conflict);
             }
             // 最後寫入者勝：沒有這筆、或事件時間嚴格大於現存的修改時間才寫入。墓碑的修改時間是刪除的時間，
             // 比刪除舊的修改不會讓資料復活。
             if ($existing !== null && !($timestamp > $existing['modifiedAt'])) {
-                return ['id' => $id, 'status' => 'ignored'];
+                return $done(['id' => $id, 'status' => 'ignored']);
             }
             $live = $existing !== null && !$existing['deleted'] ? $existing : null;
             $seq = $this->db->nextSeq();
@@ -634,7 +694,7 @@ final class Api
             $revision = ($existing['revision'] ?? 0) + 1;
             $operation = $live !== null ? 'update' : 'create';
             $this->repo->addHistory($now, $entity, $entityId, $eventId, $operation, 'app', $s->deviceId, $s->identity, $s->deviceName,
-                $live['payloadText'] ?? null, $text, self::changedFields($live['payload'] ?? null, $payload), null, $seq, $revision);
+                $live['payloadText'] ?? null, $text, Admin::changedFields($live['payload'] ?? null, $payload), null, $seq, $revision);
             $this->logAudit($s, $entity, $entityId, $operation, $text, $now);
             if ($entity === 'trip' && $completed) {
                 $this->repo->deleteLocation($entityId);
@@ -650,7 +710,7 @@ final class Api
             if ($eventId !== null) {
                 $this->repo->recordProcessed($s->deviceId, $eventId, 'applied', null, Json::encode($result), $now);
             }
-            return $result;
+            return $done($result);
         });
     }
 
@@ -673,7 +733,8 @@ final class Api
 
     private function logAudit(Session $s, string $entity, string $id, string $operation, string $payloadText, int $now): void
     {
-        $this->repo->addAudit($now, $s->deviceId, $s->deviceName, $entity, $id, $operation, Util::firstCodePoints($payloadText, 2000));
+        // 駕駛人只留 UUID 與姓名（不把個資寫進稽核紀錄）
+        $this->repo->addAudit($now, $s->deviceId, $s->deviceName, $entity, $id, $operation, Admin::auditSummary($entity, $payloadText));
     }
 
     // ───────── 即時位置 ─────────
@@ -935,32 +996,12 @@ final class Api
     }
 
     /**
-     * 修改的欄位（第一層的鍵；不含每次都會變的 lastModifiedAt）。新增時是所有欄位。
+     * 修改前後歷史（1.2.0；只有管理員）：依種類、資料 ID、套用結果、來源篩選，新到舊分頁。
+     * 駕駛人的個資預設遮蔽；`pii=1` 顯示完整內容，並在稽核紀錄留下「檢視個資」。
      *
-     * @return list<string>
+     * @return array<string, mixed>
      */
-    private static function changedFields(?\stdClass $before, \stdClass $after): array
-    {
-        $b = $before === null ? [] : get_object_vars($before);
-        $a = get_object_vars($after);
-        $keys = array_unique(array_merge(array_keys($b), array_keys($a)));
-        $out = [];
-        foreach ($keys as $k) {
-            if ($k === 'lastModifiedAt') {
-                continue;
-            }
-            $x = array_key_exists($k, $b) ? Json::encode($b[$k]) : null;
-            $y = array_key_exists($k, $a) ? Json::encode($a[$k]) : null;
-            if ($x !== $y) {
-                $out[] = (string) $k;
-            }
-        }
-        sort($out, SORT_STRING);
-        return $out;
-    }
-
-    /** 修改前後歷史（1.2.0；只有管理員）。 @return array<string, mixed> */
-    private function history(): array
+    private function history(Session $s): array
     {
         $limit = Util::intParam($this->req, 'limit', 50, 1, 200);
         $beforeRaw = $this->req->query('before');
@@ -974,36 +1015,23 @@ final class Api
         if ($idRaw !== null && $id === null) {
             throw ApiError::badRequest('id 必須是 UUID');
         }
-        $rows = $this->repo->listHistory($entity, $id, $before, $limit);
-        $decode = static function (mixed $text): mixed {
-            if ($text === null) {
-                return null;
-            }
-            $j = Json::decodeObject((string) $text);
-            return $j === null ? null : new RawJson((string) $text);
-        };
+        $outcome = $this->req->query('outcome');
+        if ($outcome !== null && $outcome !== '' && $outcome !== 'applied' && $outcome !== 'notApplied') {
+            throw ApiError::badRequest('outcome 必須是 applied 或 notApplied');
+        }
+        $source = $this->req->query('source');
+        if ($source !== null && $source !== '' && !in_array($source, ['app', 'web', 'api', 'cascade'], true)) {
+            throw ApiError::badRequest('source 不正確');
+        }
+        $pii = $this->req->query('pii') === '1';
+        $rows = $this->repo->listHistory($entity, $id, $before, $limit,
+            $outcome === 'applied' || $outcome === 'notApplied' ? $outcome : null, $source === null || $source === '' ? null : $source);
+        if ($pii) {
+            $this->repo->addAudit(Util::nowMs(), $s->deviceId, $s->deviceName, $entity ?? 'history', $id ?? '', 'view-pii', '');
+        }
         $entries = [];
         foreach ($rows as $r) {
-            $entries[] = [
-                'id' => (int) $r['id'],
-                'at' => (int) $r['at'],
-                'entity' => (string) $r['entity'],
-                'entityId' => (string) $r['entity_id'],
-                'eventId' => $r['event_id'] === null ? null : (string) $r['event_id'],
-                'operation' => (string) $r['operation'],
-                'source' => (string) $r['source'],
-                'actor' => [
-                    'deviceId' => $r['actor_device'] === null ? null : (string) $r['actor_device'],
-                    'identity' => $r['actor_identity'] === null ? null : (string) $r['actor_identity'],
-                    'name' => $r['actor_name'] === null ? null : (string) $r['actor_name'],
-                ],
-                'before' => $decode($r['before_json']),
-                'after' => $decode($r['after_json']),
-                'changedFields' => $r['changed_fields'] === null ? null : json_decode((string) $r['changed_fields'], true),
-                'reason' => $r['reason'] === null ? null : (string) $r['reason'],
-                'seq' => (int) $r['seq'],
-                'revision' => (int) $r['revision'],
-            ];
+            $entries[] = Admin::historyJson($r, $pii);
         }
         return ['entries' => $entries, 'next' => count($rows) === $limit ? (int) $rows[count($rows) - 1]['id'] : null];
     }

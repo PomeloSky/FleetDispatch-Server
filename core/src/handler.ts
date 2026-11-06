@@ -1,11 +1,13 @@
 // HTTP 處理：路由、驗證、各端點（規格：docs/protocol.md）。只用 Web 標準的 Request／Response，
 // Cloudflare Workers 直接使用；Docker 版由 node:http 轉接。
 
+import { auditSummary, changedFields, historyJson } from './admin.ts';
+import { AdminApi } from './admin-api.ts';
 import { constantTimeEqual, newPairingCode, newToken, normalizePairingCode, sha256Hex } from './crypto.ts';
-import type { DeviceRow, HistoryRow, SqlDb } from './db.ts';
+import type { DeviceRow, SqlDb } from './db.ts';
 import { Repo } from './db.ts';
 import { authorize, outgoingPayload, parseBinding, scopeFields, validateEvent, visible } from './rules.ts';
-import type { DriverBinding, Entity, EventResult, Role, ServerConfig, Session, SyncEvent } from './types.ts';
+import type { DriverBinding, Entity, EventResult, Role, ServerConfig, Session, StoredRecord, SyncEvent } from './types.ts';
 import { ApiError, ENTITIES, ROLES, SNAPSHOT_KEYS, VEHICLE_CHILDREN } from './types.ts';
 import { badRequest, cleanName, intParam, isObject, msToApple, normalizeUuid, nowMs, num, str } from './util.ts';
 import { SERVER_VERSION } from './version.ts';
@@ -40,42 +42,6 @@ function optionalRevision(raw: unknown): number | null | undefined {
   return typeof n === 'number' && Number.isInteger(n) && n >= 0 ? n : undefined;
 }
 
-/** 修改的欄位（第一層的鍵；不含每次都會變的 lastModifiedAt）。新增時是所有欄位。 */
-function changedFields(before: Record<string, unknown> | null, after: Record<string, unknown>): string[] {
-  const keys = new Set([...Object.keys(before ?? {}), ...Object.keys(after)]);
-  keys.delete('lastModifiedAt');
-  return [...keys].filter((k) => JSON.stringify(before?.[k]) !== JSON.stringify(after[k])).sort();
-}
-
-function parseJson(text: string | null): unknown {
-  if (text === null) return null;
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
-
-/** 修改前後歷史的一筆（API 回傳）。 */
-export function historyJson(r: HistoryRow) {
-  return {
-    id: Number(r.id),
-    at: Number(r.at),
-    entity: r.entity,
-    entityId: r.entity_id,
-    eventId: r.event_id,
-    operation: r.operation,
-    source: r.source,
-    actor: { deviceId: r.actor_device, identity: r.actor_identity, name: r.actor_name },
-    before: parseJson(r.before_json),
-    after: parseJson(r.after_json),
-    changedFields: (parseJson(r.changed_fields) as string[] | null) ?? null,
-    reason: r.reason,
-    seq: Number(r.seq),
-    revision: Number(r.revision),
-  };
-}
-
 /** 每個資料庫連線（Worker isolate、Node 程序）只建立一次資料表（CREATE TABLE IF NOT EXISTS）。 */
 function ensureInit(repo: Repo, config: ServerConfig): Promise<void> {
   let p = initialized.get(repo.db);
@@ -104,6 +70,14 @@ const ROUTES: [string, string[]][] = [
   ['admin/server', ['PATCH']],
   ['admin/audit', ['GET']],
   ['admin/history', ['GET']],
+  // 1.2.0：網頁管理的資料查詢與受控修改（docs/protocol.md §7.2–7.6）
+  ['admin/schema', ['GET']],
+  ['admin/records', ['GET']],
+  ['admin/records/*/*', ['GET', 'PATCH']],
+  ['admin/records/*/*/impact', ['GET']],
+  ['admin/records/*/*/delete', ['POST']],
+  ['admin/requests/*/approve', ['POST']],
+  ['admin/requests/*/reject', ['POST']],
 ];
 
 function matchRoute(seg: string[]): [string, string[]] | null {
@@ -132,7 +106,7 @@ const noContent = (): Response =>
 function errorResponse(e: ApiError): Response {
   const extra: Record<string, string> = {};
   if (e.retryAfter !== undefined) extra['Retry-After'] = String(e.retryAfter);
-  return json({ error: { code: e.code, message: e.message } }, e.status, extra);
+  return json({ error: { code: e.code, message: e.message, ...(e.details ?? {}) } }, e.status, extra);
 }
 
 /** 取 `/api/v1/` 之後的路徑（支援基底路徑與 `/index.php/api/v1/`）。 */
@@ -244,7 +218,16 @@ export class Api {
       if (is('DELETE', 'admin/pairing-codes/*')) return this.deleteCode(seg[2]);
       if (is('PATCH', 'admin/server')) return json(await this.rename(await readJson(request)));
       if (is('GET', 'admin/audit')) return json(await this.audit(url));
-      if (is('GET', 'admin/history')) return json(await this.history(url));
+      if (is('GET', 'admin/history')) return json(await this.history(session, url));
+      const admin = new AdminApi(this.repo, session);
+      if (is('GET', 'admin/schema')) return json(admin.schema());
+      if (is('GET', 'admin/records')) return json(await admin.list(url));
+      if (is('GET', 'admin/records/*/*')) return json(await admin.detail(seg[2], seg[3]));
+      if (is('PATCH', 'admin/records/*/*')) return json(await admin.edit(seg[2], seg[3], await readJson(request)));
+      if (is('GET', 'admin/records/*/*/impact')) return json(await admin.impact(seg[2], seg[3]));
+      if (is('POST', 'admin/records/*/*/delete')) return json(await admin.remove(seg[2], seg[3], await readJson(request)));
+      if (is('POST', 'admin/requests/*/approve')) return json(await admin.decide(seg[2], 'approve', await readJson(request)));
+      if (is('POST', 'admin/requests/*/reject')) return json(await admin.decide(seg[2], 'reject', await readJson(request)));
     }
     throw new ApiError(404, 'not_found', '找不到這個端點');
   }
@@ -431,6 +414,7 @@ export class Api {
 
   /**
    * 套用一筆事件。冪等（1.2.0）：同一台裝置重送同一個事件 ID 時回傳第一次的結果，不重複寫入、不重複稽核。
+   * 沒有套用（拒絕、衝突、略過）時在修改前後歷史留下摘要（主機上的內容、送來的內容、原因）。
    */
   private async applyEvent(s: Session, raw: unknown): Promise<EventResult> {
     const v = validateEvent(raw);
@@ -446,34 +430,58 @@ export class Api {
         }
       }
     }
-    const result = await this.applyValidated(s, v, raw, eventId);
-    if (eventId && result.status !== 'applied') {
-      await this.repo.recordProcessed(s.deviceId, eventId, result.status, result.reason ?? null, JSON.stringify(result), nowMs());
-    }
+    const { result, existing } = await this.applyValidated(s, v, raw, eventId);
+    if (result.status !== 'applied') await this.recordOutcome(s, v, eventId, result, existing);
     return result;
   }
 
-  private async applyValidated(s: Session, v: ValidEvent, raw: unknown, eventId: string | null): Promise<EventResult> {
-    if (v.payloadText.length > LIMITS.maxPayloadBytes) return { id: v.id, status: 'rejected', reason: 'payload-too-large' };
+  /** 沒有套用的事件的摘要與冪等紀錄（同一個交易）。 */
+  private async recordOutcome(s: Session, v: ValidEvent, eventId: string | null, result: EventResult, existing: StoredRecord | null) {
+    const live = existing && !existing.deleted && existing.payload ? existing.payload : null;
+    const attempted = v.op === 'delete' || result.reason === 'payload-too-large' || v.payload === null ? null : v.payloadText;
+    await this.repo.recordOutcome({
+      at: nowMs(),
+      entity: v.entity,
+      id: v.entityId,
+      eventId,
+      operation: v.op,
+      actor: { identity: s.identity, deviceId: s.deviceId, name: s.deviceName },
+      beforeText: live ? JSON.stringify(live) : null,
+      attemptedText: attempted,
+      changedFields: attempted === null ? null : changedFields(live, v.payload),
+      reason: result.reason ?? (v.op === 'delete' ? 'not-found' : 'stale'),
+      revision: existing?.revision ?? 0,
+      outcome: result.status as 'rejected' | 'conflict' | 'ignored',
+      processed: eventId
+        ? { deviceId: s.deviceId, eventId, status: result.status, reason: result.reason ?? null, resultJson: JSON.stringify(result) }
+        : null,
+    });
+  }
+
+  private async applyValidated(
+    s: Session, v: ValidEvent, raw: unknown, eventId: string | null,
+  ): Promise<{ result: EventResult; existing: StoredRecord | null }> {
+    const done = (result: EventResult, existing: StoredRecord | null = null) => ({ result, existing });
+    if (v.payloadText.length > LIMITS.maxPayloadBytes) return done({ id: v.id, status: 'rejected', reason: 'payload-too-large' });
     const expectedRevision = optionalRevision(raw);
-    if (expectedRevision === undefined) return { id: v.id, status: 'rejected', reason: 'invalid-expected-revision' };
+    if (expectedRevision === undefined) return done({ id: v.id, status: 'rejected', reason: 'invalid-expected-revision' });
     const actor = { identity: s.identity, deviceId: s.deviceId, name: s.deviceName };
 
     // 樂觀並行控制：讀取 → 授權 → 以讀到的序號為條件寫入；期間被別的請求改過就重讀、重新授權（授權與寫入看到同一個版本）。
     for (let attempt = 0; attempt < 3; attempt++) {
       const existing = await this.repo.getRecord(v.entity, v.entityId);
       const decision = authorize(s, v.entity, v.op, v.payload, existing);
-      if (!decision.allow) return { id: v.id, status: 'rejected', reason: decision.reason };
+      if (!decision.allow) return done({ id: v.id, status: 'rejected', reason: decision.reason }, existing);
       const live = existing && !existing.deleted ? existing : null;
       const currentRevision = existing?.revision ?? 0;
       if (expectedRevision !== null && expectedRevision !== currentRevision) {
-        return {
+        return done({
           id: v.id,
           status: 'conflict',
           reason: 'revision-mismatch',
           revision: currentRevision,
           current: existing ? { revision: existing.revision, modifiedAt: existing.modifiedAt, deleted: existing.deleted } : undefined,
-        };
+        }, existing);
       }
       const now = nowMs();
       const nowApple = msToApple(now);
@@ -481,23 +489,29 @@ export class Api {
       const processed = (result: EventResult) => (eventId ? { deviceId: s.deviceId, eventId, resultJson: JSON.stringify(result) } : null);
 
       if (v.op === 'delete') {
-        if (!live) return { id: v.id, status: 'ignored' };
+        if (!live) return done({ id: v.id, status: 'ignored' }, existing);
         // 伺服器端的業務規則（1.2.0）：還有進行中車趟的車輛不能刪除（App 也有相同規則）。
-        if (v.entity === 'vehicle' && live.vehiclePlate && (await this.repo.activeTripsOfPlate(live.vehiclePlate)) > 0) {
-          return { id: v.id, status: 'rejected', reason: 'vehicle-has-active-trips' };
+        const plate = v.entity === 'vehicle' && live.vehiclePlate ? live.vehiclePlate : null;
+        if (plate && (await this.repo.activeTripsOfPlate(plate)) > 0) {
+          return done({ id: v.id, status: 'rejected', reason: 'vehicle-has-active-trips' }, existing);
         }
         const at = Math.min(v.timestamp, nowApple);
         const result: EventResult = { id: v.id, status: 'applied', revision: nextRevision };
-        const ok = await this.repo.writeRecord({
-          entity: v.entity, id: v.entityId, operation: 'delete', payloadText: null, modifiedAt: at, eventTime: at,
-          fields: live, actor, source: 'app', eventId, reason: null, expectedSeq: live.seq, nextRevision,
-          changedFields: null, processed: processed(result), now,
+        // 刪除、連鎖刪除（集合式）、歷史、稽核紀錄、即時位置、冪等紀錄在同一個交易：不會只刪一半。
+        const ok = await this.repo.writeAll({
+          expect: [{ entity: v.entity, id: v.entityId, seq: live.seq, live: true }],
+          conditions: plate ? [Repo.noActiveTrips(plate)] : [],
+          writes: [{
+            entity: v.entity, id: v.entityId, operation: 'delete', payloadText: null, modifiedAt: at, fields: live, actor, source: 'app',
+            eventId, reason: null, nextRevision, changedFields: null, auditSummary: '',
+          }],
+          cascade: plate ? { plate, entities: VEHICLE_CHILDREN, at, actor } : null,
+          processed: processed(result),
+          extra: v.entity === 'trip' ? [{ sql: 'DELETE FROM fd_locations WHERE trip_id = ?', params: [v.entityId] }] : [],
+          now,
         });
         if (!ok) continue;
-        await this.logAudit(s, v.entity, v.entityId, 'delete', '', now);
-        if (v.entity === 'trip') await this.repo.deleteLocation(v.entityId);
-        if (v.entity === 'vehicle' && live.vehiclePlate) await this.cascadeVehicle(s, live.vehiclePlate, at, now);
-        return result;
+        return done(result, existing);
       }
 
       // 建立／修改：時間校正 → 最後寫入者勝（SQL 中的條件式寫入）。
@@ -513,7 +527,7 @@ export class Api {
         restamped = true;
       }
       // 最後寫入者勝：墓碑的修改時間是刪除的時間，比刪除舊的修改不會讓資料復活。
-      if (existing && !(timestamp > existing.modifiedAt)) return { id: v.id, status: 'ignored' };
+      if (existing && !(timestamp > existing.modifiedAt)) return done({ id: v.id, status: 'ignored' }, existing);
       const result: EventResult = { id: v.id, status: 'applied', revision: nextRevision };
       if (restamped) result.event = { ...(raw as SyncEvent), timestamp, payloadJSON: payloadText };
       const ok = await this.repo.writeRecord({
@@ -525,30 +539,10 @@ export class Api {
       if (!ok) continue;
       await this.logAudit(s, v.entity, v.entityId, live ? 'update' : 'create', payloadText, now);
       if (v.entity === 'trip' && payload.isCompleted === true) await this.repo.deleteLocation(v.entityId);
-      return result;
+      return done(result, existing);
     }
     // 同一筆資料被連續改動：整批請求稍後重送（事件冪等，重送安全）
     throw new ApiError(503, 'busy', '主機忙碌，請稍後再試', 1);
-  }
-
-  /** 刪除車輛時連鎖刪除同車牌的車趟、保養、工單、巡檢（來源 cascade，留下歷史）。 */
-  private async cascadeVehicle(s: Session, plate: string, at: number, now: number): Promise<void> {
-    const actor = { identity: s.identity, deviceId: s.deviceId, name: s.deviceName };
-    for (const child of await this.repo.liveChildrenOfPlate(plate, VEHICLE_CHILDREN)) {
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const rec = await this.repo.getRecord(child.entity, child.id);
-        if (!rec || rec.deleted) break;
-        const ok = await this.repo.writeRecord({
-          entity: rec.entity, id: rec.id, operation: 'delete', payloadText: null, modifiedAt: at, eventTime: at, fields: rec, actor,
-          source: 'cascade', eventId: null, reason: 'vehicle-deleted', expectedSeq: rec.seq, nextRevision: rec.revision + 1,
-          changedFields: null, processed: null, now,
-        });
-        if (!ok) continue;
-        await this.logAudit(s, rec.entity, rec.id, 'delete', '', now);
-        if (rec.entity === 'trip') await this.repo.deleteLocation(rec.id);
-        break;
-      }
-    }
   }
 
   private async logAudit(s: Session, entity: Entity, id: string, operation: string, payloadText: string, now: number) {
@@ -559,7 +553,8 @@ export class Api {
       entity,
       entity_id: id,
       operation,
-      summary: [...payloadText].slice(0, 2000).join(''),
+      // 駕駛人只留 UUID 與姓名（不把個資寫進稽核紀錄）
+      summary: auditSummary(entity, payloadText),
     });
   }
 
@@ -714,8 +709,11 @@ export class Api {
     return this.info();
   }
 
-  /** 修改前後歷史（1.2.0；只有管理員）：依種類、資料 ID 篩選，新到舊分頁。 */
-  private async history(url: URL) {
+  /**
+   * 修改前後歷史（1.2.0；只有管理員）：依種類、資料 ID、套用結果、來源篩選，新到舊分頁。
+   * 駕駛人的個資預設遮蔽；`pii=1` 顯示完整內容，並在稽核紀錄留下「檢視個資」。
+   */
+  private async history(s: Session, url: URL) {
     const limit = intParam(url, 'limit', 50, 1, 200);
     const beforeRaw = url.searchParams.get('before');
     const before = beforeRaw === null || beforeRaw === '' ? null : intParam(url, 'before', 0, 0, Number.MAX_SAFE_INTEGER);
@@ -724,8 +722,23 @@ export class Api {
     const idRaw = url.searchParams.get('id');
     const id = idRaw === null ? null : normalizeUuid(idRaw);
     if (idRaw !== null && id === null) throw badRequest('id 必須是 UUID');
-    const rows = await this.repo.listHistory({ entity: entityRaw as Entity | null, id, before, limit });
-    return { entries: rows.map(historyJson), next: rows.length === limit ? Number(rows[rows.length - 1].id) : null };
+    const outcome = url.searchParams.get('outcome');
+    if (outcome !== null && outcome !== '' && outcome !== 'applied' && outcome !== 'notApplied') throw badRequest('outcome 必須是 applied 或 notApplied');
+    const source = url.searchParams.get('source');
+    if (source !== null && source !== '' && !['app', 'web', 'api', 'cascade'].includes(source)) throw badRequest('source 不正確');
+    const pii = url.searchParams.get('pii') === '1';
+    const rows = await this.repo.listHistory({
+      entity: entityRaw as Entity | null, id, before, limit,
+      outcome: outcome === 'applied' || outcome === 'notApplied' ? outcome : null,
+      source: source === null || source === '' ? null : source,
+    });
+    if (pii) {
+      await this.repo.addAudit({
+        at: nowMs(), device_id: s.deviceId, device_name: s.deviceName, entity: entityRaw ?? 'history', entity_id: id ?? '',
+        operation: 'view-pii', summary: '',
+      });
+    }
+    return { entries: rows.map((r) => historyJson(r, pii)), next: rows.length === limit ? Number(rows[rows.length - 1].id) : null };
   }
 
   private async audit(url: URL) {

@@ -5,7 +5,7 @@
 | 版本 | 主機 | 內容 |
 | --- | --- | --- |
 | 1 | 1.0.0–1.1.x | 初版 |
-| 2 | 1.2.0 | `fd_records.revision`（每筆資料的版本；既有資料從 1 開始）、`fd_record_history`（修改前後歷史）、`fd_processed_events`（已處理事件，冪等） |
+| 2 | 1.2.0 | `fd_records.revision`（每筆資料的版本；既有資料從 1 開始）、`fd_record_history`（修改前後歷史，含 `outcome` 套用結果）、`fd_processed_events`（已處理事件，冪等）；清除 1.0–1.1 稽核紀錄中駕駛人的摘要（個資）；`fd_meta` 的 `guard`（多筆不可分割寫入用） |
 
 ## 升級前備份
 
@@ -18,7 +18,7 @@
 
 ## 遷移的細節
 
-- **Docker／Node、Cloudflare D1**（`core/src/db.ts` 的 `Repo.migrate`）：版本 1 → 2 的敘述（補 `revision` 欄位、建立新資料表、既有資料的版本設為 1、更新版本）在同一個 batch（交易）中執行；欄位已存在時略過。
+- **Docker／Node、Cloudflare D1**（`core/src/db.ts` 的 `Repo.migrate`）：版本 1 → 2 的敘述（補 `revision` 欄位、建立新資料表、既有資料的版本設為 1、清除駕駛人的稽核摘要、更新版本）在同一個 batch（交易）中執行；欄位已存在時略過。
 - **PHP＋SQLite**（`php/src/Db.php`）：同上，整步在 `BEGIN IMMEDIATE` 的交易中。
 - **PHP＋MySQL**：MySQL 的 DDL 會自動提交，所以以 `GET_LOCK('fleetdispatch_migrate')` 避免兩個請求同時遷移，並逐項檢查（欄位是否已存在、`CREATE TABLE IF NOT EXISTS`），最後才更新版本；中途失敗時下一個請求會從未完成的項目繼續。
 - 資料表已經手動匯入（帳號沒有建表權限）：請先匯入新版的 `php/schema/mysql.sql` 中 1.2.0 的兩個資料表，並以 `ALTER TABLE fd_records ADD COLUMN revision BIGINT NOT NULL DEFAULT 0` 補欄位，主機會把版本更新為 2。
@@ -29,7 +29,7 @@
 
 ## 測試
 
-- `conformance/migration-node.test.mjs`：以 1.1.0 的資料表建立 Docker／Node 版的資料庫，啟動目前版本：自動備份、資料不變、既有資料的版本是 1、新的寫入留下歷史；再次啟動不重複遷移與備份。
+- `conformance/migration-node.test.mjs`：以 1.1.0 的資料表建立 Docker／Node 版的資料庫，啟動目前版本：自動備份、資料不變、既有資料的版本是 1、駕駛人的稽核摘要被清除（其他摘要不變）、新的寫入留下歷史；再次啟動不重複遷移與備份。
 - `conformance/migration-php.test.mjs`：PHP＋SQLite 版的相同測試（需要 `php` 與 `pdo_sqlite`）。
 - Cloudflare D1：以 `wrangler d1 execute --local` 建立 1.1.0 的資料表與資料，再以 `wrangler dev --local` 啟動確認（2026-11-06 手動驗證：版本 1 → 2、既有資料 `revision = 1`、歷史資料表已建立）。
 - MySQL：需要有 MySQL 的環境（CI）執行 `conformance/` 的測試。

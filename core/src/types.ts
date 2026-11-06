@@ -126,11 +126,14 @@ export class ApiError extends Error {
   status: number;
   code: string;
   retryAfter?: number;
+  /** 錯誤的補充資料（1.2.0）：併入回應的 `error` 物件，例如欄位錯誤 `fields`、衝突時的 `current`。 */
+  details?: Record<string, unknown>;
 
-  constructor(status: number, code: string, message: string, retryAfter?: number) {
+  constructor(status: number, code: string, message: string, retryAfter?: number, details?: Record<string, unknown>) {
     super(message);
     this.status = status;
     this.code = code;
     this.retryAfter = retryAfter;
+    this.details = details;
   }
 }

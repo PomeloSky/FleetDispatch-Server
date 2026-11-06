@@ -47,11 +47,13 @@ CREATE TABLE IF NOT EXISTS fd_record_history (
     event_id TEXT, operation TEXT NOT NULL, source TEXT NOT NULL,
     actor_device TEXT, actor_identity TEXT, actor_name TEXT,
     before_json TEXT, after_json TEXT, changed_fields TEXT, reason TEXT,
-    seq INTEGER NOT NULL, revision INTEGER NOT NULL);
+    seq INTEGER NOT NULL, revision INTEGER NOT NULL, outcome TEXT NOT NULL DEFAULT 'applied');
 
 CREATE INDEX IF NOT EXISTS fd_history_entity ON fd_record_history (entity, entity_id, id);
 
 CREATE INDEX IF NOT EXISTS fd_history_seq ON fd_record_history (seq);
+
+CREATE INDEX IF NOT EXISTS fd_history_at ON fd_record_history (at);
 
 CREATE TABLE IF NOT EXISTS fd_processed_events (
     device_id TEXT NOT NULL, event_id TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, result_json TEXT, at INTEGER NOT NULL,
