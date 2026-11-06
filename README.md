@@ -88,6 +88,8 @@ FD_PHP_CONFIG=/path/to/config.php php -S 127.0.0.1:8080 php/public/index.php   #
 - 更新前請先備份（各部署方式的說明都有備份方法）。
 - 1.1.0 起提供網頁管理，預設網址是 `/admin`；不需要時設為 `off` 關閉（Cloudflare 與 Docker 的 `FD_ADMIN_PATH`、PHP 的 `admin_path`）。
 - PHP 版還沒有 `config.php` 時，網頁管理會顯示安裝精靈（檢查環境、測試資料庫、產生設定檔）；已經安裝過的主機不受影響。
+- 1.2.0：資料表自動升級到版本 3（Docker 與 PHP＋SQLite 會先自動備份；MySQL 與 Cloudflare D1 請先自行備份）；網頁管理的登入改用 HttpOnly Cookie，
+  1.1 記住登入的瀏覽器會自動轉換。各版本的內容見 [CHANGELOG.md](CHANGELOG.md)，升級細節見 [docs/migration.md](docs/migration.md)。
 
 ## 授權
 
