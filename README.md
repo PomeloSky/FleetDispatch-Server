@@ -25,6 +25,8 @@
   授權與寫入看到同一個版本、有進行中車趟的車輛不能刪除、資料表版本與自動遷移（升級前自動備份 SQLite）。
 - 1.2.0 管理員的資料 API：資料清單（搜尋、篩選、排序、分頁）、詳情與關聯、受控修改（差異預覽、原因、版本檢查）、刪除的影響預覽與不可分割的連鎖刪除、
   用車申請的核准與退回；沒有套用的事件也留下摘要；歷史中的駕駛人個資預設遮蔽（[docs/admin-management.md](docs/admin-management.md)）。
+- 1.2.0 報表：期間摘要（里程、費用、每公里成本、稼動率；依車輛、駕駛人、成本中心、日期）與 CSV 匯出（車趟、保養、工單、巡檢），
+  計算規則與 App 的報表相同（[docs/reports.md](docs/reports.md)）。
 - 角色與資料範圍：管理員可讀寫全部；駕駛只收到自己的車趟、巡檢與用車申請，其他駕駛人的個資被遮蔽；檢視者唯讀、個資被遮蔽。
   駕駛不能核准自己的申請、不能修改或改派別人的車趟。
 - 用車申請與核准、巡檢、工單、零件、保養等 10 種資料；即時位置（出車中的車輛位置）；稽核紀錄（誰在什麼時候改了什麼）。
@@ -47,7 +49,7 @@ docs/          協定規格與各部署方式的架設說明
 ```
 
 - 協定規格：[docs/protocol.md](docs/protocol.md)（HTTP JSON API v1）；同步一致性 [docs/sync-consistency.md](docs/sync-consistency.md)、
-  稽核與修改歷史 [docs/audit-history.md](docs/audit-history.md)、網頁管理的資料 [docs/admin-management.md](docs/admin-management.md)、
+  稽核與修改歷史 [docs/audit-history.md](docs/audit-history.md)、網頁管理的資料 [docs/admin-management.md](docs/admin-management.md)、報表 [docs/reports.md](docs/reports.md)、
   資料表升級 [docs/migration.md](docs/migration.md)、
   發布檢查與提交身分 [docs/release-checklist.md](docs/release-checklist.md)。
 - 相容性測試：**只對本機新建、空的主機執行**（測試會建立管理員並寫入資料；不要對正式主機執行）：

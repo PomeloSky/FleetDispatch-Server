@@ -7,6 +7,8 @@ import {
 import type { Parsed, QueryParams } from './admin.ts';
 import { ADMIN_SPEC } from './admin-spec.ts';
 import type { AdminFilter, AdminRow, DeviceRow, Expectation, GuardedWrite, Repo } from './db.ts';
+import type { ExportKind, ReportFilter, ReportInput } from './reports.ts';
+import { EXPORT_KINDS, exportCsv, localDate, payloads, summary, validTimeZone } from './reports.ts';
 import { Repo as RepoClass } from './db.ts';
 import { scopeFields } from './rules.ts';
 import type { Entity, Session } from './types.ts';
@@ -447,6 +449,65 @@ export class AdminApi {
       return { deleted: { entity, id: row.id, revision: Number(row.revision) + 1 }, cascade: counts };
     }
     throw new ApiError(503, 'busy', '主機忙碌，請稍後再試', 1);
+  }
+
+  // ───────── 報表（docs/reports.md） ─────────
+
+  /** 報表的篩選條件：期間（毫秒，含 from、不含 to，最多 400 天）、時區、車牌、駕駛（driverId 或姓名）、成本中心。 */
+  private async reportFilter(url: URL): Promise<ReportFilter> {
+    const p = url.searchParams;
+    if (!p.get('from') || !p.get('to')) throw badRequest('需要 from 與 to（1970 起算的毫秒）');
+    const from = intParam(url, 'from', 0, 0, Number.MAX_SAFE_INTEGER);
+    const to = intParam(url, 'to', 0, 0, Number.MAX_SAFE_INTEGER);
+    if (to <= from) throw badRequest('to 必須晚於 from');
+    if (to - from > 400 * 86400 * 1000) throw badRequest('期間最多 400 天');
+    const tz = p.get('tz') || 'UTC';
+    if (!validTimeZone(tz)) throw badRequest('tz 必須是時區名稱（例如 Asia/Taipei）');
+    const plate = p.get('plate');
+    let driver = p.get('driver');
+    const driverRaw = p.get('driverId');
+    if (driverRaw !== null && driverRaw !== '') {
+      const id = normalizeUuid(driverRaw);
+      if (!id) throw badRequest('driverId 必須是 UUID');
+      const d = await this.driverById(id);
+      if (!d) throw new ApiError(404, 'not_found', '找不到這位駕駛人');
+      driver = d.name;
+    }
+    return {
+      from, to, tz,
+      plate: plate === null || plate === '' ? null : plate,
+      driver: driver === null || driver === '' ? null : driver,
+      costCenter: p.get('costCenter'),
+    };
+  }
+
+  private async reportInput(): Promise<ReportInput> {
+    const rows = async (e: Entity) => payloads(await this.repo.adminRows(e, {}));
+    const drivers: ReportInput['drivers'] = [];
+    for (const r of await this.repo.adminRows('driver', {})) {
+      const payload = parsePayload(r.payload);
+      if (payload) drivers.push({ id: r.id, payload });
+    }
+    return {
+      trips: await rows('trip'), vehicles: await rows('vehicle'), drivers, maintenance: await rows('maintenance'),
+      workOrders: await rows('workOrder'), inspections: await rows('inspection'), now: nowMs(),
+    };
+  }
+
+  async reportSummary(url: URL) {
+    const f = await this.reportFilter(url);
+    return summary(await this.reportInput(), f);
+  }
+
+  /** CSV 匯出：`{ filename, body }`（呼叫端以 text/csv 回應）。 */
+  async reportExport(url: URL): Promise<{ filename: string; body: string }> {
+    const kind = url.searchParams.get('kind');
+    if (!(EXPORT_KINDS as readonly (string | null)[]).includes(kind)) throw badRequest('kind 必須是 trips、maintenance、workOrders 或 inspections');
+    const f = await this.reportFilter(url);
+    const body = exportCsv(kind as ExportKind, await this.reportInput(), f);
+    const last = localDate(f.to - 1, f.tz);
+    const filename = `FleetDispatch_${kind}_${localDate(f.from, f.tz)}_${last}${f.plate ? '_' + f.plate : ''}.csv`;
+    return { filename, body };
   }
 
   // ───────── 用車申請的簽核 ─────────

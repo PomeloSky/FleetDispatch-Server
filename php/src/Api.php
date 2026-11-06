@@ -50,6 +50,9 @@ final class Api
         ['admin/records/*/*/delete', ['POST']],
         ['admin/requests/*/approve', ['POST']],
         ['admin/requests/*/reject', ['POST']],
+        // 1.2.0：報表（docs/reports.md）
+        ['admin/reports/summary', ['GET']],
+        ['admin/reports/export', ['GET']],
     ];
 
     /** 已處理事件的保留期間（毫秒）。 */
@@ -207,6 +210,12 @@ final class Api
             }
             if ($is('POST', 'admin/requests/*/reject')) {
                 return Response::json($admin->decide($seg[2], 'reject', $this->readJson()));
+            }
+            if ($is('GET', 'admin/reports/summary')) {
+                return Response::json($admin->reportSummary());
+            }
+            if ($is('GET', 'admin/reports/export')) {
+                return $admin->reportExport();
             }
         }
         throw new ApiError(404, 'not_found', '找不到這個端點');

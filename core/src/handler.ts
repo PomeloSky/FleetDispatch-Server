@@ -78,6 +78,9 @@ const ROUTES: [string, string[]][] = [
   ['admin/records/*/*/delete', ['POST']],
   ['admin/requests/*/approve', ['POST']],
   ['admin/requests/*/reject', ['POST']],
+  // 1.2.0：報表（docs/reports.md）
+  ['admin/reports/summary', ['GET']],
+  ['admin/reports/export', ['GET']],
 ];
 
 function matchRoute(seg: string[]): [string, string[]] | null {
@@ -96,6 +99,21 @@ function json(body: unknown, status = 200, extra: Record<string, string> = {}): 
       'Cache-Control': 'no-store',
       'X-Content-Type-Options': 'nosniff',
       ...extra,
+    },
+  });
+}
+
+/** CSV 下載（報表匯出）：檔名同時給 ASCII 版本與 RFC 5987 的 UTF-8 版本。 */
+function csvResponse(r: { filename: string; body: string }): Response {
+  const ascii = r.filename.replace(/[^A-Za-z0-9._-]/g, '_');
+  return new Response(r.body, {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/csv; charset=utf-8',
+      // RFC 3986 的嚴格編碼（與 PHP 的 rawurlencode 相同）
+      'Content-Disposition': `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(r.filename).replace(/[!'()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase())}`,
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
     },
   });
 }
@@ -228,6 +246,8 @@ export class Api {
       if (is('POST', 'admin/records/*/*/delete')) return json(await admin.remove(seg[2], seg[3], await readJson(request)));
       if (is('POST', 'admin/requests/*/approve')) return json(await admin.decide(seg[2], 'approve', await readJson(request)));
       if (is('POST', 'admin/requests/*/reject')) return json(await admin.decide(seg[2], 'reject', await readJson(request)));
+      if (is('GET', 'admin/reports/summary')) return json(await admin.reportSummary(url));
+      if (is('GET', 'admin/reports/export')) return csvResponse(await admin.reportExport(url));
     }
     throw new ApiError(404, 'not_found', '找不到這個端點');
   }

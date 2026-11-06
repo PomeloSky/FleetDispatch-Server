@@ -22,6 +22,7 @@ require_once __DIR__ . '/Web.php';
 require_once __DIR__ . '/Installer.php';
 require_once __DIR__ . '/AdminSpec.php';
 require_once __DIR__ . '/Admin.php';
+require_once __DIR__ . '/Reports.php';
 require_once __DIR__ . '/AdminApi.php';
 require_once __DIR__ . '/Api.php';
 require_once __DIR__ . '/App.php';

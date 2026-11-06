@@ -122,7 +122,7 @@ export async function adminSuite(t, h) {
     assert.deepEqual(r.records.map((x) => x.id).sort(), [ids.ta, ids.tb].sort());
     r = await list(`entity=trip&q=${encodeURIComponent('acme')}`);
     assert.deepEqual(r.records.map((x) => x.id), [ids.tb], '英文字母不分大小寫');
-    r = await list(`entity=trip&q=${encodeURIComponent('彰化　陳大文')}`);
+    r = await list(`entity=trip&q=${encodeURIComponent('彰化\u3000陳大文')}`);
     assert.deepEqual(r.records.map((x) => x.id), [ids.tb], '多個字詞都要符合（全形空白也能分開）');
     r = await list(`entity=trip&from=${ms(at(2))}&to=${ms(at(3))}`);
     assert.deepEqual(r.records.map((x) => x.id), [ids.tb], '時間範圍：含開始、不含結束');
@@ -432,5 +432,144 @@ export async function adminSuite(t, h) {
     }
     expectError(await get('admin/history?outcome=nope'), 400, 'invalid_request');
     expectError(await get('admin/history?source=nope'), 400, 'invalid_request');
+  });
+}
+
+/**
+ * 報表（docs/reports.md）的固定向量。App 的 test/services/reports/server_alignment_test.dart 以同一組資料（同樣的當地時間）
+ * 斷言相同的數字與 CSV，兩邊的計算規則一致。時區 Asia/Taipei（UTC+8，沒有日光節約時間）。
+ */
+export const REPORT_VECTOR = {
+  tz: 'Asia/Taipei',
+  // 2026-01-01 00:00 到 2026-01-09 00:00（當地時間）
+  from: Date.UTC(2025, 11, 31, 16, 0),
+  to: Date.UTC(2026, 0, 8, 16, 0),
+  csvTrips: '\uFEFF車號,日期,出車時間,回程時間,起始碼錶,結束碼錶,里程,起點,到達地點,任務說明,駕駛人,油種,加油量(L),加油金額,過路費,停車費,電池更換,成本中心\r\n'
+    + 'RPT-A,2026-01-02,09:00,11:30,1000,1050,50,總公司,新竹,送貨,張三,,,,40,,,業務\r\n'
+    + 'RPT-A,2026-01-03,22:00,02:00,1050,1170,120,總公司,台中 → 彰化,送貨,張三,汽油,30,900,,60,,\r\n'
+    + "RPT-B,2026-01-05,08:00,09:00,5000,4990,0,\"A, B\",新竹,'=SUM(A1),李四,,,,,,,\r\n",
+};
+
+export async function reportSuite(t, h) {
+  const { api, expectError, ev, send, uuid, tokens } = h;
+  const admin = tokens.admin;
+  const APPLE = 978307200;
+  /** 台北時間的 Apple 秒。 */
+  const tp = (y, m, d, hh = 0, mm = 0) => Date.UTC(y, m - 1, d, hh - 8, mm) / 1000 - APPLE;
+  const ids = { a: uuid(), b: uuid(), d: uuid(), t1: uuid(), t2: uuid(), t3: uuid(), t4: uuid(), t5: uuid(), t6: uuid(), m1: uuid(), m2: uuid(), w1: uuid(), w2: uuid(), i1: uuid(), i2: uuid() };
+  const V = REPORT_VECTOR;
+  const vehicle = (id, plate) => ({
+    entityUUID: id, plateNumber: plate, custodian: '', vehicleType: 'car', isElectric: false, fuelType: 'gas', brand: '', modelYear: 0, vin: '', lastModifiedAt: tp(2025, 12, 1),
+  });
+  const trip = (id, o) => ({
+    entityUUID: id, startTime: o.start, endTime: o.end ?? o.start, odometerStart: o.odo[0], odometerEnd: o.odo[1], origin: o.origin ?? '總公司',
+    destinations: o.dest ?? ['新竹'], mission: o.mission ?? '送貨', fuelAmount: o.fuel ?? 0, fuelCost: o.fuelCost ?? 0, tollCost: o.toll ?? 0,
+    parkingCost: o.parking ?? 0, fuelType: o.fuelType ?? '', didSwapBattery: false, driver: o.driver, isCompleted: o.done ?? true,
+    lastModifiedAt: o.start + 60, vehiclePlateNumber: o.plate, ...(o.costCenter ? { costCenter: o.costCenter } : {}), ...(o.driverId ? { driverEntityUUID: o.driverId } : {}),
+  });
+  const get = (q) => api('GET', `admin/reports/summary?from=${V.from}&to=${V.to}&tz=${encodeURIComponent(V.tz)}${q}`, { token: admin });
+  const round2 = (v) => Math.floor(v * 100 + 0.5) / 100;
+
+  await t.test('報表：準備固定向量的資料', async () => {
+    const results = await send(admin,
+      ev('vehicle', 'create', ids.a, vehicle(ids.a, 'RPT-A')),
+      ev('vehicle', 'create', ids.b, vehicle(ids.b, 'RPT-B')),
+      ev('driver', 'create', ids.d, { entityUUID: ids.d, name: '張三', licenseNumber: '', phoneNumber: '', notes: '', lastModifiedAt: tp(2025, 12, 1) }),
+      ev('trip', 'create', ids.t1, trip(ids.t1, { plate: 'RPT-A', start: tp(2026, 1, 2, 9), end: tp(2026, 1, 2, 11, 30), odo: [1000, 1050], toll: 40, driver: '張三', driverId: ids.d, costCenter: '業務' })),
+      // 駕駛人資料的姓名優先於車趟上的姓名（App 的規則）；跨夜
+      ev('trip', 'create', ids.t2, trip(ids.t2, { plate: 'RPT-A', start: tp(2026, 1, 3, 22), end: tp(2026, 1, 4, 2), odo: [1050, 1170], fuel: 30, fuelCost: 900, parking: 60, fuelType: '汽油', driver: '舊名', driverId: ids.d, dest: ['台中', '彰化'] })),
+      // 結束里程小於起始：里程算 0；公式與逗號
+      ev('trip', 'create', ids.t3, trip(ids.t3, { plate: 'RPT-B', start: tp(2026, 1, 5, 8), end: tp(2026, 1, 5, 9), odo: [5000, 4990], driver: '李四', origin: 'A, B', mission: '=SUM(A1)' })),
+      // 出車中：不算
+      ev('trip', 'create', ids.t4, trip(ids.t4, { plate: 'RPT-A', start: tp(2026, 1, 6, 8), odo: [1170, 0], driver: '張三', driverId: ids.d, done: false })),
+      // 期間開始前出車、跨入期間：不算車趟，但算稼動（1/1）
+      ev('trip', 'create', ids.t5, trip(ids.t5, { plate: 'RPT-B', start: tp(2025, 12, 31, 23, 30), end: tp(2026, 1, 1, 1), odo: [4900, 4950], driver: '李四' })),
+      // 剛好在期間結束時出車：不算（不含結束）
+      ev('trip', 'create', ids.t6, trip(ids.t6, { plate: 'RPT-B', start: tp(2026, 1, 9), end: tp(2026, 1, 9, 1), odo: [4990, 5000], driver: '李四' })),
+      ev('maintenance', 'create', ids.m1, { entityUUID: ids.m1, maintenanceDate: tp(2026, 1, 4, 10), odometerReading: 1170, intervalKm: 5000, notes: '', cost: 1500, createdAt: tp(2026, 1, 4), lastModifiedAt: tp(2026, 1, 4), vehiclePlateNumber: 'RPT-A' }),
+      ev('maintenance', 'create', ids.m2, { entityUUID: ids.m2, maintenanceDate: tp(2025, 12, 20), odometerReading: 4800, intervalKm: 5000, notes: '', cost: 999, createdAt: tp(2025, 12, 20), lastModifiedAt: tp(2025, 12, 20), vehiclePlateNumber: 'RPT-B' }),
+      ev('workOrder', 'create', ids.w1, {
+        entityUUID: ids.w1, title: '換煞車皮', status: 'inProgress', openedAt: tp(2026, 1, 5, 10), odometer: 1170, assignedTo: '', notes: '',
+        lines: [{ id: uuid(), kind: 'part', detail: '煞車皮', quantity: 2, unitCost: 300 }, { id: uuid(), kind: 'labor', detail: '工資', quantity: 1, unitCost: 150 }, { id: uuid(), kind: 'labor', detail: '檢查', unitCost: 50 }],
+        createdAt: tp(2026, 1, 5, 10), lastModifiedAt: tp(2026, 1, 5, 10), vehiclePlateNumber: 'RPT-A',
+      }),
+      ev('workOrder', 'create', ids.w2, { entityUUID: ids.w2, title: '洗車', status: 'open', openedAt: tp(2026, 1, 7), odometer: 0, assignedTo: '', notes: '', lines: [], createdAt: tp(2026, 1, 7), lastModifiedAt: tp(2026, 1, 7), vehiclePlateNumber: 'RPT-B' }),
+      ev('inspection', 'create', ids.i1, { entityUUID: ids.i1, type: 'preTrip', date: tp(2026, 1, 2, 8, 30), odometer: 1000, driverName: '張三', overallResult: 'pass', notes: '', lines: [], createdAt: tp(2026, 1, 2), lastModifiedAt: tp(2026, 1, 2), vehiclePlateNumber: 'RPT-A' }),
+      ev('inspection', 'create', ids.i2, {
+        entityUUID: ids.i2, type: 'postTrip', date: tp(2026, 1, 5, 7, 45), odometer: 5000, driverName: '李四', overallResult: 'fail', notes: '',
+        lines: [{ id: uuid(), item: '煞車', status: 'defect', severity: 'major', comment: '異音' }, { id: uuid(), item: '燈光', status: 'ok', severity: '', comment: '' }],
+        createdAt: tp(2026, 1, 5), lastModifiedAt: tp(2026, 1, 5), vehiclePlateNumber: 'RPT-B',
+      }),
+    );
+    assert.ok(results.every((r) => r.status === 'applied'), JSON.stringify(results));
+  });
+
+  await t.test('報表：期間摘要（與 App 的報表規則相同）', async () => {
+    const r = await get('');
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    const s = r.json;
+    assert.deepEqual(s.period, { from: V.from, to: V.to, tz: V.tz, firstDay: '2026-01-01', lastDay: '2026-01-08', days: 8 });
+    const x = s.totals;
+    assert.deepEqual(
+      [x.trips, x.distance, x.fuel, x.fuelCost, x.tollCost, x.parkingCost, x.tripCost, x.maintenanceCost, x.workOrderCost, x.totalCost, x.costPerKm],
+      [3, 170, 30, 900, 40, 60, 1000, 1500, 800, 3300, 19.41],
+    );
+    assert.deepEqual([x.maintenanceCount, x.workOrderCount, x.inspectionCount, x.inspectionDefects], [1, 2, 2, 1]);
+    // 稼動率：RPT-A 3 個車日（1/2、1/3、1/4）、RPT-B 2 個（1/1、1/5）；其他測試的車輛在這段期間沒有出車
+    const fleet = s.vehicles.filter((v) => v.vehicleId !== null).length;
+    assert.equal(x.utilization, round2((5 / (8 * fleet)) * 100));
+    const a = s.vehicles.find((v) => v.plate === 'RPT-A');
+    assert.deepEqual([a.vehicleId, a.trips, a.distance, a.tripCost, a.maintenanceCost, a.workOrderCost, a.utilization], [ids.a, 2, 170, 1000, 1500, 800, 37.5]);
+    const b = s.vehicles.find((v) => v.plate === 'RPT-B');
+    assert.deepEqual([b.trips, b.distance, b.tripCost, b.maintenanceCost, b.workOrderCost, b.utilization], [1, 0, 0, 0, 0, 25]);
+    assert.deepEqual(s.drivers.map((d) => [d.name, d.driverId, d.trips, d.distance, d.tripCost]), [['張三', ids.d, 2, 170, 1000], ['李四', null, 1, 0, 0]].sort((p, q) => (p[0] < q[0] ? -1 : 1)));
+    assert.deepEqual(s.costCenters.map((c) => [c.costCenter, c.trips, c.distance, c.tripCost]), [['', 2, 120, 960], ['業務', 1, 50, 40]]);
+    assert.deepEqual(s.daily.map((d) => [d.date, d.trips, d.distance, d.tripCost]), [['2026-01-02', 1, 50, 40], ['2026-01-03', 1, 120, 960], ['2026-01-05', 1, 0, 0]]);
+  });
+
+  await t.test('報表：篩選車牌、駕駛人、成本中心', async () => {
+    let x = (await get('&plate=RPT-A')).json;
+    assert.deepEqual([x.totals.trips, x.totals.distance, x.totals.maintenanceCost, x.totals.workOrderCost, x.totals.inspectionCount, x.totals.utilization], [2, 170, 1500, 800, 1, 37.5]);
+    assert.deepEqual(x.vehicles.map((v) => v.plate), ['RPT-A']);
+    x = (await get(`&driverId=${ids.d}`)).json;
+    assert.deepEqual([x.totals.trips, x.totals.distance, x.totals.tripCost], [2, 170, 1000], '依駕駛人資料的姓名（T2 車趟上寫的是舊名）');
+    x = (await get(`&driver=${encodeURIComponent('李四')}`)).json;
+    assert.deepEqual([x.totals.trips, x.totals.distance], [1, 0]);
+    x = (await get(`&costCenter=${encodeURIComponent('業務')}`)).json;
+    assert.deepEqual([x.totals.trips, x.totals.tripCost], [1, 40]);
+    x = (await get('&costCenter=')).json;
+    assert.deepEqual([x.totals.trips, x.totals.tripCost], [2, 960], '空字串是「未指定」的成本中心');
+    expectError(await api('GET', `admin/reports/summary?from=${V.from}&to=${V.to}&tz=Mars%2FBase`, { token: admin }), 400, 'invalid_request');
+    expectError(await api('GET', `admin/reports/summary?from=${V.to}&to=${V.from}`, { token: admin }), 400, 'invalid_request');
+    expectError(await api('GET', 'admin/reports/summary', { token: admin }), 400, 'invalid_request');
+    expectError(await api('GET', `admin/reports/summary?from=${V.from}&to=${V.from + 401 * 86400000}`, { token: admin }), 400, 'invalid_request');
+    expectError(await api('GET', `admin/reports/summary?from=${V.from}&to=${V.to}&driverId=${uuid()}`, { token: admin }), 404, 'not_found');
+    expectError(await api('GET', `admin/reports/summary?from=${V.from}&to=${V.to}`, { token: tokens.driver }), 403, 'forbidden');
+  });
+
+  await t.test('報表：CSV 匯出（與 App 的報表 CSV 相同的欄位與格式）', async () => {
+    const res = await fetch(`${h.base}/api/v1/admin/reports/export?kind=trips&from=${V.from}&to=${V.to}&tz=${encodeURIComponent(V.tz)}`, { headers: { Authorization: `Bearer ${admin}` } });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('content-type'), 'text/csv; charset=utf-8');
+    assert.match(res.headers.get('content-disposition'), /^attachment; filename="FleetDispatch_trips_2026-01-01_2026-01-08\.csv"; filename\*=UTF-8''FleetDispatch_trips_2026-01-01_2026-01-08\.csv$/);
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+    const body = new TextDecoder('utf-8', { ignoreBOM: true }).decode(await res.arrayBuffer());
+    assert.equal(body, V.csvTrips);
+
+    const csvOf = async (kind, q = '') => {
+      const r = await fetch(`${h.base}/api/v1/admin/reports/export?kind=${kind}&from=${V.from}&to=${V.to}&tz=${encodeURIComponent(V.tz)}${q}`, { headers: { Authorization: `Bearer ${admin}` } });
+      assert.equal(r.status, 200);
+      return new TextDecoder('utf-8', { ignoreBOM: true }).decode(await r.arrayBuffer());
+    };
+    assert.equal(await csvOf('maintenance'), '\uFEFF日期,車牌,里程,費用,備註,保養間隔\r\n2026-01-04,RPT-A,1170,1500,,5000\r\n');
+    assert.equal(await csvOf('workOrders'), '\uFEFF開立日,標題,車輛,狀態,完工日,里程,負責人,工項數,合計金額,備註\r\n'
+      + '2026-01-05,換煞車皮,RPT-A,進行中,,1170,,3,800,\r\n2026-01-07,洗車,RPT-B,待處理,,,,0,0,\r\n');
+    assert.equal(await csvOf('inspections'), '\uFEFF日期,車輛,類型,點檢人,里程,結果,缺陷數,缺陷明細,備註\r\n'
+      + '2026-01-02 08:30,RPT-A,出車前,張三,1000,合格,0,,\r\n2026-01-05 07:45,RPT-B,收車後,李四,5000,不合格,1,煞車（嚴重）：異音,\r\n');
+    assert.equal(await csvOf('trips', '&plate=RPT-B'), V.csvTrips.split('\r\n').filter((l, i) => i === 0 || l.startsWith('RPT-B')).join('\r\n') + '\r\n');
+    const named = await fetch(`${h.base}/api/v1/admin/reports/export?kind=trips&from=${V.from}&to=${V.to}&tz=${encodeURIComponent(V.tz)}&plate=RPT-A`, { headers: { Authorization: `Bearer ${admin}` } });
+    assert.match(named.headers.get('content-disposition'), /filename="FleetDispatch_trips_2026-01-01_2026-01-08_RPT-A\.csv"/);
+    expectError(await api('GET', `admin/reports/export?kind=nope&from=${V.from}&to=${V.to}`, { token: admin }), 400, 'invalid_request');
+    expectError(await api('GET', `admin/reports/export?kind=trips&from=${V.from}&to=${V.to}`, { token: tokens.driver }), 403, 'forbidden');
   });
 }

@@ -76,7 +76,7 @@ export function compareStrings(a: string, b: string): number {
 }
 
 /** 搜尋字詞：以空白（含全形空白）分開，最多 10 個。 */
-const SPACE = /[ \t\n\r\f\v 　]+/;
+const SPACE = /[ \t\n\r\f\v\u00a0\u3000]+/;
 export function searchTerms(q: string | null): string[] {
   if (q === null) return [];
   return q.split(SPACE).filter((t) => t !== '').slice(0, 10).map(asciiLower);

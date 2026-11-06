@@ -272,6 +272,7 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 | `PATCH /admin/records/{entity}/{id}` | 受控修改（§7.5，1.2.0） |
 | `GET …/{id}/impact`、`POST …/{id}/delete` | 刪除的影響預覽與刪除（§7.6，1.2.0） |
 | `POST /admin/requests/{id}/approve`、`…/reject` | 用車申請的核准、退回（§7.7，1.2.0） |
+| `GET /admin/reports/summary`、`GET /admin/reports/export` | 報表的期間摘要與 CSV 匯出（§7.8，1.2.0） |
 
 `Device`：`{ "deviceId", "name", "platform", "role", "driverBinding", "pairedAt", "lastSeenAt", "tokenExpiresAt", "revokedAt" }`（時間為毫秒，沒有時 `null`）。
 
@@ -404,6 +405,11 @@ App 的資料格式中，巡檢、工單與車趟之間沒有直接的關聯欄�
   起始里程是同車最後一趟已回車的結束里程，沒有時 0；駕駛姓名是申請人；`driverId` 是指派的駕駛人），申請改為 `approved`、`approvedAt`、
   `approvedBy`（網頁管理的裝置名稱）、`resultingTripUUID`。兩筆在同一個交易寫入 → `{ "request": Record, "trip": Record }`。
 - 退回 `{ "expectedRevision", "rejectionReason" }`（1–500 個字）：`rejected`、`approvedAt`、`approvedBy`、`rejectionReason` → `{ "request", "trip": null }`。
+
+### 7.8 報表 `GET /admin/reports/summary`、`GET /admin/reports/export`（1.2.0）
+
+只有管理員。期間摘要（里程、費用、稼動率；依車輛、駕駛人、成本中心、日期）與 CSV 匯出（車趟、保養、工單、巡檢），
+計算規則、參數、回應與 CSV 格式見 [`reports.md`](reports.md)。規則與 App 的報表相同，三種實作以同一組固定向量測試。
 
 ## 8. 即時位置
 

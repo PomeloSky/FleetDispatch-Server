@@ -7,7 +7,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { adminSuite } from './admin-suite.mjs';
+import { adminSuite, reportSuite } from './admin-suite.mjs';
 
 const BASE = (process.env.FD_BASE ?? 'http://127.0.0.1:8080').replace(/\/+$/, '');
 const SETUP = process.env.FD_SETUP_TOKEN ?? '';
@@ -682,6 +682,7 @@ test('FleetDispatch Server API v1', async (t) => {
 
   // 網頁管理的資料 API（1.2.0）：在解除配對與嘗試次數限制之前（需要管理員與駕駛的權杖）
   await adminSuite(t, { api, expectError, ev, send, uuid, nowApple, tokens, ids, allChanges });
+  await reportSuite(t, { api, expectError, ev, send, uuid, tokens, base: BASE });
 
   await t.test('限制：事件太多、裝置自行解除配對', async () => {
     const many = Array.from({ length: 501 }, () => ev('part', 'create', uuid(), null));

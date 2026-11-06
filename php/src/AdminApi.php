@@ -581,6 +581,104 @@ final class AdminApi
         });
     }
 
+    // ───────── 報表（docs/reports.md） ─────────
+
+    /** @return array{from: int, to: int, tz: string, plate: ?string, driver: ?string, costCenter: ?string} */
+    private function reportFilter(): array
+    {
+        $fromRaw = $this->req->query('from');
+        $toRaw = $this->req->query('to');
+        if ($fromRaw === null || $fromRaw === '' || $toRaw === null || $toRaw === '') {
+            throw ApiError::badRequest('需要 from 與 to（1970 起算的毫秒）');
+        }
+        $from = Util::intParam($this->req, 'from', 0, 0, Util::MAX_SAFE_INTEGER);
+        $to = Util::intParam($this->req, 'to', 0, 0, Util::MAX_SAFE_INTEGER);
+        if ($to <= $from) {
+            throw ApiError::badRequest('to 必須晚於 from');
+        }
+        if ($to - $from > 400 * 86400 * 1000) {
+            throw ApiError::badRequest('期間最多 400 天');
+        }
+        $tz = $this->req->query('tz');
+        $tz = $tz === null || $tz === '' ? 'UTC' : $tz;
+        if (!Reports::validTimeZone($tz)) {
+            throw ApiError::badRequest('tz 必須是時區名稱（例如 Asia/Taipei）');
+        }
+        $plate = $this->req->query('plate');
+        $driver = $this->req->query('driver');
+        $driverRaw = $this->req->query('driverId');
+        if ($driverRaw !== null && $driverRaw !== '') {
+            $id = Util::normalizeUuid($driverRaw);
+            if ($id === null) {
+                throw ApiError::badRequest('driverId 必須是 UUID');
+            }
+            $d = $this->driverById($id);
+            if ($d === null) {
+                throw new ApiError(404, 'not_found', '找不到這位駕駛人');
+            }
+            $driver = $d['name'];
+        }
+        return [
+            'from' => $from, 'to' => $to, 'tz' => $tz,
+            'plate' => $plate === null || $plate === '' ? null : $plate,
+            'driver' => $driver === null || $driver === '' ? null : $driver,
+            'costCenter' => $this->req->query('costCenter'),
+        ];
+    }
+
+    /** @return array<string, mixed> */
+    private function reportInput(): array
+    {
+        $rows = function (string $entity): array {
+            $out = [];
+            foreach ($this->repo->adminRows($entity, []) as $r) {
+                $p = $r['payload'] === null ? null : Json::decodeObject((string) $r['payload']);
+                if ($p !== null) {
+                    $out[] = $p;
+                }
+            }
+            return $out;
+        };
+        $drivers = [];
+        foreach ($this->repo->adminRows('driver', []) as $r) {
+            $p = $r['payload'] === null ? null : Json::decodeObject((string) $r['payload']);
+            if ($p !== null) {
+                $drivers[] = ['id' => (string) $r['id'], 'payload' => $p];
+            }
+        }
+        return [
+            'trips' => $rows('trip'), 'vehicles' => $rows('vehicle'), 'drivers' => $drivers, 'maintenance' => $rows('maintenance'),
+            'workOrders' => $rows('workOrder'), 'inspections' => $rows('inspection'), 'now' => Util::nowMs(),
+        ];
+    }
+
+    /** @return array<string, mixed> */
+    public function reportSummary(): array
+    {
+        $f = $this->reportFilter();
+        return Reports::summary($this->reportInput(), $f);
+    }
+
+    /** CSV 匯出（text/csv；檔名同時給 ASCII 版本與 RFC 5987 的 UTF-8 版本）。 */
+    public function reportExport(): Response
+    {
+        $kind = $this->req->query('kind');
+        if (!in_array($kind, Reports::EXPORT_KINDS, true)) {
+            throw ApiError::badRequest('kind 必須是 trips、maintenance、workOrders 或 inspections');
+        }
+        $f = $this->reportFilter();
+        $body = Reports::exportCsv($kind, $this->reportInput(), $f);
+        $filename = 'FleetDispatch_' . $kind . '_' . Reports::localDate($f['from'], $f['tz']) . '_' . Reports::localDate($f['to'] - 1, $f['tz'])
+            . ($f['plate'] !== null ? '_' . $f['plate'] : '') . '.csv';
+        $ascii = preg_replace('/[^A-Za-z0-9._-]/', '_', $filename) ?? 'export.csv';
+        return Response::raw(200, $body, [
+            'Content-Type' => 'text/csv; charset=utf-8',
+            'Content-Disposition' => 'attachment; filename="' . $ascii . '"; filename*=UTF-8\'\'' . rawurlencode($filename),
+            'Cache-Control' => 'no-store',
+            'X-Content-Type-Options' => 'nosniff',
+        ]);
+    }
+
     // ───────── 用車申請的簽核 ─────────
 
     /** @return array<string, mixed> */
