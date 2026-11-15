@@ -289,7 +289,7 @@ final class Rules
         if ($op === 'delete') {
             return ['ok' => true, 'id' => $id, 'entity' => $entity, 'op' => $op, 'entityId' => $entityId, 'timestamp' => $timestamp, 'payload' => null, 'payloadText' => ''];
         }
-        $payload = Json::decodeObject($payloadText);
+        $payload = Json::decodeObject($payloadText, Json::PAYLOAD_DEPTH);
         if ($payload === null) {
             return ['ok' => false, 'id' => $id, 'reason' => 'invalid-payload'];
         }
@@ -299,8 +299,17 @@ final class Rules
         if (Util::num($payload->lastModifiedAt ?? null) === null) {
             return ['ok' => false, 'id' => $id, 'reason' => 'invalid-payload'];
         }
+        // 範圍欄位的長度上限（與 core/src/rules.ts 的 MAX_SCOPE_TEXT 相同；docs/security-review.md §4.6）
+        foreach (self::scopeFields($entity, $payload) as $v) {
+            if ($v !== null && Util::cpLength($v) > self::MAX_SCOPE_TEXT) {
+                return ['ok' => false, 'id' => $id, 'reason' => 'invalid-payload'];
+            }
+        }
         return ['ok' => true, 'id' => $id, 'entity' => $entity, 'op' => $op, 'entityId' => $entityId, 'timestamp' => $timestamp, 'payload' => $payload, 'payloadText' => $payloadText];
     }
+
+    /** 範圍欄位（車牌、駕駛姓名、駕駛人 UUID、申請的裝置）的長度上限（字元）。 */
+    public const MAX_SCOPE_TEXT = 200;
 
     /**
      * 綁定的駕駛人 `{driverUuid, driverName}`（driverName 去除前後空白後不能是空字串，最多 200 個字元）。

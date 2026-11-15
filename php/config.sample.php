@@ -32,6 +32,10 @@ return [
     // 設為 'off' 關閉網頁管理。首頁顯示 FleetDispatch App 的介紹與下載連結。
     'admin_path' => '/admin',
 
+    // 修改前後歷史保留的天數（選填）：0 或不寫＝不自動刪除；設定時至少 30 天，較舊的歷史自動刪除
+    // （歷史含駕駛人的個資；稽核紀錄不刪除）。見 docs/audit-history.md §4。
+    // 'history_retention_days' => 730,
+
     // 前面有幾層「你自己控制的」反向代理（用來取得真實的來源 IP，配對嘗試次數限制會用到）：
     //   0 = PHP 直接面對網際網路（一般虛擬主機、Apache／nginx 直接跑 PHP）：不採信 X-Forwarded-For。
     //   1 = 前面剛好有一層反向代理（例如 Cloudflare 代理、另一台 nginx、主機商的 nginx 前端）。

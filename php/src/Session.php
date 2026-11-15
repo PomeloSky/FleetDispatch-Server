@@ -13,6 +13,8 @@ final class Session
      *                         以同一個 deviceId 重新配對不會繼承之前的擁有權
      * @param string $role admin、driver 或 viewer（資料庫中不認得的角色視為 viewer）
      * @param array{driverUuid: string, driverName: string}|null $binding 綁定的駕駛人（只有駕駛有）
+     * @param array{kind: string, until: int, csrf: string}|null $web 以 Cookie 登入的網頁管理（1.2.0）：種類（session、remember）、
+     *                                                              登入期限、CSRF 權杖；App 與 1.1 的網頁權杖是 null
      */
     public function __construct(
         public readonly string $deviceId,
@@ -21,6 +23,7 @@ final class Session
         public readonly string $role,
         public readonly ?array $binding,
         public readonly int $tokenExpiresAt,
+        public readonly ?array $web = null,
     ) {
     }
 }

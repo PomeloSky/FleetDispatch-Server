@@ -1,15 +1,24 @@
 // HTTP 處理：路由、驗證、各端點（規格：docs/protocol.md）。只用 Web 標準的 Request／Response，
 // Cloudflare Workers 直接使用；Docker 版由 node:http 轉接。
 
+import { auditSummary, changedFields, historyJson } from './admin.ts';
+import { AdminApi } from './admin-api.ts';
 import { constantTimeEqual, newPairingCode, newToken, normalizePairingCode, sha256Hex } from './crypto.ts';
 import type { DeviceRow, SqlDb } from './db.ts';
 import { Repo } from './db.ts';
 import { authorize, outgoingPayload, parseBinding, scopeFields, validateEvent, visible } from './rules.ts';
-import type { DriverBinding, Entity, EventResult, Role, ServerConfig, Session, SyncEvent } from './types.ts';
+import type { DriverBinding, Entity, EventResult, Role, ServerConfig, Session, StoredRecord, SyncEvent } from './types.ts';
 import { ApiError, ENTITIES, ROLES, SNAPSHOT_KEYS, VEHICLE_CHILDREN } from './types.ts';
-import { badRequest, cleanName, intParam, isObject, msToApple, normalizeUuid, nowMs, num, str } from './util.ts';
+import {
+  MAX_JSON_NESTING, badRequest, cleanName, intParam, isObject, msToApple, normalizeUuid, nowMs, num, rateLimitKey, str, withinJsonNesting,
+} from './util.ts';
 import { SERVER_VERSION } from './version.ts';
 import { acceptsHtml, adminResponse, homeResponse, isHome, matchAdmin } from './web.ts';
+import {
+  CSRF_HEADER, WEB_SESSION_LIFETIME, WEB_TOUCH_INTERVAL_MS, clearSessionCookie, crossSite, csrfToken, isJsonContent,
+  readSessionCookie, sessionCookie, webExpiry, webSessionKind,
+} from './web-session.ts';
+import type { WebSessionKind } from './web-session.ts';
 
 export const LIMITS = { maxEventsPerRequest: 500, maxBodyBytes: 5 * 1024 * 1024, maxPayloadBytes: 1024 * 1024 };
 const TOKEN_TTL_MS = 90 * 24 * 3600 * 1000;
@@ -27,6 +36,18 @@ export interface RequestContext {
 }
 
 const initialized = new WeakMap<SqlDb, Promise<void>>();
+const lastPurge = new WeakMap<SqlDb, number>();
+/** 已處理事件的保留期間。 */
+const PROCESSED_TTL_MS = 30 * 24 * 3600 * 1000;
+
+type ValidEvent = Extract<ReturnType<typeof validateEvent>, { ok: true }>;
+
+/** 事件的 `expectedRevision`（1.2.0，選填）：沒有時 null；不是非負整數時 undefined（拒絕）。 */
+function optionalRevision(raw: unknown): number | null | undefined {
+  if (!isObject(raw) || raw.expectedRevision === undefined || raw.expectedRevision === null) return null;
+  const n = raw.expectedRevision;
+  return typeof n === 'number' && Number.isInteger(n) && n >= 0 ? n : undefined;
+}
 
 /** 每個資料庫連線（Worker isolate、Node 程序）只建立一次資料表（CREATE TABLE IF NOT EXISTS）。 */
 function ensureInit(repo: Repo, config: ServerConfig): Promise<void> {
@@ -43,6 +64,9 @@ function ensureInit(repo: Repo, config: ServerConfig): Promise<void> {
 const ROUTES: [string, string[]][] = [
   ['info', ['GET']],
   ['pair', ['POST']],
+  // 1.2.0：網頁管理以 HttpOnly Cookie 登入（docs/protocol.md §13.1）
+  ['web/login', ['POST']],
+  ['web/upgrade', ['POST']],
   ['session', ['GET']],
   ['unpair', ['POST']],
   ['snapshot', ['GET']],
@@ -55,6 +79,18 @@ const ROUTES: [string, string[]][] = [
   ['admin/pairing-codes/*', ['DELETE']],
   ['admin/server', ['PATCH']],
   ['admin/audit', ['GET']],
+  ['admin/history', ['GET']],
+  // 1.2.0：網頁管理的資料查詢與受控修改（docs/protocol.md §7.2–7.6）
+  ['admin/schema', ['GET']],
+  ['admin/records', ['GET']],
+  ['admin/records/*/*', ['GET', 'PATCH']],
+  ['admin/records/*/*/impact', ['GET']],
+  ['admin/records/*/*/delete', ['POST']],
+  ['admin/requests/*/approve', ['POST']],
+  ['admin/requests/*/reject', ['POST']],
+  // 1.2.0：報表（docs/reports.md）
+  ['admin/reports/summary', ['GET']],
+  ['admin/reports/export', ['GET']],
 ];
 
 function matchRoute(seg: string[]): [string, string[]] | null {
@@ -77,13 +113,28 @@ function json(body: unknown, status = 200, extra: Record<string, string> = {}): 
   });
 }
 
-const noContent = (): Response =>
-  new Response(null, { status: 204, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
+/** CSV 下載（報表匯出）：檔名同時給 ASCII 版本與 RFC 5987 的 UTF-8 版本。 */
+function csvResponse(r: { filename: string; body: string }): Response {
+  const ascii = r.filename.replace(/[^A-Za-z0-9._-]/g, '_');
+  return new Response(r.body, {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/csv; charset=utf-8',
+      // RFC 3986 的嚴格編碼（與 PHP 的 rawurlencode 相同）
+      'Content-Disposition': `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(r.filename).replace(/[!'()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase())}`,
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    },
+  });
+}
+
+const noContent = (extra: Record<string, string> = {}): Response =>
+  new Response(null, { status: 204, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', ...extra } });
 
 function errorResponse(e: ApiError): Response {
   const extra: Record<string, string> = {};
   if (e.retryAfter !== undefined) extra['Retry-After'] = String(e.retryAfter);
-  return json({ error: { code: e.code, message: e.message } }, e.status, extra);
+  return json({ error: { code: e.code, message: e.message, ...(e.details ?? {}) } }, e.status, extra);
 }
 
 /** 取 `/api/v1/` 之後的路徑（支援基底路徑與 `/index.php/api/v1/`）。 */
@@ -99,6 +150,8 @@ async function readJson(request: Request): Promise<Record<string, unknown>> {
   if (declared > LIMITS.maxBodyBytes) throw new ApiError(413, 'payload_too_large', '請求本體超過 5 MB');
   const text = await request.text();
   if (new TextEncoder().encode(text).length > LIMITS.maxBodyBytes) throw new ApiError(413, 'payload_too_large', '請求本體超過 5 MB');
+  // 巢狀層數與 PHP 版相同（docs/security-review.md §4.7）
+  if (!withinJsonNesting(text, MAX_JSON_NESTING)) throw badRequest('請求本體不是合法的 JSON');
   try {
     const v: unknown = JSON.parse(text);
     if (!isObject(v)) throw badRequest('請求本體必須是 JSON 物件');
@@ -124,7 +177,18 @@ function deviceJson(d: DeviceRow) {
     lastSeenAt: d.last_seen_at === null ? null : Number(d.last_seen_at),
     tokenExpiresAt: d.token_expires_at === null || d.revoked_at !== null ? null : Number(d.token_expires_at),
     revokedAt: d.revoked_at === null ? null : Number(d.revoked_at),
+    // 1.2.0：網頁管理的登入（`session` 不記住、`remember` 記住；App 與 1.1 的網頁權杖是 null）與登入期限
+    webSession: webSessionKind(d.web_session),
+    sessionUntil: webSessionKind(d.web_session) === null || d.session_until === null ? null : Number(d.session_until),
   };
+}
+
+/** 網頁登入與轉換（沒有登入 Cookie 的請求）：自訂標頭、同一個來源、JSON 本體。 */
+function requireWebRequest(request: Request): void {
+  if ((request.headers.get(CSRF_HEADER) ?? '').trim() === '' || crossSite(request)) {
+    throw new ApiError(403, 'csrf_failed', '請求來源驗證失敗，請重新整理網頁後再試');
+  }
+  if (!isJsonContent(request)) throw new ApiError(415, 'unsupported_media_type', '請求本體必須是 JSON（Content-Type: application/json）');
 }
 
 export class Api {
@@ -135,7 +199,8 @@ export class Api {
   constructor(ctx: RequestContext) {
     this.repo = new Repo(ctx.db);
     this.config = ctx.config;
-    this.ip = ctx.clientIp;
+    // 配對嘗試次數限制的來源（IPv6 以 /64 網段計算，docs/security-review.md §4.5）
+    this.ip = rateLimitKey(ctx.clientIp);
   }
 
   async handle(request: Request): Promise<Response> {
@@ -173,12 +238,20 @@ export class Api {
 
     if (is('GET', 'info')) return json(await this.info());
     if (is('POST', 'pair')) return json(await this.pair(await readJson(request)));
+    if (is('POST', 'web/login')) {
+      requireWebRequest(request);
+      return this.webLogin(request, await readJson(request));
+    }
+    if (is('POST', 'web/upgrade')) {
+      requireWebRequest(request);
+      return this.webUpgrade(request, await readJson(request));
+    }
 
-    // 以下需要權杖。
+    // 以下需要權杖（App：Authorization 標頭；網頁管理：登入 Cookie）。
     const session = await this.authenticate(request);
 
     if (is('GET', 'session')) return json(await this.sessionJson(session));
-    if (is('POST', 'unpair')) return this.unpairSelf(session);
+    if (is('POST', 'unpair')) return this.unpairSelf(request, session);
     if (is('GET', 'snapshot')) return json(await this.snapshot(session));
     if (is('GET', 'changes')) return json(await this.changes(session, url));
     if (is('POST', 'events')) return json(await this.events(session, await readJson(request)));
@@ -188,13 +261,25 @@ export class Api {
     if (seg[0] === 'admin') {
       if (session.role !== 'admin') throw new ApiError(403, 'forbidden', '只有管理員可以使用');
       if (is('GET', 'admin/devices')) return json({ devices: (await this.repo.listDevices()).map(deviceJson) });
-      if (is('PATCH', 'admin/devices/*')) return json(await this.patchDevice(seg[2], await readJson(request)));
-      if (is('DELETE', 'admin/devices/*')) return this.deleteDevice(seg[2]);
+      if (is('PATCH', 'admin/devices/*')) return json(await this.patchDevice(session, seg[2], await readJson(request)));
+      if (is('DELETE', 'admin/devices/*')) return this.deleteDevice(session, seg[2]);
       if (is('POST', 'admin/pairing-codes')) return json(await this.createCode(session, await readJson(request)));
       if (is('GET', 'admin/pairing-codes')) return json(await this.listCodes());
-      if (is('DELETE', 'admin/pairing-codes/*')) return this.deleteCode(seg[2]);
-      if (is('PATCH', 'admin/server')) return json(await this.rename(await readJson(request)));
+      if (is('DELETE', 'admin/pairing-codes/*')) return this.deleteCode(session, seg[2]);
+      if (is('PATCH', 'admin/server')) return json(await this.rename(session, await readJson(request)));
       if (is('GET', 'admin/audit')) return json(await this.audit(url));
+      if (is('GET', 'admin/history')) return json(await this.history(session, url));
+      const admin = new AdminApi(this.repo, session);
+      if (is('GET', 'admin/schema')) return json(admin.schema());
+      if (is('GET', 'admin/records')) return json(await admin.list(url));
+      if (is('GET', 'admin/records/*/*')) return json(await admin.detail(seg[2], seg[3]));
+      if (is('PATCH', 'admin/records/*/*')) return json(await admin.edit(seg[2], seg[3], await readJson(request)));
+      if (is('GET', 'admin/records/*/*/impact')) return json(await admin.impact(seg[2], seg[3]));
+      if (is('POST', 'admin/records/*/*/delete')) return json(await admin.remove(seg[2], seg[3], await readJson(request)));
+      if (is('POST', 'admin/requests/*/approve')) return json(await admin.decide(seg[2], 'approve', await readJson(request)));
+      if (is('POST', 'admin/requests/*/reject')) return json(await admin.decide(seg[2], 'reject', await readJson(request)));
+      if (is('GET', 'admin/reports/summary')) return json(await admin.reportSummary(url));
+      if (is('GET', 'admin/reports/export')) return csvResponse(await admin.reportExport(url));
     }
     throw new ApiError(404, 'not_found', '找不到這個端點');
   }
@@ -211,9 +296,12 @@ export class Api {
       serverId: meta.serverId,
       name: meta.name,
       time: nowMs(),
-      setupRequired: (await this.repo.countActiveAdmins()) === 0,
+      setupRequired: (await this.repo.countActiveAdmins(nowMs())) === 0,
       setupConfigured: this.config.setupToken !== null,
-      features: ['liveLocations', 'audit'],
+      // 1.2.0：idempotency（重送同一個事件回傳第一次的結果）、revision（每筆資料的版本、expectedRevision 與 conflict）、
+      // history（修改前後歷史）、webSession（網頁管理以 Cookie 登入）。舊版 App 不使用這些能力，照舊運作。
+      features: ['liveLocations', 'audit', 'idempotency', 'revision', 'history', 'webSession'],
+      schemaVersion: await this.repo.schemaVersion(),
       limits: { maxEventsPerRequest: LIMITS.maxEventsPerRequest, maxBodyBytes: LIMITS.maxBodyBytes },
     };
   }
@@ -231,31 +319,7 @@ export class Api {
     if (!code || !deviceId || !deviceName) throw badRequest('需要 code、deviceId（UUID）與 deviceName');
 
     const now = nowMs();
-    const f = await this.repo.failures(this.ip, now - ATTEMPT_WINDOW_MS);
-    if (f.count >= MAX_FAILURES) {
-      const retry = Math.max(1, Math.ceil(((f.oldest ?? now) + ATTEMPT_WINDOW_MS - now) / 1000));
-      throw new ApiError(429, 'rate_limited', '嘗試太多次，請稍後再試', retry);
-    }
-    const fail = async (): Promise<never> => {
-      await this.repo.recordFailure(this.ip, now);
-      throw new ApiError(401, 'invalid_code', '配對碼錯誤、已使用或已過期');
-    };
-
-    let role: Role;
-    let binding: DriverBinding | null = null;
-    let codeHash: string | null = null;
-    if ((await this.repo.countActiveAdmins()) === 0) {
-      if (this.config.setupToken === null) throw new ApiError(409, 'setup_not_configured', '主機尚未設定設定碼（請依部署文件設定 FD_SETUP_TOKEN）');
-      if (!constantTimeEqual(code.trim(), this.config.setupToken)) return fail();
-      role = 'admin';
-    } else {
-      codeHash = await sha256Hex(normalizePairingCode(code));
-      const row = await this.repo.findUsableCode(codeHash, now);
-      if (!row) return fail();
-      role = row.role;
-      binding = role === 'driver' ? bindingOf(row) : null;
-    }
-
+    const grant = await this.checkCode(code, now);
     const existing = await this.repo.deviceById(deviceId);
     if (existing && existing.revoked_at === null && existing.token_hash !== null && Number(existing.token_expires_at ?? 0) > now) {
       throw new ApiError(409, 'device_conflict', '這台裝置已經配對；請由管理員先解除配對');
@@ -264,28 +328,155 @@ export class Api {
     const token = newToken();
     const expiresAt = now + TOKEN_TTL_MS;
     const ok = await this.repo.pairDevice(
-      { id: deviceId, name: deviceName, platform, role, binding, tokenHash: await sha256Hex(token), expiresAt },
+      { id: deviceId, name: deviceName, platform, role: grant.role, binding: grant.binding, tokenHash: await sha256Hex(token), expiresAt },
       now,
-      codeHash,
+      grant.codeHash,
     );
-    if (!ok) return fail();
-    return { token, deviceId, role, driverBinding: binding, server: await this.serverJson(), tokenExpiresAt: expiresAt };
+    if (!ok) return this.failCode(now);
+    await this.auditOp({ deviceId, deviceName }, 'device', deviceId, 'pair', {
+      role: grant.role, platform, via: grant.codeHash ? 'code' : 'setup', codeId: grant.codeId, driverBinding: grant.binding,
+    });
+    return { token, deviceId, role: grant.role, driverBinding: grant.binding, server: await this.serverJson(), tokenExpiresAt: expiresAt };
+  }
+
+  /**
+   * 管理操作的稽核紀錄（1.2.0，docs/audit-history.md §3）：配對、網頁登入、解除配對、裝置的角色與綁定、配對碼、主機名稱。
+   * 摘要是 JSON，不含權杖、配對碼本身與駕駛人的個資。
+   */
+  private async auditOp(
+    actor: { deviceId: string; deviceName: string }, entity: 'device' | 'pairingCode' | 'server', entityId: string, operation: string,
+    summary: Record<string, unknown> | null,
+  ): Promise<void> {
+    await this.repo.addAudit({
+      at: nowMs(), device_id: actor.deviceId, device_name: actor.deviceName, entity, entity_id: entityId, operation,
+      summary: summary === null ? '' : JSON.stringify(summary),
+    });
+  }
+
+  /**
+   * 檢查配對碼或設定碼（配對與網頁登入共用）：嘗試次數限制、沒有可以使用的管理員時比對設定碼、否則找可以使用的配對碼。
+   * 錯誤時記一次失敗並回 401（還沒有用掉配對碼）。
+   */
+  private async checkCode(
+    code: string, now: number,
+  ): Promise<{ role: Role; binding: DriverBinding | null; codeHash: string | null; codeId: string | null }> {
+    const f = await this.repo.failures(this.ip, now - ATTEMPT_WINDOW_MS);
+    if (f.count >= MAX_FAILURES) {
+      const retry = Math.max(1, Math.ceil(((f.oldest ?? now) + ATTEMPT_WINDOW_MS - now) / 1000));
+      throw new ApiError(429, 'rate_limited', '嘗試太多次，請稍後再試', retry);
+    }
+    if ((await this.repo.countActiveAdmins(now)) === 0) {
+      if (this.config.setupToken === null) throw new ApiError(409, 'setup_not_configured', '主機尚未設定設定碼（請依部署文件設定 FD_SETUP_TOKEN）');
+      if (!constantTimeEqual(code.trim(), this.config.setupToken)) return this.failCode(now);
+      return { role: 'admin', binding: null, codeHash: null, codeId: null };
+    }
+    const codeHash = await sha256Hex(normalizePairingCode(code));
+    const row = await this.repo.findUsableCode(codeHash, now);
+    if (!row) return this.failCode(now);
+    return { role: row.role, binding: row.role === 'driver' ? bindingOf(row) : null, codeHash, codeId: row.id };
+  }
+
+  private async failCode(now: number): Promise<never> {
+    await this.repo.recordFailure(this.ip, now);
+    throw new ApiError(401, 'invalid_code', '配對碼錯誤、已使用或已過期');
+  }
+
+  // ───────── 網頁管理的登入（1.2.0） ─────────
+
+  /**
+   * 網頁管理登入：以管理員的配對碼（或沒有可以使用的管理員時的設定碼）建立一個網頁裝置，權杖只放在 HttpOnly Cookie。
+   * 不是管理員的配對碼回 403 admin_only，配對碼不會被用掉。
+   */
+  private async webLogin(request: Request, body: Record<string, unknown>): Promise<Response> {
+    const code = str(body.code);
+    const deviceName = cleanName(body.deviceName, 100);
+    if (!code || !deviceName) throw badRequest('需要 code 與 deviceName');
+    if (body.remember !== undefined && typeof body.remember !== 'boolean') throw badRequest('remember 必須是 true 或 false');
+    const kind: WebSessionKind = body.remember === true ? 'remember' : 'session';
+
+    const now = nowMs();
+    const grant = await this.checkCode(code, now);
+    if (grant.role !== 'admin') throw new ApiError(403, 'admin_only', '網頁管理只能用「管理員」的配對碼登入');
+    const deviceId = crypto.randomUUID().toUpperCase();
+    const token = newToken();
+    const until = now + WEB_SESSION_LIFETIME[kind].maxMs;
+    const expiresAt = webExpiry(kind, now, until);
+    const ok = await this.repo.pairDevice(
+      { id: deviceId, name: deviceName, platform: 'web', role: 'admin', binding: null, tokenHash: await sha256Hex(token), expiresAt, web: { kind, until } },
+      now,
+      grant.codeHash,
+    );
+    if (!ok) return this.failCode(now);
+    await this.auditOp({ deviceId, deviceName }, 'device', deviceId, 'web-login', {
+      via: grant.codeHash ? 'code' : 'setup', codeId: grant.codeId, remember: kind === 'remember',
+    });
+    return this.webSessionResponse(request, token, deviceId, kind, until, now);
+  }
+
+  /**
+   * 1.1 的網頁登入（瀏覽器保存的權杖，以 Authorization 標頭送來）換成 Cookie：同一台網頁裝置換新權杖，舊權杖立即失效。
+   * 只接受網頁（platform 是 web）且還沒有轉換的權杖；App 的權杖回 403 not_web_session。
+   */
+  private async webUpgrade(request: Request, body: Record<string, unknown>): Promise<Response> {
+    if (body.remember !== undefined && typeof body.remember !== 'boolean') throw badRequest('remember 必須是 true 或 false');
+    const kind: WebSessionKind = body.remember === true ? 'remember' : 'session';
+    const match = /^Bearer\s+([A-Za-z0-9_-]{20,200})$/.exec((request.headers.get('Authorization') ?? '').trim());
+    if (!match) throw new ApiError(401, 'unauthorized', '需要權杖');
+    const oldHash = await sha256Hex(match[1]);
+    const device = await this.repo.deviceByTokenHash(oldHash);
+    const now = nowMs();
+    if (!device || device.token_expires_at === null || Number(device.token_expires_at) <= now || !device.identity
+      || webSessionKind(device.web_session) !== null) {
+      throw new ApiError(401, 'unauthorized', '權杖無效或已過期，請重新登入');
+    }
+    if (device.platform !== 'web') throw new ApiError(403, 'not_web_session', '只有網頁管理的登入可以轉換');
+    const token = newToken();
+    const until = now + WEB_SESSION_LIFETIME[kind].maxMs;
+    const expiresAt = webExpiry(kind, now, until);
+    if (!(await this.repo.upgradeWebSession(device.device_id, oldHash, { tokenHash: await sha256Hex(token), kind, until, expiresAt }, now))) {
+      throw new ApiError(401, 'unauthorized', '權杖無效或已過期，請重新登入');
+    }
+    await this.auditOp({ deviceId: device.device_id, deviceName: device.name }, 'device', device.device_id, 'web-upgrade', { remember: kind === 'remember' });
+    return this.webSessionResponse(request, token, device.device_id, kind, until, now);
+  }
+
+  /** 網頁登入成功：回應不含權杖（只在 Set-Cookie），附上這次登入的資訊與 CSRF 權杖。 */
+  private async webSessionResponse(request: Request, token: string, deviceId: string, kind: WebSessionKind, until: number, now: number) {
+    const device = (await this.repo.deviceById(deviceId))!;
+    const role = (ROLES as readonly string[]).includes(device.role) ? device.role : 'viewer';
+    const session: Session = {
+      deviceId,
+      identity: device.identity ?? '',
+      deviceName: device.name,
+      role,
+      binding: role === 'driver' ? bindingOf(device) : null,
+      tokenExpiresAt: Number(device.token_expires_at),
+      web: { kind, until, csrf: await csrfToken(token) },
+    };
+    return json(await this.sessionJson(session), 200, { 'Set-Cookie': sessionCookie(request, token, kind, until, now) });
   }
 
   // ───────── 驗證 ─────────
 
+  /** 有 Authorization 標頭時以權杖驗證（App）；否則以網頁管理的登入 Cookie 驗證。 */
   private async authenticate(request: Request): Promise<Session> {
-    const header = request.headers.get('Authorization') ?? '';
-    const match = /^Bearer\s+([A-Za-z0-9_-]{20,200})$/.exec(header.trim());
+    const header = (request.headers.get('Authorization') ?? '').trim();
+    if (header === '') {
+      const cookie = readSessionCookie(request);
+      if (cookie !== null) return this.cookieSession(request, cookie);
+    }
+    const match = /^Bearer\s+([A-Za-z0-9_-]{20,200})$/.exec(header);
     if (!match) throw new ApiError(401, 'unauthorized', '需要權杖');
     const device = await this.repo.deviceByTokenHash(await sha256Hex(match[1]));
     const now = nowMs();
-    if (!device || device.token_expires_at === null || Number(device.token_expires_at) <= now) {
+    // 網頁管理的 Cookie 權杖不能放在 Authorization 標頭使用（期限與 CSRF 檢查只在 Cookie 的路徑）
+    if (!device || device.token_expires_at === null || Number(device.token_expires_at) <= now || webSessionKind(device.web_session) !== null) {
       throw new ApiError(401, 'unauthorized', '權杖無效或已過期，請重新配對');
     }
     let expiresAt = Number(device.token_expires_at);
     if (device.last_seen_at === null || now - Number(device.last_seen_at) >= TOUCH_INTERVAL_MS) {
-      expiresAt = now + TOKEN_TTL_MS;
+      // 1.1 的網頁權杖（存在瀏覽器）只更新最後使用時間、不再延長（docs/security-review.md §1）
+      if (device.platform !== 'web') expiresAt = now + TOKEN_TTL_MS;
       await this.repo.touchDevice(device.device_id, now, expiresAt);
     }
     const role = (ROLES as readonly string[]).includes(device.role) ? device.role : 'viewer';
@@ -297,6 +488,47 @@ export class Api {
       role,
       binding: role === 'driver' ? bindingOf(device) : null,
       tokenExpiresAt: expiresAt,
+      web: null,
+    };
+  }
+
+  /**
+   * 網頁管理的登入 Cookie：閒置期限與登入期限；非 GET 的請求檢查 CSRF 權杖、Sec-Fetch-Site 與 JSON 本體
+   * （檢查不通過時不延長期限）。
+   */
+  private async cookieSession(request: Request, token: string): Promise<Session> {
+    const device = await this.repo.deviceByTokenHash(await sha256Hex(token));
+    const now = nowMs();
+    const kind = device ? webSessionKind(device.web_session) : null;
+    if (!device || kind === null || device.token_expires_at === null || Number(device.token_expires_at) <= now || !device.identity) {
+      throw new ApiError(401, 'unauthorized', '登入已失效，請重新登入');
+    }
+    const csrf = await csrfToken(token);
+    const method = request.method.toUpperCase();
+    if (method !== 'GET' && method !== 'HEAD') {
+      if (!constantTimeEqual((request.headers.get(CSRF_HEADER) ?? '').trim(), csrf) || crossSite(request)) {
+        throw new ApiError(403, 'csrf_failed', '請求來源驗證失敗，請重新整理網頁後再試');
+      }
+      const length = Number(request.headers.get('Content-Length') ?? '0');
+      if (((request.headers.get('Content-Type') ?? '') !== '' || length > 0) && !isJsonContent(request)) {
+        throw new ApiError(415, 'unsupported_media_type', '請求本體必須是 JSON（Content-Type: application/json）');
+      }
+    }
+    const until = Number(device.session_until ?? 0);
+    let expiresAt = Number(device.token_expires_at);
+    if (device.last_seen_at === null || now - Number(device.last_seen_at) >= WEB_TOUCH_INTERVAL_MS) {
+      expiresAt = webExpiry(kind, now, until);
+      await this.repo.touchDevice(device.device_id, now, expiresAt);
+    }
+    const role = (ROLES as readonly string[]).includes(device.role) ? device.role : 'viewer';
+    return {
+      deviceId: device.device_id,
+      identity: device.identity,
+      deviceName: device.name,
+      role,
+      binding: role === 'driver' ? bindingOf(device) : null,
+      tokenExpiresAt: expiresAt,
+      web: { kind, until, csrf },
     };
   }
 
@@ -308,15 +540,18 @@ export class Api {
       driverBinding: s.binding,
       server: await this.serverJson(),
       tokenExpiresAt: s.tokenExpiresAt,
+      // 網頁管理的登入（1.2.0）：種類、登入期限與 CSRF 權杖；App 的回應沒有這個欄位
+      ...(s.web ? { web: { remember: s.web.kind === 'remember', sessionUntil: s.web.until, csrfToken: s.web.csrf } } : {}),
     };
   }
 
-  private async unpairSelf(s: Session): Promise<Response> {
-    if (s.role === 'admin' && (await this.repo.countActiveAdmins()) <= 1) {
-      throw new ApiError(409, 'last_admin', '最後一位管理員不能解除配對');
+  private async unpairSelf(request: Request, s: Session): Promise<Response> {
+    if (!(await this.repo.revokeDevice(s.deviceId, nowMs()))) {
+      throw new ApiError(409, 'last_admin', '最後一位可以使用的管理員不能解除配對');
     }
-    await this.repo.revokeDevice(s.deviceId, nowMs());
-    return noContent();
+    await this.auditOp(s, 'device', s.deviceId, 'unpair', { role: s.role, web: s.web !== null });
+    // 網頁管理登出：同時刪除登入 Cookie
+    return noContent(s.web ? { 'Set-Cookie': clearSessionCookie(request) } : {});
   }
 
   // ───────── 讀取 ─────────
@@ -325,12 +560,15 @@ export class Api {
     const cursor = await this.repo.currentSeq();
     const out: Record<string, unknown> = {};
     for (const e of ENTITIES) out[SNAPSHOT_KEYS[e]] = [];
+    const revisions: Record<string, number> = {};
     for (const r of await this.repo.allLive()) {
       if (!r.payload || !visible(s, r)) continue;
       (out[SNAPSHOT_KEYS[r.entity]] as unknown[]).push(outgoingPayload(s, r.entity, r.id, r.payload));
+      revisions[`${r.entity}:${r.id}`] = r.revision;
     }
     out.authoritative = true;
-    return { cursor, snapshot: out, session: await this.sessionJson(s) };
+    // revisions（1.2.0）：每筆資料目前的版本（`<種類>:<UUID>`），用戶端修改時可帶 expectedRevision
+    return { cursor, snapshot: out, revisions, session: await this.sessionJson(s) };
   }
 
   async changes(s: Session, url: URL) {
@@ -346,6 +584,7 @@ export class Api {
         id: r.id,
         deleted: r.deleted,
         modifiedAt: r.modifiedAt,
+        revision: r.revision,
         payload: r.deleted || !r.payload ? null : outgoingPayload(s, r.entity, r.id, r.payload),
       });
     }
@@ -359,74 +598,152 @@ export class Api {
     const list = body.events;
     if (!Array.isArray(list)) throw badRequest('需要 events 陣列');
     if (list.length > LIMITS.maxEventsPerRequest) throw badRequest(`每次最多 ${LIMITS.maxEventsPerRequest} 筆事件`);
+    await this.purgeProcessedOccasionally();
     const results: EventResult[] = [];
     for (const raw of list) results.push(await this.applyEvent(s, raw));
     return { results, cursor: await this.repo.currentSeq() };
   }
 
+  /** 已處理事件保留 30 天；有設定保留天數時刪除較舊的修改前後歷史。每個執行環境最多每小時清一次。 */
+  private async purgeProcessedOccasionally(): Promise<void> {
+    const now = nowMs();
+    if (now - (lastPurge.get(this.repo.db) ?? 0) < 3600 * 1000) return;
+    lastPurge.set(this.repo.db, now);
+    await this.repo.purgeProcessed(now - PROCESSED_TTL_MS);
+    if (this.config.historyRetentionDays > 0) await this.repo.purgeHistory(now - this.config.historyRetentionDays * 24 * 3600 * 1000);
+  }
+
+  /**
+   * 套用一筆事件。冪等（1.2.0）：同一台裝置重送同一個事件 ID 時回傳第一次的結果，不重複寫入、不重複稽核。
+   * 沒有套用（拒絕、衝突、略過）時在修改前後歷史留下摘要（主機上的內容、送來的內容、原因）。
+   */
   private async applyEvent(s: Session, raw: unknown): Promise<EventResult> {
     const v = validateEvent(raw);
     if (!v.ok) return { id: v.id, status: 'rejected', reason: v.reason };
-    if (v.payloadText.length > LIMITS.maxPayloadBytes) return { id: v.id, status: 'rejected', reason: 'payload-too-large' };
-    const existing = await this.repo.getRecord(v.entity, v.entityId);
-    const decision = authorize(s, v.entity, v.op, v.payload, existing);
-    if (!decision.allow) return { id: v.id, status: 'rejected', reason: decision.reason };
-
-    const now = nowMs();
-    const nowApple = msToApple(now);
-
-    if (v.op === 'delete') {
-      const at = Math.min(v.timestamp, nowApple);
-      if (!(await this.repo.tombstone(v.entity, v.entityId, at, s.deviceId, now))) return { id: v.id, status: 'ignored' };
-      await this.logAudit(s, v.entity, v.entityId, 'delete', '', now);
-      if (v.entity === 'trip') await this.repo.deleteLocation(v.entityId);
-      if (v.entity === 'vehicle' && existing?.vehiclePlate) await this.cascadeVehicle(s, existing.vehiclePlate, at, now);
-      return { id: v.id, status: 'applied' };
+    const eventId = v.id.trim().length > 0 && v.id.length <= 100 ? v.id : null;
+    if (eventId) {
+      const prior = await this.repo.processedResult(s.deviceId, eventId);
+      if (prior) {
+        try {
+          return { ...(JSON.parse(prior) as EventResult), duplicate: true };
+        } catch {
+          // 紀錄壞掉時重新處理（寫入本身仍受最後寫入者勝保護）
+        }
+      }
     }
-
-    // 建立／修改：時間校正 → 最後寫入者勝（SQL 中的條件式寫入）。
-    const payload = v.payload!;
-    let timestamp = v.timestamp;
-    let payloadText = v.payloadText;
-    let restamped = false;
-    const modified = num(payload.lastModifiedAt)!;
-    if (timestamp > nowApple || modified > nowApple) {
-      timestamp = Math.min(timestamp, nowApple);
-      payload.lastModifiedAt = Math.min(modified, nowApple);
-      payloadText = JSON.stringify(payload);
-      restamped = true;
-    }
-    // 最後寫入者勝：墓碑的修改時間是刪除的時間，比刪除舊的修改不會讓資料復活。
-    if (existing && !(timestamp > existing.modifiedAt)) return { id: v.id, status: 'ignored' };
-    const live = existing && !existing.deleted ? existing : null;
-    const applied = await this.repo.upsertRecord(
-      v.entity,
-      v.entityId,
-      payloadText,
-      num(payload.lastModifiedAt)!,
-      timestamp,
-      scopeFields(v.entity, payload),
-      { identity: s.identity, deviceId: s.deviceId },
-      now,
-    );
-    if (!applied) return { id: v.id, status: 'ignored' };
-    await this.logAudit(s, v.entity, v.entityId, live ? 'update' : 'create', payloadText, now);
-    if (v.entity === 'trip' && payload.isCompleted === true) await this.repo.deleteLocation(v.entityId);
-    const result: EventResult = { id: v.id, status: 'applied' };
-    if (restamped) {
-      const ev = raw as SyncEvent;
-      result.event = { ...ev, timestamp, payloadJSON: payloadText };
-    }
+    const { result, existing } = await this.applyValidated(s, v, raw, eventId);
+    if (result.status !== 'applied') await this.recordOutcome(s, v, eventId, result, existing);
     return result;
   }
 
-  private async cascadeVehicle(s: Session, plate: string, at: number, now: number): Promise<void> {
-    for (const child of await this.repo.liveChildrenOfPlate(plate, VEHICLE_CHILDREN)) {
-      if (await this.repo.tombstone(child.entity, child.id, at, s.deviceId, now)) {
-        await this.logAudit(s, child.entity, child.id, 'delete', '', now);
-        if (child.entity === 'trip') await this.repo.deleteLocation(child.id);
+  /** 沒有套用的事件的摘要與冪等紀錄（同一個交易）。 */
+  private async recordOutcome(s: Session, v: ValidEvent, eventId: string | null, result: EventResult, existing: StoredRecord | null) {
+    const live = existing && !existing.deleted && existing.payload ? existing.payload : null;
+    const attempted = v.op === 'delete' || result.reason === 'payload-too-large' || v.payload === null ? null : v.payloadText;
+    await this.repo.recordOutcome({
+      at: nowMs(),
+      entity: v.entity,
+      id: v.entityId,
+      eventId,
+      operation: v.op,
+      actor: { identity: s.identity, deviceId: s.deviceId, name: s.deviceName },
+      beforeText: live ? JSON.stringify(live) : null,
+      attemptedText: attempted,
+      changedFields: attempted === null ? null : changedFields(live, v.payload),
+      reason: result.reason ?? (v.op === 'delete' ? 'not-found' : 'stale'),
+      revision: existing?.revision ?? 0,
+      outcome: result.status as 'rejected' | 'conflict' | 'ignored',
+      processed: eventId
+        ? { deviceId: s.deviceId, eventId, status: result.status, reason: result.reason ?? null, resultJson: JSON.stringify(result) }
+        : null,
+    });
+  }
+
+  private async applyValidated(
+    s: Session, v: ValidEvent, raw: unknown, eventId: string | null,
+  ): Promise<{ result: EventResult; existing: StoredRecord | null }> {
+    const done = (result: EventResult, existing: StoredRecord | null = null) => ({ result, existing });
+    if (v.payloadText.length > LIMITS.maxPayloadBytes) return done({ id: v.id, status: 'rejected', reason: 'payload-too-large' });
+    const expectedRevision = optionalRevision(raw);
+    if (expectedRevision === undefined) return done({ id: v.id, status: 'rejected', reason: 'invalid-expected-revision' });
+    const actor = { identity: s.identity, deviceId: s.deviceId, name: s.deviceName };
+
+    // 樂觀並行控制：讀取 → 授權 → 以讀到的序號為條件寫入；期間被別的請求改過就重讀、重新授權（授權與寫入看到同一個版本）。
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const existing = await this.repo.getRecord(v.entity, v.entityId);
+      const decision = authorize(s, v.entity, v.op, v.payload, existing);
+      if (!decision.allow) return done({ id: v.id, status: 'rejected', reason: decision.reason }, existing);
+      const live = existing && !existing.deleted ? existing : null;
+      const currentRevision = existing?.revision ?? 0;
+      if (expectedRevision !== null && expectedRevision !== currentRevision) {
+        return done({
+          id: v.id,
+          status: 'conflict',
+          reason: 'revision-mismatch',
+          revision: currentRevision,
+          current: existing ? { revision: existing.revision, modifiedAt: existing.modifiedAt, deleted: existing.deleted } : undefined,
+        }, existing);
       }
+      const now = nowMs();
+      const nowApple = msToApple(now);
+      const nextRevision = currentRevision + 1;
+      const processed = (result: EventResult) => (eventId ? { deviceId: s.deviceId, eventId, resultJson: JSON.stringify(result) } : null);
+
+      if (v.op === 'delete') {
+        if (!live) return done({ id: v.id, status: 'ignored' }, existing);
+        // 伺服器端的業務規則（1.2.0）：還有進行中車趟的車輛不能刪除（App 也有相同規則）。
+        const plate = v.entity === 'vehicle' && live.vehiclePlate ? live.vehiclePlate : null;
+        if (plate && (await this.repo.activeTripsOfPlate(plate)) > 0) {
+          return done({ id: v.id, status: 'rejected', reason: 'vehicle-has-active-trips' }, existing);
+        }
+        const at = Math.min(v.timestamp, nowApple);
+        const result: EventResult = { id: v.id, status: 'applied', revision: nextRevision };
+        // 刪除、連鎖刪除（集合式）、歷史、稽核紀錄、即時位置、冪等紀錄在同一個交易：不會只刪一半。
+        const ok = await this.repo.writeAll({
+          expect: [{ entity: v.entity, id: v.entityId, seq: live.seq, live: true }],
+          conditions: plate ? [Repo.noActiveTrips(plate)] : [],
+          writes: [{
+            entity: v.entity, id: v.entityId, operation: 'delete', payloadText: null, modifiedAt: at, fields: live, actor, source: 'app',
+            eventId, reason: null, nextRevision, changedFields: null, auditSummary: '',
+          }],
+          cascade: plate ? { plate, entities: VEHICLE_CHILDREN, at, actor } : null,
+          processed: processed(result),
+          extra: v.entity === 'trip' ? [{ sql: 'DELETE FROM fd_locations WHERE trip_id = ?', params: [v.entityId] }] : [],
+          now,
+        });
+        if (!ok) continue;
+        return done(result, existing);
+      }
+
+      // 建立／修改：時間校正 → 最後寫入者勝（SQL 中的條件式寫入）。
+      const payload = { ...v.payload! };
+      let timestamp = v.timestamp;
+      let payloadText = v.payloadText;
+      let restamped = false;
+      const modified = num(payload.lastModifiedAt)!;
+      if (timestamp > nowApple || modified > nowApple) {
+        timestamp = Math.min(timestamp, nowApple);
+        payload.lastModifiedAt = Math.min(modified, nowApple);
+        payloadText = JSON.stringify(payload);
+        restamped = true;
+      }
+      // 最後寫入者勝：墓碑的修改時間是刪除的時間，比刪除舊的修改不會讓資料復活。
+      if (existing && !(timestamp > existing.modifiedAt)) return done({ id: v.id, status: 'ignored' }, existing);
+      const result: EventResult = { id: v.id, status: 'applied', revision: nextRevision };
+      if (restamped) result.event = { ...(raw as SyncEvent), timestamp, payloadJSON: payloadText };
+      const ok = await this.repo.writeRecord({
+        entity: v.entity, id: v.entityId, operation: live ? 'update' : 'create', payloadText,
+        modifiedAt: num(payload.lastModifiedAt)!, eventTime: timestamp, fields: scopeFields(v.entity, payload), actor, source: 'app',
+        eventId, reason: null, expectedSeq: existing?.seq ?? null, nextRevision, changedFields: changedFields(live?.payload ?? null, payload),
+        processed: processed(result), now,
+      });
+      if (!ok) continue;
+      await this.logAudit(s, v.entity, v.entityId, live ? 'update' : 'create', payloadText, now);
+      if (v.entity === 'trip' && payload.isCompleted === true) await this.repo.deleteLocation(v.entityId);
+      return done(result, existing);
     }
+    // 同一筆資料被連續改動：整批請求稍後重送（事件冪等，重送安全）
+    throw new ApiError(503, 'busy', '主機忙碌，請稍後再試', 1);
   }
 
   private async logAudit(s: Session, entity: Entity, id: string, operation: string, payloadText: string, now: number) {
@@ -437,7 +754,8 @@ export class Api {
       entity,
       entity_id: id,
       operation,
-      summary: [...payloadText].slice(0, 2000).join(''),
+      // 駕駛人只留 UUID 與姓名（不把個資寫進稽核紀錄）
+      summary: auditSummary(entity, payloadText),
     });
   }
 
@@ -500,7 +818,7 @@ export class Api {
 
   // ───────── 管理 ─────────
 
-  private async patchDevice(rawId: string, body: Record<string, unknown>) {
+  private async patchDevice(s: Session, rawId: string, body: Record<string, unknown>) {
     const id = normalizeUuid(rawId);
     if (!id) throw badRequest('裝置 ID 必須是 UUID');
     const d = await this.repo.deviceById(id);
@@ -517,22 +835,28 @@ export class Api {
       binding = b;
     }
     if (role !== 'driver') binding = null;
-    if (d.role === 'admin' && role !== 'admin' && d.revoked_at === null && (await this.repo.countActiveAdmins()) <= 1) {
-      throw new ApiError(409, 'last_admin', '最後一位管理員不能降級');
+    // 最後一位管理員的檢查在同一句 SQL（兩位管理員同時互相降級時不會一個都不剩）
+    if (!(await this.repo.updateDevice(id, role, binding, nowMs()))) {
+      throw new ApiError(409, 'last_admin', '最後一位可以使用的管理員不能降級');
     }
-    await this.repo.updateDevice(id, role, binding);
+    const before = bindingOf(d);
+    if (role !== d.role || JSON.stringify(binding) !== JSON.stringify(before)) {
+      await this.auditOp(s, 'device', id, 'update', {
+        name: d.name, from: { role: d.role, driverBinding: before }, to: { role, driverBinding: binding },
+      });
+    }
     return deviceJson((await this.repo.deviceById(id))!);
   }
 
-  private async deleteDevice(rawId: string): Promise<Response> {
+  private async deleteDevice(s: Session, rawId: string): Promise<Response> {
     const id = normalizeUuid(rawId);
     if (!id) throw badRequest('裝置 ID 必須是 UUID');
     const d = await this.repo.deviceById(id);
     if (!d) throw new ApiError(404, 'not_found', '找不到這台裝置');
-    if (d.role === 'admin' && d.revoked_at === null && (await this.repo.countActiveAdmins()) <= 1) {
-      throw new ApiError(409, 'last_admin', '最後一位管理員不能解除配對');
+    if (d.revoked_at === null) {
+      if (!(await this.repo.revokeDevice(id, nowMs()))) throw new ApiError(409, 'last_admin', '最後一位可以使用的管理員不能解除配對');
+      await this.auditOp(s, 'device', id, 'revoke', { name: d.name, role: d.role, platform: d.platform });
     }
-    await this.repo.revokeDevice(id, nowMs());
     return noContent();
   }
 
@@ -563,6 +887,7 @@ export class Api {
       created_at: now,
       expires_at: expiresAt,
     });
+    await this.auditOp(s, 'pairingCode', id, 'create', { role, driverBinding: binding, label, expiresAt });
     return { id, code, role, driverBinding: binding, label, expiresAt };
   }
 
@@ -580,17 +905,57 @@ export class Api {
     };
   }
 
-  private async deleteCode(rawId: string): Promise<Response> {
+  private async deleteCode(s: Session, rawId: string): Promise<Response> {
     const id = normalizeUuid(rawId);
     if (!id || (await this.repo.deleteCode(id)) === 0) throw new ApiError(404, 'not_found', '找不到這個配對碼');
+    await this.auditOp(s, 'pairingCode', id, 'delete', null);
     return noContent();
   }
 
-  private async rename(body: Record<string, unknown>) {
+  private async rename(s: Session, body: Record<string, unknown>) {
     const name = cleanName(body.name, 100);
     if (!name) throw badRequest('name 必須是 1–100 個字元');
+    const meta = await this.repo.meta();
     await this.repo.setName(name);
+    if (meta.name !== name) await this.auditOp(s, 'server', meta.serverId, 'rename', { from: meta.name, to: name });
     return this.info();
+  }
+
+  /**
+   * 修改前後歷史（1.2.0；只有管理員）：依種類、資料 ID、套用結果、來源篩選，新到舊分頁。
+   * 駕駛人的個資預設遮蔽；`pii=1` 顯示完整內容，並在稽核紀錄留下「檢視個資」。
+   */
+  private async history(s: Session, url: URL) {
+    const limit = intParam(url, 'limit', 50, 1, 200);
+    const beforeRaw = url.searchParams.get('before');
+    const before = beforeRaw === null || beforeRaw === '' ? null : intParam(url, 'before', 0, 0, Number.MAX_SAFE_INTEGER);
+    const entityRaw = url.searchParams.get('entity');
+    if (entityRaw !== null && !(ENTITIES as readonly string[]).includes(entityRaw)) throw badRequest('entity 不正確');
+    const idRaw = url.searchParams.get('id');
+    const id = idRaw === null ? null : normalizeUuid(idRaw);
+    if (idRaw !== null && id === null) throw badRequest('id 必須是 UUID');
+    const outcome = url.searchParams.get('outcome');
+    if (outcome !== null && outcome !== '' && outcome !== 'applied' && outcome !== 'notApplied') throw badRequest('outcome 必須是 applied 或 notApplied');
+    const source = url.searchParams.get('source');
+    if (source !== null && source !== '' && !['app', 'web', 'api', 'cascade'].includes(source)) throw badRequest('source 不正確');
+    const pii = url.searchParams.get('pii') === '1';
+    const rows = await this.repo.listHistory({
+      entity: entityRaw as Entity | null, id, before, limit,
+      outcome: outcome === 'applied' || outcome === 'notApplied' ? outcome : null,
+      source: source === null || source === '' ? null : source,
+    });
+    if (pii) {
+      await this.repo.addAudit({
+        at: nowMs(), device_id: s.deviceId, device_name: s.deviceName, entity: entityRaw ?? 'history', entity_id: id ?? '',
+        operation: 'view-pii', summary: '',
+      });
+    }
+    return {
+      entries: rows.map((r) => historyJson(r, pii)),
+      next: rows.length === limit ? Number(rows[rows.length - 1].id) : null,
+      // 1.2.0：保留天數（0 是不自動刪除）
+      retentionDays: this.config.historyRetentionDays,
+    };
   }
 
   private async audit(url: URL) {

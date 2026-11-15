@@ -5,6 +5,7 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 - 傳輸：HTTPS，JSON（UTF-8）。所有端點在 `<基底網址>/api/v1/` 之下；基底網址可以含路徑（例如 `https://example.com/fleet`）。
   PHP 主機無法設定網址改寫時，也接受 `<基底網址>/index.php/api/v1/…`。
 - 版本：`/api/v1` 與 `GET /info` 的 `apiVersion: 1`。不相容的變更才會出 v2；新增欄位一律選填，用戶端必須忽略不認得的欄位。
+  1.2.0 新增的能力（冪等、revision 與衝突、修改前後歷史）以 `GET /info` 的 `features` 宣告；舊版 App 不使用，照舊運作（§14）。
 - 時間：API 外層的時間（`time`、`expiresAt`…）是 **1970 起算的毫秒整數**。資料內容（車趟、車輛…）沿用 App 的資料格式：
   **2001-01-01 UTC 起算的秒數（浮點數）**，下文稱「Apple 秒」。
 - UUID：8-4-4-4-12 的十六進位，主機一律轉成大寫儲存與比對。
@@ -27,7 +28,8 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 | `inspection` | 巡檢 | `entityUUID`、`driverName`、`vehiclePlateNumber`、`lastModifiedAt` |
 
 - 資料內容（payload）是 App 送來的 JSON 物件，主機**原樣保存**，只讀上表的欄位，不得增刪其他欄位（遮蔽與時間校正除外，見 §4、§5）。
-  主機不需要知道其他欄位的意義。
+  主機不需要知道其他欄位的意義。1.2.0 起管理員以網頁管理修改資料時，主機只依 `spec/admin-entities.json` 修改允許的欄位（§7.5），
+  其他欄位（含 App 新版本才有的欄位）原樣保留。
 - 每筆資料有一個**變更序號** `seq`：全主機單調遞增的整數，資料每次被寫入或刪除就取得新的序號。用戶端以序號作為增量同步的游標。
 - 刪除保留為**墓碑**（`deleted = true`、沒有內容），讓離線的用戶端也收得到刪除。墓碑保留查詢範圍用的欄位（駕駛人、申請裝置、車牌）。
 - 主機另存：裝置（§3）、配對碼（§3）、稽核紀錄（§7）、即時位置（§8）、伺服器資訊（ID、名稱）。
@@ -75,8 +77,10 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 
 ### 3.1 第一次設定（第一位管理員）
 
-部署時必須設定**設定碼**（setup token，至少 16 個字元；各實作的設定方式見部署文件）。主機上沒有任何有效的管理員裝置時，
-`POST /pair` 接受設定碼，配對的裝置成為管理員。之後設定碼不再有效；要恢復（例如管理員裝置遺失），由主機管理者依部署文件撤銷所有管理員後，設定碼重新生效。
+部署時必須設定**設定碼**（setup token，至少 16 個字元；各實作的設定方式見部署文件）。主機上沒有**可以使用的管理員**
+（角色是管理員、沒有解除配對、權杖還沒過期）時，`POST /pair` 與 `POST /web/login`（§13.1）接受設定碼，配對的裝置成為管理員。
+有可以使用的管理員時設定碼無效。要恢復（例如管理員裝置遺失），由主機管理者依部署文件撤銷所有管理員後，設定碼重新生效；
+1.2.0 起，所有管理員的權杖都過期時（例如只用網頁管理、超過期限沒有使用）設定碼也會自動重新生效。
 第一位管理員也可以是網頁管理的瀏覽器（§13）。
 
 ### 3.2 配對碼
@@ -90,13 +94,16 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 
 - 配對成功時發給 32 位元組的隨機權杖（base64url，無 padding），主機只存 SHA-256（十六進位小寫），以常數時間比對。
 - 有效期限 90 天，**使用時自動延長**（為了減少寫入，同一台裝置最多每小時更新一次 `lastSeenAt` 與期限）。
+- 網頁管理（1.2.0）的權杖只放在 HttpOnly Cookie，期限另計（§13.1）；這種權杖放在 `Authorization` 標頭使用時回 `401`。
+  1.0–1.1 網頁管理（`platform` 是 `web`）以 `POST /pair` 取得、存在瀏覽器的權杖不再延長，升級到資料表版本 3 時最多再用 30 天。
 - 權杖失效（過期、裝置被解除配對、未知）→ `401 unauthorized`，用戶端必須重新配對。
 - 同一個 `deviceId` 仍有有效權杖時，新的配對被拒絕（`409 device_conflict`）；要由管理員先解除配對，或由該裝置自己 `POST /unpair`。
 
 ### 3.4 嘗試次數限制
 
-同一個來源 IP 在 15 分鐘內配對失敗 10 次後，該 IP 的 `POST /pair` 回 `429 rate_limited`（`Retry-After` 秒數），直到最早一次失敗滿 15 分鐘。
-成功的配對不計入。
+同一個來源 IP 在 15 分鐘內配對失敗 10 次後，該 IP 的 `POST /pair` 與 `POST /web/login` 回 `429 rate_limited`（`Retry-After` 秒數），
+直到最早一次失敗滿 15 分鐘。兩個端點共用同一個計數；成功的配對不計入。
+1.2.0 起 IPv6 以 /64 網段計算（同一個網段的位址通常屬於同一個使用者），IPv4 對應的 IPv6（`::ffff:a.b.c.d`）視為 IPv4。
 
 來源 IP：Cloudflare 版用 `CF-Connecting-IP`；Docker 與 PHP 版預設用連線的位址，設定了信任的反向代理層數 N（≥ 1）時，
 取 `X-Forwarded-For` 從右邊數來第 N 個值（最左邊的值由用戶端自己填，可以偽造，不得使用）。
@@ -119,21 +126,29 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 
 | 欄位 | 型別 | 說明 |
 | --- | --- | --- |
-| `id` | 字串 | 事件 UUID（只用於回應中對應結果） |
+| `id` | 字串 | 事件 UUID：回應中對應結果；1.2.0 起也是冪等的鍵（同一台裝置重送同一個 `id` 回傳第一次的結果，見下方） |
 | `timestamp` | 數字 | 事件時間（Apple 秒）；最後寫入者勝的比較依據 |
 | `actor` | 字串 | 送出者名稱（顯示用，主機不採信，以權杖的裝置為準） |
 | `entity` | 字串 | §1 的種類 |
 | `operation` | 字串 | `create`、`update`、`delete` |
 | `entityID` | 字串 | 資料的 UUID |
 | `payloadJSON` | 字串 | 資料內容的 **JSON 字串**；刪除時可以是空字串 |
+| `expectedRevision` | 整數（選填，1.2.0） | 送出者看到的版本（§6 的 `revision`）。與主機上的版本不同時不寫入、回傳 `conflict`；沒有這筆資料時版本是 0。不帶時依最後寫入者勝 |
 
 限制：每次最多 500 筆、請求本體最多 5 MB、單筆內容最多 1 MB；超過回 `413 payload_too_large` 或 `400 invalid_request`。
+請求本體的 JSON 最多 511 層陣列或物件（1.2.0 起三種實作相同；超過回 `400 invalid_request`）。
 
 處理順序（逐筆、依陣列順序，每一筆自成一個交易）：
 
-1. **格式**：種類、操作、UUID 不合法，或建立／修改的內容不是 JSON 物件、`entityUUID` 與 `entityID` 不同（不分大小寫）、`lastModifiedAt` 不是數字 →
-   `rejected`（`invalid-payload`）。
-2. **授權**：§2.1。不允許 → `rejected`（原因碼）。
+1. **格式**：種類、操作、UUID 不合法，或建立／修改的內容不是 JSON 物件、`entityUUID` 與 `entityID` 不同（不分大小寫）、`lastModifiedAt` 不是數字、
+   內容超過 64 層陣列或物件、範圍欄位（車牌、駕駛姓名、`driverEntityUUID`、`requestedByDeviceID`）超過 200 個字元（1.2.0）→
+   `rejected`（`invalid-payload`）。`expectedRevision` 不是非負整數 → `rejected`（`invalid-expected-revision`）。
+   **冪等（1.2.0）**：同一台裝置（權杖）已處理過同一個事件 `id`（1–100 字元）時，直接回傳第一次的結果並加上 `"duplicate": true`，
+   不重複寫入、不重複稽核與歷史（回應遺失後重送是安全的）。已處理的事件保留 30 天。
+2. **授權**：§2.1。不允許 → `rejected`（原因碼）。授權與寫入看到同一個版本（PHP 在寫入鎖內讀取；TypeScript 版以讀取時的序號作為寫入條件，
+   期間被改過就重讀、重新授權後重試，連續失敗回 `503 busy`，整批可安全重送）。
+   **版本（1.2.0）**：帶了 `expectedRevision` 且與主機上的版本不同 → `conflict`（`revision-mismatch`），結果附 `revision`（目前的版本）與
+   `current: { revision, modifiedAt, deleted }`。
 3. **時間校正**：建立／修改時，`timestamp` 或內容的 `lastModifiedAt` 晚於主機現在時間，兩者都改成主機現在時間（Apple 秒），
    並在結果附上校正後的事件（`event`），送出者必須套用它。
 4. **最後寫入者勝**：
@@ -141,9 +156,13 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
      比刪除更舊的修改不會讓資料復活。
      寫入時保存內容、`lastModifiedAt`（取自內容）、查詢欄位，取得新的序號。
    - 刪除：主機上有這筆（不是墓碑）就改為墓碑並取得新的序號；沒有就 `ignored`。
+   - **伺服器端的業務規則（1.2.0）**：還有未回車車趟（同車牌、`isCompleted: false`）的車輛不能刪除 → `rejected`（`vehicle-has-active-trips`）。
+   - 每次寫入（含刪除）該筆資料的 `revision` 加 1（新資料是 1；1.1.0 升級上來的既有資料是 1）。
 5. **連鎖刪除**：刪除車輛時，車牌（`vehiclePlateNumber`）等於該車輛 `plateNumber` 的 `trip`、`maintenance`、`maintenanceItem`、`workOrder`、`inspection`
    一併改為墓碑（各自取得新的序號）。刪除車趟或車趟改為已完成（`isCompleted: true`）時，移除它的即時位置。
 6. **稽核紀錄**：寫入或刪除成功時記一筆（§7）。
+7. **修改前後歷史（1.2.0）**：每次寫入（App、網頁管理、連鎖刪除）在同一個交易記下修改前與修改後的內容、變更的欄位、來源、身分、原因、
+   序號與版本（§7.1）。沒有寫入時不留紀錄；舊紀錄不覆寫。
 
 回應 `200`：
 
@@ -153,11 +172,16 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
     { "id": "事件 UUID", "status": "applied" },
     { "id": "…", "status": "applied", "event": { 校正後的 SyncEvent } },
     { "id": "…", "status": "ignored" },
-    { "id": "…", "status": "rejected", "reason": "not-own-trip" }
+    { "id": "…", "status": "rejected", "reason": "not-own-trip" },
+    { "id": "…", "status": "applied", "revision": 3 },
+    { "id": "…", "status": "applied", "revision": 3, "duplicate": true },
+    { "id": "…", "status": "conflict", "reason": "revision-mismatch", "revision": 4, "current": { "revision": 4, "modifiedAt": 815000000.5, "deleted": false } }
   ],
   "cursor": 1234
 }
 ```
+
+1.2.0 起 `applied` 的結果附 `revision`（寫入後的版本）。`conflict` 只會回給帶了 `expectedRevision` 的事件。
 
 - `cursor` 是處理完後主機目前的最大序號。
 - 用戶端收到 `rejected` 時，應提示使用者並以全量同步（§6）回復成主機的狀態。
@@ -198,6 +222,8 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 - `cursor` 必須在讀取資料**之前**取得：快照之後的變更一定會出現在 `GET /changes?since=cursor`（可能重複，用戶端以最後寫入者勝處理）。
 - `authoritative: true`：用戶端依自己的規則移除主機沒有的資料（App 已有的規則：待送的、剛送出的、5 分鐘內修改的不移除；異常的大量移除不執行）。
 
+1.2.0 起回應另有 `revisions`：`{ "<種類>:<UUID>": 版本, … }`（看得到的每一筆資料目前的版本），用戶端修改時可帶 `expectedRevision`。
+
 ### 6.2 增量 `GET /api/v1/changes?since=<序號>&limit=<筆數>`
 
 - `since` 預設 0；`limit` 預設 500、最多 1000。依序號遞增回傳序號大於 `since` 的資料（同一筆資料只會出現最新的狀態）。
@@ -235,6 +261,9 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 
 `driverBinding` 沒有時是 `null`。角色或綁定被管理員改變時，用戶端在下一次回應就會看到；角色改變後應做一次全量同步（資料範圍不同）。
 
+以網頁管理的登入 Cookie（§13.1）驗證時另外有 `web`：`{ "remember": false, "sessionUntil": 1793659200000, "csrfToken": "32 個十六進位字元" }`
+（`remember`：記住這個瀏覽器；`sessionUntil`：登入期限；`csrfToken`：非 GET 請求的 `X-FleetDispatch-CSRF`）。App 的回應沒有這個欄位。
+
 ## 7. 管理（admin）
 
 | 端點 | 說明 |
@@ -246,13 +275,155 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 | `GET /admin/pairing-codes` | 尚未使用、未過期的配對碼 `{ "codes": [ { "id", "label", "role", "driverBinding", "createdAt", "expiresAt" } ] }` |
 | `DELETE /admin/pairing-codes/{id}` | 刪除 → `204` |
 | `PATCH /admin/server` | `{ "name" }`（1–100 字元）→ `Info`（§9） |
-| `GET /admin/audit?before=<id>&limit=<筆數>` | 稽核紀錄，新的在前：`{ "entries": [ { "id", "at", "deviceId", "deviceName", "entity", "entityId", "operation", "summary" } ], "next": <id 或 null> }`；`limit` 預設 100、最多 500 |
+| `GET /admin/audit?before=<id>&limit=<筆數>` | 稽核紀錄，新的在前：`{ "entries": [ { "id", "at", "deviceId", "deviceName", "entity", "entityId", "operation", "summary" } ], "next": <id 或 null> }`；`limit` 預設 100、最多 500。1.2.0 起也記錄配對、網頁登入、角色與綁定、解除配對、配對碼、主機名稱（`entity` 是 `device`、`pairingCode`、`server`；[`audit-history.md`](audit-history.md) §3） |
+| `GET /admin/history` | 修改前後歷史（§7.1，1.2.0） |
+| `GET /admin/schema` | 網頁管理的資料規格（§7.2，1.2.0） |
+| `GET /admin/records`、`GET /admin/records/{entity}/{id}` | 資料清單與詳情（§7.3、§7.4，1.2.0） |
+| `PATCH /admin/records/{entity}/{id}` | 受控修改（§7.5，1.2.0） |
+| `GET …/{id}/impact`、`POST …/{id}/delete` | 刪除的影響預覽與刪除（§7.6，1.2.0） |
+| `POST /admin/requests/{id}/approve`、`…/reject` | 用車申請的核准、退回（§7.7，1.2.0） |
+| `GET /admin/reports/summary`、`GET /admin/reports/export` | 報表的期間摘要與 CSV 匯出（§7.8，1.2.0） |
 
-`Device`：`{ "deviceId", "name", "platform", "role", "driverBinding", "pairedAt", "lastSeenAt", "tokenExpiresAt", "revokedAt" }`（時間為毫秒，沒有時 `null`）。
+`Device`：`{ "deviceId", "name", "platform", "role", "driverBinding", "pairedAt", "lastSeenAt", "tokenExpiresAt", "revokedAt", "webSession", "sessionUntil" }`
+（時間為毫秒，沒有時 `null`）。`webSession`（1.2.0）：網頁管理以 Cookie 登入時是 `session`（不記住）或 `remember`（記住這個瀏覽器），
+App 與 1.1 的網頁權杖是 `null`；`sessionUntil`：網頁登入的期限。
 
-限制：最後一位有效的管理員不能被降級或解除配對（`409 last_admin`）。
+限制：沒有其他**可以使用的管理員**（§3.1）時，管理員不能被降級或解除配對（`409 last_admin`）。1.2.0 起這個檢查與更新是同一個不可分割的操作：
+兩位管理員同時互相降級或解除配對時，至少留下一位。
 
-稽核紀錄的 `summary`：資料內容 JSON 的前 2,000 個字元（刪除時是空字串）；`operation` 是 `create`、`update`、`delete`；連鎖刪除也各記一筆。
+### 7.1 修改前後歷史 `GET /admin/history?entity=<種類>&id=<UUID>&outcome=<applied|notApplied>&source=<來源>&pii=1&before=<id>&limit=<筆數>`（1.2.0）
+
+只有管理員。新的在前；`limit` 預設 50、最多 200；參數都可省略。`outcome`：`applied` 只列套用的、`notApplied` 只列沒有套用的
+（拒絕、衝突、略過）；`source`：`app`、`web`、`api`、`cascade`。
+
+```json
+{
+  "entries": [
+    {
+      "id": 812, "at": 1793616000000, "entity": "vehicle", "entityId": "UUID", "eventId": "事件 UUID 或 null",
+      "operation": "update", "source": "app", "outcome": "applied",
+      "actor": { "deviceId": "UUID", "identity": "配對身分", "name": "裝置名稱" },
+      "before": { 修改前的內容 }, "after": { 修改後的內容 }, "changedFields": ["custodian"],
+      "reason": null, "seq": 1234, "revision": 3
+    }
+  ],
+  "next": 811,
+  "retentionDays": 0
+}
+```
+
+- `retentionDays`（1.2.0）：主機設定的保留天數，`0` 是不自動刪除（[`audit-history.md`](audit-history.md) §4）。
+- `operation`：`create`、`update`、`delete`；刪除時 `after` 是 `null`，新增時 `before` 是 `null`。
+- `source`：`app`（App 的事件）、`web`（網頁管理的修改、核准、刪除，`reason` 是管理員填的原因）、`cascade`（刪除車輛的連鎖刪除，`reason: "vehicle-deleted"`）；`api` 保留。
+- `outcome`：`applied`（寫入）；App 的事件沒有套用時也留下一筆摘要：`rejected`（`reason` 是拒絕的原因碼）、`conflict`（`revision-mismatch`）、
+  `ignored`（`stale`：比主機上的版本舊，最後寫入者勝略過；`not-found`：刪除已不存在的資料）。沒有套用的紀錄 `before` 是主機上當時的內容、
+  `after` 是送來的內容（刪除、`payload-too-large` 時是 `null`）、`revision` 是主機上當時的版本（沒有改變）、`seq` 是當時的序號。
+  格式錯誤（`invalid-payload`）的事件無法對應到資料，不留紀錄。重送同一個事件（冪等）不會多一筆。
+- `changedFields`：第一層的鍵，不含 `lastModifiedAt`；新增時是所有欄位；沒有套用時是「送來的內容」與「主機上的內容」不同的欄位。
+- 個資遮蔽：駕駛人的 `phoneNumber`、`licenseNumber` 只顯示最後 3 個字（前面以 `••••` 代替；4 個字以內整個遮蔽），`notes` 顯示「［已遮蔽］」。
+  `pii=1` 顯示完整內容，並在稽核紀錄留下一筆 `operation: "view-pii"`（`entity` 是查詢的種類或 `history`，`entityId` 是查詢的 ID 或空字串）。
+- 版本比較：同一筆資料每一筆 `applied` 紀錄的 `after` 就是那個 `revision` 的完整內容（刪除時沒有內容），網頁管理以此比較任兩個版本。
+
+稽核紀錄的 `summary`：資料內容 JSON 的前 2,000 個字元（刪除時是空字串）；**駕駛人**只有 `{"entityUUID","name"}`（1.2.0 起，不把證號、電話、備註寫進稽核紀錄；
+升級時清除 1.0–1.1 留下的駕駛人摘要）。`operation` 是 `create`、`update`、`delete`（另有 `view-pii`）；連鎖刪除也各記一筆。
+
+### 7.2 網頁管理的資料規格 `GET /admin/schema`（1.2.0）
+
+只有管理員。回傳 `spec/admin-entities.json` 的內容（三種實作相同）：每種資料的名稱、欄位（標籤、型別、單位、範圍、可否在網頁修改）、搜尋的欄位、
+排序選項、狀態篩選、預設排序。網頁管理依它顯示表格與表單；**修改時以主機的檢查為準**（§7.5）。
+
+### 7.3 資料清單 `GET /admin/records?entity=<種類>&…`（1.2.0）
+
+只有管理員。參數：
+
+| 參數 | 說明 |
+| --- | --- |
+| `entity` | 必填，10 種之一 |
+| `q` | 搜尋（最多 100 個字）：以空白（含全形空白）分成最多 10 個字詞，每個字詞都要出現在規格的 `search` 欄位之一（文字或文字清單）；英文字母不分大小寫 |
+| `plate` | 車牌（逐字相同） |
+| `driverId` | 駕駛人的 UUID：車趟（駕駛人 UUID 相同，或沒有 UUID 時姓名相同）、巡檢（駕駛姓名相同）、用車申請（申請人姓名相同）；其他種類 `400` |
+| `deviceId` | 裝置 ID：這台裝置**這次配對**建立的資料 |
+| `from`、`to` | 時間範圍（1970 起算的毫秒），比較規格的 `time` 欄位：含 `from`、不含 `to`；沒有時間的資料不列出 |
+| `status` | 規格的 `statuses` 之一：車趟 `active`／`completed`、用車申請與工單依 `status`、巡檢依 `overallResult`、零件 `low`（安全庫存大於 0 且庫存不大於它） |
+| `sort`、`order` | 規格的 `sorts` 之一（預設 `defaultSort`）與 `asc`／`desc`（預設 `defaultOrder`）。數字在文字前；**沒有值的一律在最後**；相同時依 UUID |
+| `limit`、`offset` | 每頁 1–200 筆（預設 50）、略過的筆數 |
+
+```json
+{ "entity": "trip", "total": 128, "offset": 0, "limit": 50,
+  "records": [ { "entity": "trip", "id": "UUID", "revision": 3, "seq": 1234, "modifiedAt": 784000000.5, "deleted": false,
+                 "updatedAt": 1793616000000, "updatedBy": { "deviceId": "UUID", "name": "王小明的 iPhone" }, "payload": { … } } ] }
+```
+
+`updatedBy` 是最後寫入這筆的裝置（名稱取自裝置清單，裝置被刪除時 `name` 是 `null`）。字串比較以碼位（UTF-8 位元組）為準，三種實作的順序相同。
+
+### 7.4 詳情與關聯 `GET /admin/records/{entity}/{id}`（1.2.0）
+
+只有管理員。`{ "record": Record, "related": { … }, "location": 即時位置或 null }`；墓碑也回傳（`deleted: true`、`payload: null`、沒有關聯）。
+每種關聯是 `{ "entity", "total", "records": [最多 20 筆，依該種類的預設排序] }`（裝置是陣列）：
+
+| 種類 | 關聯 |
+| --- | --- |
+| `vehicle` | `trips`、`maintenance`、`maintenanceItems`、`workOrders`、`inspections`（車牌相同）、`tripRequests`（申請的車牌相同） |
+| `driver` | `trips`（同 `driverId` 的規則）、`inspections`（駕駛姓名相同）、`tripRequests`（申請人姓名相同）、`devices`（綁定這位駕駛人、還沒解除配對的裝置） |
+| `trip` | `vehicles`（車牌相同）、`drivers`（駕駛人 UUID；沒有時姓名相同）、`tripRequests`（核准後產生這趟的申請）、`inspections`（同車、出車前 1 天到回車後 1 天）、`workOrders`（同車、這段期間開著的工單） |
+| `tripRequest` | `trips`（核准後產生的車趟）、`vehicles`、`devices`（申請的裝置） |
+| `workOrder` | `vehicles`、`parts`（明細引用的零件） |
+| `part` | `workOrders`（明細引用這個零件） |
+| `inspection` | `vehicles`、`drivers`（姓名相同）、`trips`（同車、巡檢前後 1 天內出車） |
+| `maintenance`、`maintenanceItem` | `vehicles` |
+
+App 的資料格式中，巡檢、工單與車趟之間沒有直接的關聯欄位，以「車牌＋時間」對應；車趟沒有備註欄位，路線軌跡只存在出車的裝置上
+（主機只有出車中的即時位置與 8.1 起的出發定位）。
+
+### 7.5 受控修改 `PATCH /admin/records/{entity}/{id}`（1.2.0）
+
+只有管理員；用車申請用 §7.7。
+
+```json
+{ "expectedRevision": 3, "changes": { "odometerEnd": 12580 }, "reason": "依單據修正", "dryRun": false }
+```
+
+- `expectedRevision`：必填，與主機上的版本不同時 `409 revision_mismatch`，`error.current` 是目前的 Record（重新載入、比較後再修改）。
+- `changes`：只能有規格中 `edit: true` 的欄位；型別、範圍、選項（舊資料清單以外的值可以維持原值）、各種類的規則（下表）都檢查，
+  錯誤時 `400 invalid_changes`，`error.fields` 是 `{ 欄位: 說明 }`（`_` 表示整體，例如「內容沒有變更」）。文字去除前後空白；
+  選填的日期給 `null` 時移除這個鍵（App 的格式）。其他欄位（含 App 新版本才有的欄位）原樣保留。
+- `reason`：1–500 個字，`dryRun` 以外必填，寫進修改前後歷史。
+- `dryRun: true`：只檢查並回傳 `{ "dryRun": true, "revision", "before", "after", "changedFields", "warnings" }`，不寫入。
+- 寫入：`lastModifiedAt` 與主機上的修改時間改為主機的現在時間（至少比原本的大 1 毫秒），版本加 1，在同一個交易寫入資料、修改前後歷史
+  （`source: "web"`）與稽核紀錄 → `{ "record", "changedFields", "warnings" }`。其他裝置以 `GET /changes` 取得；**比這次修改舊的離線修改送來時被略過**
+  （最後寫入者勝；歷史留下 `ignored`／`stale` 的摘要），App 8.1 帶 `expectedRevision` 時回 `conflict`。
+
+| 種類 | 規則 |
+| --- | --- |
+| `trip` | 已回車不能改回出車中；出車中不能改回車時間與結束里程，要「回車」時同時給 `isCompleted: true`、`endTime`、`odometerEnd`，且至少一個目的地；回車時間不早於出車時間；結束里程大於 0 且不小於起始里程；超過 1,000 km 只提醒（`warnings`）。`vehiclePlateNumber` 必須是現有車輛的車牌；`driverEntityUUID` 必須是現有的駕駛人，`driver`（姓名）一併更新。回車時移除即時位置 |
+| `vehicle` | 車牌不能修改（車趟、保養、工單、巡檢以車牌對應車輛，請在 App 修改）；`modelYear` 是 0（未設定）或 1900–2100；改 `fuelType` 時 `isElectric` 一併更新 |
+| `driver` | 姓名不能修改（車趟、巡檢與裝置綁定以姓名對應，請在 App 修改） |
+| `workOrder` | 不能改為「已完成」（App 完工時在同一個交易扣零件庫存並寫保養紀錄）；其他狀態可以，重新開啟保留完工時間（與 App 相同，再完工不重複扣庫存）；明細只顯示 |
+| `inspection` | 結果由明細判斷，只顯示；明細只顯示 |
+
+### 7.6 刪除 `GET /admin/records/{entity}/{id}/impact`、`POST /admin/records/{entity}/{id}/delete`（1.2.0）
+
+- 影響預覽 → `{ "entity", "id", "revision", "blockers": [ { "code", "message", "count" } ], "cascade": { 種類: 筆數 }, "references": { … } }`：
+  車輛的 `cascade` 是會一併刪除的車趟、保養、保養項目、工單、巡檢（車牌相同）；還有出車中的車趟時 `blockers` 有 `vehicle-has-active-trips`。
+  駕駛人的 `references` 是車趟與綁定裝置的數量（車趟保留駕駛姓名，不會被刪除），零件是引用它的工單數。
+- 刪除 `{ "expectedRevision", "reason", "expectedCascade"? }`：`reason` 必填；車輛必須帶預覽時的 `expectedCascade`，與目前不同時 `409 impact_changed`
+  （`error.cascade` 是目前的筆數，請重新預覽）；有出車中的車趟時 `409 vehicle_has_active_trips`。車輛與連鎖刪除的資料在**同一個交易**改為墓碑、
+  各自取得新的序號（依種類、UUID 的順序）並留下歷史與稽核紀錄 → `{ "deleted": { "entity", "id", "revision" }, "cascade": { … } }`。
+- 用車申請不會被連鎖刪除；8.1 的封存（停用）見 App 的說明，網頁管理的刪除一律是永久刪除。
+
+### 7.7 用車申請的簽核 `POST /admin/requests/{id}/approve`、`POST /admin/requests/{id}/reject`（1.2.0）
+
+只有待簽核（`pending`）的申請（否則 `409 request_not_pending`）；`expectedRevision` 必填。
+
+- 核准 `{ "expectedRevision", "driverId"?, "note"? }`：與 App 的核准相同——建立一趟出車中的車趟（出車、回車時間是預計的時間；車牌是申請的車牌且車輛存在時才帶；
+  起始里程是同車最後一趟已回車的結束里程，沒有時 0；駕駛姓名是申請人；`driverId` 是指派的駕駛人），申請改為 `approved`、`approvedAt`、
+  `approvedBy`（網頁管理的裝置名稱）、`resultingTripUUID`。兩筆在同一個交易寫入 → `{ "request": Record, "trip": Record }`。
+- 退回 `{ "expectedRevision", "rejectionReason" }`（1–500 個字）：`rejected`、`approvedAt`、`approvedBy`、`rejectionReason` → `{ "request", "trip": null }`。
+
+### 7.8 報表 `GET /admin/reports/summary`、`GET /admin/reports/export`（1.2.0）
+
+只有管理員。期間摘要（里程、費用、稼動率；依車輛、駕駛人、成本中心、日期）與 CSV 匯出（車趟、保養、工單、巡檢），
+計算規則、參數、回應與 CSV 格式見 [`reports.md`](reports.md)。規則與 App 的報表相同，三種實作以同一組固定向量測試。
 
 ## 8. 即時位置
 
@@ -271,13 +442,15 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
   "product": "FleetDispatch Server", "apiVersion": 1, "serverVersion": "1.0.0", "variant": "docker",
   "serverId": "UUID", "name": "優良運輸", "time": 1793616000000,
   "setupRequired": false, "setupConfigured": true,
-  "features": ["liveLocations", "audit"],
+  "features": ["liveLocations", "audit", "idempotency", "revision", "history", "webSession"], "schemaVersion": 3,
   "limits": { "maxEventsPerRequest": 500, "maxBodyBytes": 5242880 }
 }
 ```
 
+- `features`（1.2.0 新增 `idempotency`、`revision`、`history`、`webSession`）：用戶端只在主機宣告時使用對應的能力。`schemaVersion`：資料表版本（1.2.0 是 3）。
+
 - `variant`：`cloudflare`、`php`、`docker`。
-- `setupRequired`：沒有任何有效的管理員（下一次配對要用設定碼）。`setupConfigured`：部署時有設定設定碼。
+- `setupRequired`：沒有可以使用的管理員（§3.1；下一次配對要用設定碼）。`setupConfigured`：部署時有設定設定碼。
 - App 驗證主機時先呼叫這個端點：`product` 必須是 `FleetDispatch Server`、`apiVersion` 必須是 1。
 
 ### `POST /api/v1/pair`（不需權杖）
@@ -298,7 +471,8 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 
 ### `POST /api/v1/unpair`（需要權杖）
 
-裝置自行解除配對（例如使用者改回單人或區網模式）→ `204`。最後一位管理員不能自行解除（`409 last_admin`）。
+裝置自行解除配對（例如使用者改回單人或區網模式）→ `204`。沒有其他可以使用的管理員時，管理員不能自行解除（`409 last_admin`）。
+網頁管理以 Cookie 登入時，這就是登出：回應同時以 `Set-Cookie`（`Max-Age=0`）刪除登入 Cookie。
 
 ## 10. 錯誤
 
@@ -308,17 +482,26 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 { "error": { "code": "invalid_request", "message": "說明文字" } }
 ```
 
+1.2.0 的管理端點在 `error` 中另外帶補充資料：`fields`（`invalid_changes`）、`current`（`revision_mismatch`）、`cascade`（`impact_changed`）。
+
 | HTTP | `code` | 時機 |
 | --- | --- | --- |
 | 400 | `invalid_request` | 參數或 JSON 格式錯誤 |
 | 401 | `unauthorized` | 沒有權杖、權杖無效或過期、裝置已解除配對 |
 | 401 | `invalid_code` | 配對碼或設定碼錯誤、用過、過期 |
 | 403 | `forbidden` | 角色不允許這個端點或操作 |
+| 403 | `csrf_failed` | 網頁管理的請求沒有通過來源檢查（§13.1） |
+| 403 | `admin_only` | `POST /web/login` 用了不是管理員的配對碼（配對碼不會被用掉） |
+| 403 | `not_web_session` | `POST /web/upgrade` 用了 App 的權杖 |
 | 404 | `not_found` | 端點或資源不存在 |
 | 405 | `method_not_allowed` | 方法不支援 |
+| 400 | `invalid_changes` | 網頁管理的修改內容不正確（`error.fields`） |
 | 409 | `device_conflict`、`last_admin`、`setup_not_configured` | 見上 |
+| 409 | `revision_mismatch`、`impact_changed`、`vehicle_has_active_trips`、`request_not_pending` | 網頁管理（§7.5–7.7） |
 | 413 | `payload_too_large` | 請求本體超過限制 |
+| 415 | `unsupported_media_type` | 網頁管理的請求本體不是 JSON（§13.1） |
 | 429 | `rate_limited` | 配對嘗試太多次（附 `Retry-After`） |
+| 503 | `busy` | 同一筆資料被連續修改，這批事件稍後重送（附 `Retry-After`；1.2.0 起事件冪等，重送安全） |
 | 500 | `server_error` | 主機內部錯誤（不得洩漏堆疊或 SQL） |
 
 ## 11. 安全要求（三種實作都必須遵守）
@@ -326,7 +509,9 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 - 只在 HTTPS 上提供服務（Docker 版本身是 HTTP，必須放在反向代理後面；只在區域網路測試時例外）。App 拒絕 `http://`，私有網段（10/8、172.16/12、192.168/16、127/8、`.local`）在使用者確認後例外。
 - 權杖、配對碼、設定碼只存雜湊或只放在部署的機密設定；不得寫入日誌。
 - 所有 SQL 一律使用參數化查詢。
+- 輸入的長度與層數限制三種實作相同（§3.4、§4），所有資料庫的欄位都放得下（MySQL 的 TEXT 最多 64 KB）；檢查結果見 [`security-review.md`](security-review.md)。
 - 不回傳 `Access-Control-Allow-Origin`（App 是原生程式，不需要跨來源存取；避免網頁冒用）。
+- 網頁管理的登入（§13.1）：權杖只放在 HttpOnly、SameSite=Strict 的 Cookie；非 GET 的請求檢查 CSRF 權杖、`Sec-Fetch-Site` 與 JSON 本體。
 - 回應加上 `Cache-Control: no-store`、`X-Content-Type-Options: nosniff`。
 - 主機錯誤不得洩漏內部細節（堆疊、SQL、檔案路徑）。
 - 網頁（§13）：管理頁只在設定的管理網址回應，首頁與管理頁都不把請求內容（基底路徑除外）填進頁面，並加上 §13 的安全標頭；`GET /info` 與首頁都不透露管理網址。
@@ -342,7 +527,7 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 ## 13. 網頁（1.1.0 起）：首頁與網頁管理
 
 主機的網址也提供兩種網頁：**首頁**是 FleetDispatch App 的介紹與下載連結（任何人都看得到）；**網頁管理**只在一個設定的網址出現，
-讓管理員用瀏覽器管理。網頁管理只使用本文件的 API，不需要額外的端點。
+讓管理員用瀏覽器管理。網頁管理只使用本文件的 API（登入是 §13.1 的 `POST /web/login`）。
 
 - **首頁**（只有 `GET`、`HEAD`）：基底路徑本身（`/`；PHP 是 `index.php` 所在的資料夾），以及 `…/index.php`、`…/index.html` 回 `200` 的 HTML。
   其他找不到的非 API 網址：`Accept` 有 `text/html`（瀏覽器）時回 `404` 狀態與同樣的首頁內容，否則照 API 的規則回 `404 not_found`（JSON）。
@@ -363,13 +548,74 @@ FleetDispatch App（8.0 起）可以改連使用者自行架設的主機。這�
 - **標頭**：管理頁 `Content-Type: text/html; charset=utf-8`，程式 `text/javascript; charset=utf-8`；兩者都有 `Cache-Control: no-store`、
   `X-Content-Type-Options: nosniff`、`X-Robots-Tag: noindex, nofollow`、`Referrer-Policy: no-referrer`。管理頁另外有
   `X-Frame-Options: DENY` 與 `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`。
-- **登入**：瀏覽器以 `POST /pair` 配對（`platform: "web"`，每次登入產生新的 `deviceId`）：沒有管理員時用設定碼成為管理員，否則用管理員建立的配對碼；
-  角色不是管理員時只能登出。權杖存在瀏覽器（勾選「記住這個瀏覽器」時是 localStorage，否則是 sessionStorage）；登出是 `POST /unpair`；
-  `401` 時清除權杖並回到登入頁。最後一位管理員不能登出（`409 last_admin`），頁面會提示先建立另一位管理員。
-- **相容性測試**：`conformance/web.test.mjs`（`FD_ADMIN_PATH` 與主機的設定相同）。
+  1.2.0 起管理頁與程式另有 `Cross-Origin-Resource-Policy: same-origin`，管理頁另有 `Cross-Origin-Opener-Policy: same-origin` 與
+  `Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=()`。
+- **登入**（1.2.0）：`POST /web/login`（§13.1），權杖由主機以 HttpOnly Cookie 保存，網頁的程式不保存也讀不到。登出是 `POST /unpair`；
+  `401` 時回到登入頁。沒有其他可以使用的管理員時不能登出（`409 last_admin`），頁面會提示先建立另一位管理員。
+  1.0–1.1 以 `POST /pair` 配對、把權杖存在瀏覽器（localStorage／sessionStorage）；1.2.0 的頁面開啟時以 `POST /web/upgrade` 換成 Cookie，並刪除瀏覽器裡的權杖。
+- **1.2.0 的網頁管理**：13 個管理區塊、資料清單與詳情、受控修改、刪除的影響預覽、用車申請的簽核、報表、修改前後歷史，
+  使用 §7.1–7.8 的端點（沒有其他端點）。畫面說明見 [`admin-management.md`](admin-management.md) §8。
+- **相容性測試**：`conformance/web.test.mjs`（`FD_ADMIN_PATH` 與主機的設定相同）、`conformance/web-session-suite.mjs`（登入，由 `api.test.mjs` 執行）、
+  `conformance/web-session-local.test.mjs`（期限與管理員的恢復，改本機暫存資料庫的時間）；畫面的瀏覽器實測 `scripts/check-admin-ui.mjs`（選用）。
+
+### 13.1 網頁管理的登入（1.2.0）
+
+權杖只放在 HttpOnly Cookie：網頁被插入惡意程式時也讀不到、帶不走（1.1 存在 localStorage）。App 不受影響（照舊用 `Authorization`）。
+
+**`POST /api/v1/web/login`**（不需權杖）：`{ "code": "管理員配對碼或設定碼", "deviceName": "網頁管理（Chrome・macOS）", "remember": false }`
+
+- 檢查與 `POST /pair` 相同（§3.1、§3.4）；配對碼的角色必須是管理員，否則 `403 admin_only`（配對碼不會被用掉）。
+  主機產生新的 `deviceId`，裝置的 `platform` 是 `web`。
+- `200`：Session（§6.3，含 `web`；**沒有權杖**）與 `Set-Cookie`。錯誤同 `POST /pair`，另有 `csrf_failed`、`unsupported_media_type`、`admin_only`。
+
+**`POST /api/v1/web/upgrade`**（`Authorization: Bearer <1.0–1.1 網頁管理的權杖>`）：`{ "remember": true }`
+
+- 只接受 `platform` 是 `web`、還沒有轉換的權杖（App 的權杖 `403 not_web_session`；無效、過期或已轉換 `401 unauthorized`）。
+  同一台網頁裝置換新的權杖（`deviceId` 不變），舊權杖立即失效。回應同 `POST /web/login`。
+
+**Cookie**：名稱 `fd_admin`（HTTPS 時 `__Secure-fd_admin` 並加 `Secure`；HTTPS 依網址或 `X-Forwarded-Proto`），`HttpOnly`、`SameSite=Strict`、
+`Path=<基底路徑>/api/v1`（網頁管理的頁面與其他路徑收不到）。「記住這個瀏覽器」時有 `Max-Age`（到登入期限），否則瀏覽器關閉時刪除。
+請求同時有 `Authorization` 標頭時以標頭為準（不看 Cookie）。
+
+**來源檢查**（`web/login`、`web/upgrade` 與以 Cookie 驗證的非 GET 請求）：
+- `X-FleetDispatch-CSRF`：以 Cookie 驗證時必須等於 Session 的 `web.csrfToken`（由登入權杖推導，不另外保存）；`web/login`、`web/upgrade` 只要不是空的。
+  自訂標頭讓跨站請求一定要先經過 CORS 預檢，而主機不回應 CORS。
+- `Sec-Fetch-Site` 有送時必須是 `same-origin`。
+- 有本體時 `Content-Type` 必須是 `application/json`（否則 `415 unsupported_media_type`）。
+- 不通過時 `403 csrf_failed`，不延長期限。GET 不檢查（SameSite=Strict 已經讓跨站請求不帶 Cookie，回應也讀不到）。
+
+**期限**：
+
+| | 閒置 | 登入期限 |
+| --- | --- | --- |
+| 不記住這個瀏覽器 | 2 小時 | 12 小時 |
+| 記住這個瀏覽器 | 30 天 | 90 天 |
+
+使用時延長閒置期限（最多每 5 分鐘寫入一次），但不超過登入期限；期限到了、管理員解除配對或登出後 `401`，要用新的管理員配對碼重新登入。
+`tokenExpiresAt` 是目前的有效期限（閒置期限與登入期限中較早的）。
 - **PHP 版的安裝精靈**（只有 PHP 版、不屬於共同規格）：還沒有 `config.php` 時，網頁管理在預設的 `/admin` 顯示安裝畫面，使用
   `GET /api/v1/install`（主機環境；在程式資料夾建立安裝金鑰檔 `install-key.php`）、`POST /api/v1/install/test`（測試資料庫）、
   `POST /api/v1/install`（建立資料表並寫入設定，只能成功一次）。後兩者需要 `installKey`（安裝金鑰檔裡的金鑰，證明能管理主機的檔案；
   錯誤時 `403 invalid_install_key`，並計入嘗試次數限制）。程式資料夾不能寫入時不提供安裝（`409 not_writable`）。
   安裝完成後刪除金鑰檔，這些路徑照一般 API 回 `404`。測試：`conformance/php-install.test.mjs`。
 
+## 14. 版本與相容性（1.2.0）
+
+| 主機 | App 8.0（build 19） | App 8.1 |
+| --- | --- | --- |
+| 1.0.x、1.1.x | 支援 | 支援：`/info` 沒有宣告 `revision`，不帶 `expectedRevision`，照最後寫入者勝（與 8.0 相同） |
+| 1.2.0 | 支援：不帶 `expectedRevision`、不讀 `revision`／`revisions`／`duplicate`，行為與 1.1 相同；刪除有進行中車趟的車輛會被拒絕（App 本身也不允許） | 支援：讀 `/info` 的 `features`；記下 `revisions`／`revision`，修改與刪除帶 `expectedRevision`（建立不帶），處理 `conflict`（見下方） |
+
+App 8.1 使用 1.2.0 能力的方式（用戶端的參考實作；其他用戶端可以照做，也可以不用）：
+- **能力**：連線時與每 6 小時讀一次 `GET /info` 的 `features`，只在宣告 `revision` 時帶 `expectedRevision`；主機從 1.1 升級到 1.2.0 後，下一次同步補做一次全量取得 `revisions`。
+- **版本**：全量同步的 `revisions` 取代全部；增量同步每筆的 `revision`、`applied` 結果的 `revision` 逐筆更新。用戶端還沒送出的修改**保留修改時看到的版本**
+  （只看送出當下的版本，會把別的裝置在這之後的修改當成看過而覆寫）。
+- **同一批的同一筆資料**：寫入後版本加 1，同一批後面的事件若帶舊的版本會得到 `conflict`；App 把同一筆資料的下一個事件留到下一批。
+- **衝突**：主機沒有寫入。App 保留送出的內容、以全量同步回復成主機的版本，由使用者選擇保留主機的版本，或以自己的修改覆寫——覆寫時換新的事件 ID、
+  事件與內容的修改時間改成現在（主機先比版本、再以最後寫入者勝比較，原本的時間比另一台裝置的修改舊時會得到 `ignored`）。
+- 相容性：App 8.1 對三種實作（Docker／Node、PHP＋SQLite、Cloudflare `wrangler dev --local`）1.2.0 的實機整合測試通過（2026-11-15：能力協商、衝突與覆寫、冪等、刪除的衝突、檢視者被拒絕）。
+
+- 資料表版本 3（版本 2：revision、修改前後歷史、已處理事件；版本 3：網頁登入的期限）：第一次請求時自動遷移，可重複執行；
+  升級前的備份與降版限制見 `docs/migration.md`。
+- 網頁管理（§13.1）：1.1 存在瀏覽器的登入在第一次開啟 1.2.0 的網頁管理時自動換成 Cookie；App 8.0／8.1 的權杖不受影響。
+- 新的結果狀態 `conflict` 只會回給帶了 `expectedRevision` 的用戶端。

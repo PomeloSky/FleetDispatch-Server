@@ -43,6 +43,8 @@
   .store small { font-size: 12px; opacity: 0.75; }
   .store strong { font-size: 18px; }
   .store.alt { background: transparent; color: var(--hero-ink); border: 1px solid rgba(232, 241, 248, 0.35); }
+  /* Google Play 尚未公開上架：不放下載連結（上架後改回連結） */
+  .store.pending { background: transparent; color: var(--hero-ink); border: 1px dashed rgba(232, 241, 248, 0.35); cursor: default; }
   .more { color: var(--cyan); }
 
   main { display: grid; gap: 48px; padding-block: 48px 64px; }
@@ -81,7 +83,7 @@
       <p class="lede">FleetDispatch 是給小型車隊、公司車與多車輛車主的維運工具：出車登記、保養與到期提醒、工單與巡檢、用車申請與簽核、數據報表，在 iPhone、iPad、Mac 與 Android 上使用，離線也能記錄。</p>
       <div class="stores">
         <a class="store" href="https://apps.apple.com/app/id6764582426" rel="noopener"><small>iPhone・iPad・Mac</small><strong>在 App Store 下載</strong></a>
-        <a class="store" href="https://play.google.com/store/apps/details?id=com.yucts.fleetdispatch" rel="noopener"><small>Android 手機與平板</small><strong>在 Google Play 下載</strong></a>
+        <span class="store pending"><small>Android 手機與平板</small><strong>測試中，即將推出</strong></span>
         <a class="store alt" href="https://instw.org/fleetdispatch" rel="noopener"><small>功能介紹與使用說明</small><strong>了解更多</strong></a>
       </div>
     </div>

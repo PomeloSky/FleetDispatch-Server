@@ -3,6 +3,7 @@
 import type { SqlDb, SqlStatement } from '../../core/src/db.ts';
 import { handleRequest } from '../../core/src/handler.ts';
 import type { ServerConfig } from '../../core/src/types.ts';
+import { parseRetentionDays } from '../../core/src/util.ts';
 import { parseAdminPath } from '../../core/src/web.ts';
 
 interface Env {
@@ -12,6 +13,8 @@ interface Env {
   FD_SERVER_NAME?: string;
   /** 網頁管理的網址路徑（預設 /admin；空字串或 off 關閉）。 */
   FD_ADMIN_PATH?: string;
+  /** 修改前後歷史保留的天數（預設不自動刪除；至少 30 天）。 */
+  FD_HISTORY_RETENTION_DAYS?: string;
 }
 
 class D1Db implements SqlDb {
@@ -60,11 +63,14 @@ export default {
     const token = env.FD_SETUP_TOKEN?.trim() ?? '';
     const admin = parseAdminPath(env.FD_ADMIN_PATH);
     if (admin.error) console.error('[fleetdispatch-server]', admin.error);
+    const retention = parseRetentionDays(env.FD_HISTORY_RETENTION_DAYS);
+    if (retention.error) console.error('[fleetdispatch-server]', retention.error);
     const config: ServerConfig = {
       variant: 'cloudflare',
       setupToken: token.length >= 16 ? token : null,
       defaultName: env.FD_SERVER_NAME?.trim() || 'FleetDispatch Server',
       adminPath: admin.path,
+      historyRetentionDays: retention.days,
     };
     return handleRequest(request, { db, config, clientIp: request.headers.get('CF-Connecting-IP') ?? '' });
   },

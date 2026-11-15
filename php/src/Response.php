@@ -43,7 +43,11 @@ final class Response
         if ($e->retryAfter !== null) {
             $headers['Retry-After'] = (string) $e->retryAfter;
         }
-        return new self($e->status, ['error' => ['code' => $e->errorCode, 'message' => $e->getMessage()]], $headers);
+        $error = ['code' => $e->errorCode, 'message' => $e->getMessage()];
+        foreach ($e->details ?? [] as $k => $v) {
+            $error[$k] = $v;
+        }
+        return new self($e->status, ['error' => $error], $headers);
     }
 
     /** 編碼本體（失敗時丟例外，由呼叫者改回 500）。 */

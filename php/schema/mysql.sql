@@ -7,6 +7,7 @@
 -- 數值欄位：毫秒時間與序號用 BIGINT，Apple 秒與座標用 DOUBLE（不可用 FLOAT，精度不夠）。
 -- fd_attempts 多一個自動編號的主鍵（有些主機要求每個資料表都要有主鍵）。
 -- fd_devices.identity 是主機在每次配對時產生的身分，fd_records.created_by 記錄建立那筆資料的身分。
+-- fd_devices.web_session、session_until（資料表版本 3）是網頁管理以 Cookie 登入的種類與期限。
 -- 注意：這個檔案由程式以分號切開執行，註解只能寫成整行的 -- 註解，而且註解裡不能有分號。
 
 CREATE TABLE IF NOT EXISTS fd_meta (
@@ -29,6 +30,7 @@ CREATE TABLE IF NOT EXISTS fd_records (
     created_by VARCHAR(36) NULL,
     updated_by VARCHAR(36) NULL,
     updated_at BIGINT NOT NULL,
+    revision BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (entity, id),
     UNIQUE KEY fd_records_seq (seq),
     KEY fd_records_plate (vehicle_plate(191))
@@ -47,6 +49,8 @@ CREATE TABLE IF NOT EXISTS fd_devices (
     last_seen_at BIGINT NULL,
     revoked_at BIGINT NULL,
     identity VARCHAR(36) NULL,
+    web_session VARCHAR(16) NULL,
+    session_until BIGINT NULL,
     PRIMARY KEY (device_id),
     UNIQUE KEY fd_devices_token (token_hash)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
@@ -100,4 +104,42 @@ CREATE TABLE IF NOT EXISTS fd_attempts (
     PRIMARY KEY (id),
     KEY fd_attempts_ip (ip, at),
     KEY fd_attempts_at (at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+-- 1.2.0（資料表版本 2）：修改前後歷史、已處理事件（冪等）。既有的主機由程式自動遷移（Db::ensureSchema），
+-- 升級前請先備份（mysqldump，見 docs/migration.md）。
+
+CREATE TABLE IF NOT EXISTS fd_record_history (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    at BIGINT NOT NULL,
+    entity VARCHAR(32) NOT NULL,
+    entity_id VARCHAR(36) NOT NULL,
+    event_id VARCHAR(100) NULL,
+    operation VARCHAR(16) NOT NULL,
+    source VARCHAR(16) NOT NULL,
+    actor_device VARCHAR(36) NULL,
+    actor_identity VARCHAR(36) NULL,
+    actor_name VARCHAR(255) NULL,
+    before_json LONGTEXT NULL,
+    after_json LONGTEXT NULL,
+    changed_fields MEDIUMTEXT NULL,
+    reason VARCHAR(500) NULL,
+    seq BIGINT NOT NULL,
+    revision BIGINT NOT NULL,
+    outcome VARCHAR(16) NOT NULL DEFAULT 'applied',
+    PRIMARY KEY (id),
+    KEY fd_history_entity (entity, entity_id, id),
+    KEY fd_history_seq (seq),
+    KEY fd_history_at (at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE TABLE IF NOT EXISTS fd_processed_events (
+    device_id VARCHAR(36) NOT NULL,
+    event_id VARCHAR(100) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    reason VARCHAR(100) NULL,
+    result_json MEDIUMTEXT NULL,
+    at BIGINT NOT NULL,
+    PRIMARY KEY (device_id, event_id),
+    KEY fd_processed_at (at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;

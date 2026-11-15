@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS fd_records (
     entity TEXT NOT NULL, id TEXT NOT NULL, seq INTEGER NOT NULL, modified_at REAL NOT NULL,
     deleted INTEGER NOT NULL DEFAULT 0, payload TEXT,
     driver_uuid TEXT, driver_name TEXT, requester_device TEXT, vehicle_plate TEXT,
-    created_by TEXT, updated_by TEXT, updated_at INTEGER NOT NULL,
+    created_by TEXT, updated_by TEXT, updated_at INTEGER NOT NULL, revision INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (entity, id));
 
 CREATE INDEX IF NOT EXISTS fd_records_seq ON fd_records (seq);
@@ -19,7 +19,8 @@ CREATE INDEX IF NOT EXISTS fd_records_plate ON fd_records (vehicle_plate);
 CREATE TABLE IF NOT EXISTS fd_devices (
     device_id TEXT PRIMARY KEY, name TEXT NOT NULL, platform TEXT NOT NULL DEFAULT '', role TEXT NOT NULL,
     driver_uuid TEXT, driver_name TEXT, token_hash TEXT, token_expires_at INTEGER,
-    paired_at INTEGER NOT NULL, last_seen_at INTEGER, revoked_at INTEGER, identity TEXT);
+    paired_at INTEGER NOT NULL, last_seen_at INTEGER, revoked_at INTEGER, identity TEXT,
+    web_session TEXT, session_until INTEGER);
 
 CREATE UNIQUE INDEX IF NOT EXISTS fd_devices_token ON fd_devices (token_hash);
 
@@ -39,3 +40,24 @@ CREATE TABLE IF NOT EXISTS fd_locations (
 CREATE TABLE IF NOT EXISTS fd_attempts (ip TEXT NOT NULL, at INTEGER NOT NULL);
 
 CREATE INDEX IF NOT EXISTS fd_attempts_ip ON fd_attempts (ip, at);
+
+-- 1.2.0（資料表版本 2）：修改前後歷史、已處理事件（冪等）。既有的主機由程式自動遷移（Db::ensureSchema）。
+
+CREATE TABLE IF NOT EXISTS fd_record_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, entity TEXT NOT NULL, entity_id TEXT NOT NULL,
+    event_id TEXT, operation TEXT NOT NULL, source TEXT NOT NULL,
+    actor_device TEXT, actor_identity TEXT, actor_name TEXT,
+    before_json TEXT, after_json TEXT, changed_fields TEXT, reason TEXT,
+    seq INTEGER NOT NULL, revision INTEGER NOT NULL, outcome TEXT NOT NULL DEFAULT 'applied');
+
+CREATE INDEX IF NOT EXISTS fd_history_entity ON fd_record_history (entity, entity_id, id);
+
+CREATE INDEX IF NOT EXISTS fd_history_seq ON fd_record_history (seq);
+
+CREATE INDEX IF NOT EXISTS fd_history_at ON fd_record_history (at);
+
+CREATE TABLE IF NOT EXISTS fd_processed_events (
+    device_id TEXT NOT NULL, event_id TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, result_json TEXT, at INTEGER NOT NULL,
+    PRIMARY KEY (device_id, event_id));
+
+CREATE INDEX IF NOT EXISTS fd_processed_at ON fd_processed_events (at);
