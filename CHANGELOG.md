@@ -2,7 +2,7 @@
 
 ## 1.2.0（尚未發布）
 
-需要 FleetDispatch App 8.0（build 19）以上。App 8.0 照舊運作（不使用 1.2.0 的新能力）；與 App 的相容性見 [`docs/protocol.md`](docs/protocol.md) §14。
+需要 FleetDispatch App 8.0（build 19）以上。App 8.0 照舊運作（不使用 1.2.0 的新能力）；App 8.1 會使用事件冪等、每筆資料的版本與衝突。與 App 的相容性見 [`docs/protocol.md`](docs/protocol.md) §14。
 
 ### 網頁管理
 
